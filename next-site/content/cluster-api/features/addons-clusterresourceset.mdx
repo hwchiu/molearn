@@ -14,6 +14,19 @@ title: Cluster API — Addons 與 ClusterResourceSet
 
 </Callout>
 
+<Callout type="tip" title="本文適用對象">
+
+- 🟢 **初學者**：了解為什麼需要 ClusterResourceSet，以及它如何解決「叢集建好後還要手動裝 CNI」的痛點
+- 🟡 **中階工程師**：重點關注 `Reconcile` vs `ReApplyOnChanges` 策略差異和 label selector 設計
+- 🔴 **資深工程師**：深入 server-side apply 的衝突處理與大型 addon 拆分策略
+
+</Callout>
+
+> 📦 **類比**：ClusterResourceSet 就像「新員工入職禮包自動發放系統」。
+> - 每個新叢集（新員工）帶上特定 label（部門標籤）時
+> - 系統自動把對應的工具清單（ConfigMap/Secret）部署進去（發放設備和工具）
+> - 不需要 IT 人員手動一一安裝，入職當天一切就緒
+
 
 ## 什麼是 ClusterResourceSet
 
@@ -208,3 +221,13 @@ spec:
 - 大型 addon（如 Istio）建議**分拆為多個 ConfigMap**，分別放入不同的 ResourceRef
 
 </Callout>
+
+> 💡 **思考一下**：ClusterResourceSet 的 `strategy: Reconcile` 和 `strategy: ReApplyOnChanges` 有什麼差異？如果你的 CNI ConfigMap 內容被更新了，在哪種策略下 workload cluster 中的 CNI 會自動更新？
+
+---
+
+## 延伸閱讀
+
+- [ClusterClass 與 Topology](/cluster-api/clusterclass-topology) — 搭配 ClusterClass 讓 addon 管理更自動化
+- [架構概覽](/cluster-api/architecture) — ClusterResourceSet 在整體 CAPI 架構中的位置
+- [CAPI Addons 官方文件](https://cluster-api.sigs.k8s.io/tasks/experimental-features/cluster-resource-set) — ClusterResourceSet 完整使用指南
