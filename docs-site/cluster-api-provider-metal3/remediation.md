@@ -1,0 +1,205 @@
+---
+layout: doc
+title: Metal3 Provider — Remediation 機制
+---
+
+# Metal3 Provider — Remediation 機制
+
+::: info 相關章節
+- [架構設計](./architecture.md) — 系統架構與元件關係
+- [BMH 生命週期](./bmh-lifecycle.md) — BareMetalHost 狀態機與 CAPM3/BMO 協作
+- [機器層級 CRD](./crds-machine.md) — Metal3Machine 與 Metal3MachineTemplate
+- [專案總覽](./index.md) — 九個 CRD 與七個 Controller 一覽
+:::
+
+---
+
+## 什麼是 Remediation
+
+**Remediation（自動修復）** 是指當叢集中的節點出現問題時（例如持續 `NotReady`、長期不健康），Cluster API（CAPI）提供的自動修復機制，讓運維人員不需手動介入即可恢復節點健康狀態。
+
+CAPI 的標準機制透過 `MachineHealthCheck` 監控節點健康狀況，一旦偵測到不健康節點便觸發修復流程。然而，預設的 CAPI 修復策略是**直接刪除並重建 Machine**，對於裸機環境代價極高，因為需要重新走完完整的 provisioning 流程（包含 PXE 開機、映像部署等），通常需要 30~60 分鐘以上。
+
+**Metal3 Provider 提供了更溫和且更快速的自定義策略：`Reboot`（重啟）**，讓機器保留現有 OS，僅透過 IPMI/Redfish 進行電源重啟，通常只需 1~5 分鐘即可恢復。
+
+### 兩種 Remediation 方式比較
+
+| 方式 | 觸發流程 | 修復行為 | 耗時估計 |
+|------|---------|---------|---------|
+| **CAPI 預設** | MachineHealthCheck 觸發 → 刪除 Machine → 建立新 Machine | 重新 provision 裸機（PXE + 映像部署） | 30~60+ 分鐘 |
+| **Metal3 自定義** | MachineHealthCheck 觸發 → 建立 Metal3Remediation → 執行 Reboot | 透過 IPMI/Redfish 重啟機器，保留 OS | 1~5 分鐘 |
+
+---
+
+## MachineHealthCheck 設定
+
+`MachineHealthCheck` 是 CAPI 內建的 CRD，負責持續監控節點健康狀況，並在節點不健康時觸發修復流程。
+
+若要啟用 Metal3 自定義 Remediation，關鍵在於將 `spec.remediationTemplate` 指向 `Metal3RemediationTemplate`，而非使用 CAPI 預設策略。
+
+```yaml
+apiVersion: cluster.x-k8s.io/v1beta1
+kind: MachineHealthCheck
+metadata:
+  name: my-cluster-mhc
+  namespace: metal3
+spec:
+  clusterName: my-cluster
+  selector:
+    matchLabels:
+      cluster.x-k8s.io/cluster-name: my-cluster
+  unhealthyConditions:
+    - type: Ready
+      status: Unknown
+      timeout: 300s
+    - type: Ready
+      status: "False"
+      timeout: 300s
+  maxUnhealthy: "40%"
+  nodeStartupTimeout: 20m
+  remediationTemplate:
+    apiVersion: infrastructure.cluster.x-k8s.io/v1beta1
+    kind: Metal3RemediationTemplate    # 使用 Metal3 自定義策略
+    name: my-cluster-remediation-template
+    namespace: metal3
+```
+
+### 關鍵欄位說明
+
+| 欄位 | 說明 |
+|------|------|
+| `remediationTemplate` | 指向 `Metal3RemediationTemplate`，告知 MHC 使用 Metal3 自定義修復策略而非預設刪除策略 |
+| `maxUnhealthy` | Circuit Breaker：不健康節點比例超過此值時，MHC 停止觸發新的 remediation，避免大規模誤觸 |
+| `nodeStartupTimeout` | 新節點啟動超時時間；超過後 MHC 視為節點不健康並觸發修復 |
+| `unhealthyConditions` | 定義「不健康」的判斷條件，支援多條件組合（`Unknown` 和 `False` 代表不同故障模式）|
+
+---
+
+## Metal3RemediationTemplate
+
+`Metal3RemediationTemplate` 是 `Metal3Remediation` 的模板物件，由 `MachineHealthCheck` 引用。當 MHC 決定修復某個節點時，會根據此模板建立對應的 `Metal3Remediation` 物件。
+
+```yaml
+apiVersion: infrastructure.cluster.x-k8s.io/v1beta1
+kind: Metal3RemediationTemplate
+metadata:
+  name: my-cluster-remediation-template
+  namespace: metal3
+spec:
+  template:
+    spec:
+      strategy:
+        type: Reboot
+        retryLimit: 3      # 最多重試 3 次
+        timeout: 5m        # 每次 reboot 後等待 5 分鐘
+```
+
+### Strategy 欄位說明
+
+| 欄位 | 類型 | 說明 |
+|------|------|------|
+| `type` | string | 修復策略類型，目前只支援 `Reboot` |
+| `retryLimit` | int | 最大重試次數；超過後觸發 CAPI 預設的刪除重建流程 |
+| `timeout` | Duration | 每次嘗試的超時時間；從 Power On 後開始計時，超時視為本次嘗試失敗 |
+
+---
+
+## Metal3Remediation
+
+`Metal3Remediation` 是 CAPM3 的核心修復 CRD，由 `MachineHealthCheck` Controller **自動建立**（名稱與對應的 `Machine` 相同）。`Metal3RemediationReconciler` 監聽此物件並驅動實際的 Reboot 流程。
+
+### Spec 欄位
+
+| 欄位 | 類型 | 說明 |
+|------|------|------|
+| `strategy` | RemediationStrategy | Reboot 策略設定，包含 `type`、`retryLimit`、`timeout` |
+
+### Status 欄位
+
+| 欄位 | 類型 | 說明 |
+|------|------|------|
+| `phase` | string | Remediation 目前所在階段：`Running`（進行中）、`Succeeded`（成功）、`Failed`（失敗）|
+| `retryCount` | int | 已嘗試的重試次數（每次超時後 +1）|
+| `lastRemediated` | Time | 最後一次執行 remediation 的時間戳 |
+| `errorMessage` | string | 錯誤訊息（若修復失敗時記錄失敗原因）|
+
+---
+
+## Reboot Remediation 詳細流程
+
+以下詳述 Metal3 Reboot Remediation 從偵測到完成的完整六步流程：
+
+### Step 1 — MachineHealthCheck 偵測到不健康節點
+
+- `MachineHealthCheck` Controller 持續監控 workload cluster 中各節點的 `Node.Status.Conditions[Ready].Status`
+- 若某節點的 `Ready` 條件持續為 `Unknown` 或 `False` 超過設定的 `timeout`（例如 300 秒），MHC 判定該節點不健康
+- MHC **Circuit Breaker** 檢查：當前不健康節點比例是否超過 `maxUnhealthy`（例如 40%），若超過則停止觸發新的修復，避免因大規模故障引起連鎖問題
+- 確認可以修復後，MHC Controller 自動建立 `Metal3Remediation` 物件（名稱與對應 `Machine` 相同）
+
+### Step 2 — Metal3RemediationReconciler 開始處理
+
+- `Metal3RemediationReconciler` 偵測到新的 `Metal3Remediation` 物件，開始 Reconcile 流程
+- 依據 `Metal3Remediation` 的 `ownerReference` 取得對應的 `Machine` 物件
+- 從 `Machine` 的 `spec.infrastructureRef` 取得對應的 `Metal3Machine` 物件
+- 從 `Metal3Machine` 的 `spec.providerID` 或相關 annotation 取得對應的 `BareMetalHost` 物件
+- 將 `Metal3Remediation.Status.Phase` 設定為 `Running`
+
+### Step 3 — 電源關閉（Power Off）
+
+- Reconciler 設定 `BareMetalHost.Spec.Online = false`
+- **Bare Metal Operator（BMO）** 偵測到 BMH 的 `online` 欄位變更，透過 IPMI 或 Redfish API 發送關機指令
+- Reconciler 等待 BMH 狀態反映機器已關機（例如 `BMH.Status.PoweredOn = false`）
+- 此步驟確保機器完全斷電，避免 dirty state 殘留
+
+### Step 4 — 刪除 K8s Node（可選）
+
+- Reconciler 連接 workload cluster，刪除對應的 K8s `Node` 物件
+- 刪除 Node 確保 workload cluster 的 scheduler 不再將新 Pod 排程到此節點，避免資源浪費
+- 若啟用 out-of-service taint 機制，Reconciler 會先為節點設定 `node.kubernetes.io/out-of-service` taint，讓 kubelet 能加速驅逐已有的 Pod
+
+### Step 5 — 電源開啟（Power On）
+
+- Reconciler 設定 `BareMetalHost.Spec.Online = true`
+- BMO 透過 IPMI 或 Redfish API 發送開機指令，機器重新啟動
+- **關鍵差異**：此時機器使用**現有 OS 和磁碟資料**直接開機，不進行任何 PXE 或映像重新部署
+- Reconciler 記錄 `Metal3Remediation.Status.LastRemediated` 時間戳，並開始計算 `timeout`
+
+### Step 6 — 等待節點恢復
+
+- Reconciler 持續監控 workload cluster 中節點的 `Ready` 狀態
+- **成功路徑**：若節點在 `timeout` 內重新加入叢集並回到 `Ready = True`：
+  - 設定 `Metal3Remediation.Status.Phase = Succeeded`
+  - 刪除 `Metal3Remediation` 物件（修復完成）
+- **重試路徑**：若超過 `timeout` 節點仍未恢復：
+  - `Metal3Remediation.Status.RetryCount + 1`
+  - 若 `retryCount < retryLimit`，回到 Step 3 重新執行一次 Power Off → Power On 循環
+- **失敗路徑**：若 `retryCount >= retryLimit`，表示 Reboot 策略無法解決問題：
+  - 設定 `Metal3Remediation.Status.Phase = Failed`
+  - MHC 偵測到修復失敗，改用 **CAPI 預設策略**（刪除並重建 Machine，觸發完整的裸機重新 provisioning 流程）
+
+---
+
+## Reboot vs 刪除重建策略比較
+
+| 比較項目 | Reboot 策略 | 刪除重建策略 |
+|---------|-----------|------------|
+| **修復時間** | 1~5 分鐘（視機器啟動速度） | 30~60+ 分鐘（需重新 provision）|
+| **資料保留** | ✅ 保留 OS 和本地資料 | ❌ 磁碟重新清除與映像部署 |
+| **適用情境** | 暫時性軟體故障、kernel panic、服務崩潰 | 持久性問題、磁碟損壞、OS 損毀 |
+| **BMH 狀態** | 保持 `provisioned`，不離開 provisioning 狀態 | 重新走完完整 provisioning 流程 |
+| **機器替換** | 同一台機器重啟 | 可能分配到不同的 BMH |
+| **對叢集衝擊** | 最小（短暫 NotReady） | 較大（節點長時間不可用）|
+
+---
+
+## Labels 恢復
+
+::: info Labels 恢復機制
+節點重啟成功並重新加入 workload cluster 後，`Metal3RemediationReconciler` 會執行以下清理與恢復動作：
+
+- **恢復節點 Labels**：確保節點上的重要 labels（例如拓撲 labels、角色 labels）在重啟後依然存在，避免 scheduler 因缺少 label 而無法正確分配 workload
+- **移除 out-of-service taint**：若 Step 4 中設定了 `node.kubernetes.io/out-of-service` taint，此時會將其移除，讓 scheduler 重新將 Pod 排程到此節點
+- **更新 Metal3Remediation Status**：記錄修復成功，並最終刪除 `Metal3Remediation` 物件，完成整個修復週期
+
+這些清理動作確保節點在重啟後能無縫重新融入叢集，不影響正常的 workload 排程。
+:::

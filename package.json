@@ -1,0 +1,13 @@
+{
+  "name": "molearn",
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vitepress dev docs-site",
+    "build": "vitepress build docs-site",
+    "preview": "vitepress preview docs-site"
+  },
+  "devDependencies": {
+    "vitepress": "^1.6.4"
+  }
+}

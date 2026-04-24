@@ -1,0 +1,229 @@
+---
+layout: doc
+title: Cluster API — ClusterClass 與 Topology
+---
+
+# ClusterClass 與 Topology
+
+::: info 相關章節
+- [Topology Controller](/cluster-api/controller-topology) — Topology Controller 內部機制
+- [架構概覽](/cluster-api/architecture) — CAPI 整體架構
+- [Cluster 與 Machine](/cluster-api/api-cluster-machine) — Cluster 與 Machine API
+:::
+
+## ClusterClass 概念
+
+**ClusterClass** 是 CAPI 提供的叢集模板系統，屬於 Feature Gate `ClusterTopology`（Beta 等級，預設已開啟）。它讓平台團隊能夠定義一份「叢集藍圖」，包含 infrastructure、control plane、workers 所需的所有模板，然後讓開發團隊只需填寫少量參數就能建立符合規範的標準化叢集。
+
+**核心設計理念：**
+
+- **定義一次，重複使用**：多個叢集可以引用同一個 ClusterClass，不需要重複定義底層模板
+- **參數化配置**：透過 `spec.variables` 定義可客製化的參數，搭配 `spec.patches` 將參數值注入模板
+- **拓撲驅動**：叢集使用 `Cluster.Spec.Topology` 宣告使用哪個 ClusterClass 及對應的參數值
+
+**企業級使用場景：**
+
+平台團隊（Platform Team）負責定義並維護 ClusterClass，制定符合公司安全與運維規範的叢集藍圖。開發團隊（Dev Team）只需透過 `Cluster.Spec.Topology` 指定 ClusterClass 名稱和必要參數，即可快速建立符合規範的叢集，大幅降低配置錯誤的機率。
+
+---
+
+## ClusterClass 結構
+
+### 主要欄位
+
+| 欄位 | 說明 |
+|------|------|
+| `spec.infrastructure.ref` | InfraClusterTemplate 引用 |
+| `spec.controlPlane.ref` | ControlPlaneTemplate 引用（如 KubeadmControlPlaneTemplate）|
+| `spec.controlPlane.machineInfrastructure.ref` | CP 節點的 InfraMachineTemplate |
+| `spec.workers.machineDeployments` | Worker MachineDeployment class 定義列表 |
+| `spec.variables` | 可配置的變數定義（含 schema 和預設值）|
+| `spec.patches` | JSON Patch 定義，將 variable 值注入 template |
+
+### Variables Schema（OpenAPI v3）
+
+ClusterClass 使用 OpenAPI v3 Schema 定義每個變數的型別、預設值與合法範圍，確保使用者填入的值符合規範：
+
+```yaml
+variables:
+  - name: imageURL
+    required: true
+    schema:
+      openAPIV3Schema:
+        type: string
+        description: "OS image 的 URL"
+        example: "https://images.example.com/ubuntu-22.04.tar.gz"
+  - name: controlPlaneReplicas
+    required: false
+    schema:
+      openAPIV3Schema:
+        type: integer
+        default: 3
+        minimum: 1
+        maximum: 5
+  - name: workerMachineType
+    required: false
+    schema:
+      openAPIV3Schema:
+        type: string
+        default: "standard"
+        enum: ["standard", "high-memory", "gpu"]
+```
+
+---
+
+## Cluster Topology 設定
+
+建立使用 ClusterClass 的 Cluster 時，只需在 `spec.topology` 中指定 ClusterClass 名稱、Kubernetes 版本及對應的參數值，無需重複定義底層模板：
+
+```yaml
+apiVersion: cluster.x-k8s.io/v1beta1
+kind: Cluster
+metadata:
+  name: production-cluster
+  namespace: default
+spec:
+  topology:
+    class: enterprise-standard    # 引用 ClusterClass
+    version: v1.28.0
+    controlPlane:
+      replicas: 3
+      metadata:
+        labels:
+          tier: control-plane
+    workers:
+      machineDeployments:
+        - class: standard-worker
+          name: app-workers
+          replicas: 5
+          metadata:
+            labels:
+              workload: application
+        - class: gpu-worker
+          name: ml-workers
+          replicas: 2
+          variables:
+            overrides:              # 覆蓋 ClusterClass 層級的 variable
+              - name: workerMachineType
+                value: "gpu"
+    variables:
+      - name: imageURL
+        value: "https://images.example.com/ubuntu-22.04.tar.gz"
+      - name: controlPlaneReplicas
+        value: 3
+```
+
+### Variable 覆蓋機制
+
+CAPI Topology 支援兩層 variable 設定，提供靈活的參數覆蓋能力：
+
+- **全域 variables**：在 `spec.topology.variables` 設定，套用到所有使用該 variable 的模板
+- **MachineDeployment 層級覆蓋**：個別 MachineDeployment 可在 `variables.overrides` 覆蓋特定 variable 的值
+- **覆蓋範圍隔離**：覆蓋只影響該 MachineDeployment，不影響其他 worker 或 control plane 的設定
+
+---
+
+## Patches 完整說明
+
+### Patch Selector
+
+`spec.patches` 定義如何將 variable 值注入對應的模板物件。每個 patch 透過 `selector` 指定目標模板的 apiVersion、kind 及套用對象（control plane 或特定 MachineDeployment class）：
+
+```yaml
+patches:
+  - name: imageURLPatch
+    definitions:
+      - selector:
+          apiVersion: infrastructure.cluster.x-k8s.io/v1beta1
+          kind: Metal3MachineTemplate
+          matchResources:
+            controlPlane: true              # 套用到 CP 的 MachineTemplate
+            machineDeploymentClass:
+              names: ["standard-worker"]    # 套用到特定 class 的 MD
+        jsonPatches:
+          - op: replace
+            path: /spec/template/spec/image/url
+            valueFrom:
+              variable: imageURL
+          - op: replace
+            path: /spec/template/spec/image/checksum
+            valueFrom:
+              template: |
+                {{ .imageChecksum }}        # Go template 引用另一個 variable
+```
+
+### Patch 套用順序
+
+::: info 套用順序
+`spec.patches` 陣列中的 patch 按照**陣列索引順序**依序套用。後面的 patch 可以覆蓋前面 patch 已設定的欄位，因此定義多個 patch 時需注意順序，確保最終結果符合預期。
+:::
+
+---
+
+## MachineDeploymentClass 深入說明
+
+`spec.workers.machineDeployments` 定義每一種 worker node 的「類型（class）」，每個 class 包含自己的 bootstrap template、infrastructure template、健康檢查規則及命名策略：
+
+```yaml
+spec:
+  workers:
+    machineDeployments:
+      - class: standard-worker
+        template:
+          bootstrap:
+            ref:
+              apiVersion: bootstrap.cluster.x-k8s.io/v1beta1
+              kind: KubeadmConfigTemplate
+              name: standard-worker-bootstrap
+          infrastructure:
+            ref:
+              apiVersion: infrastructure.cluster.x-k8s.io/v1beta1
+              kind: Metal3MachineTemplate
+              name: standard-worker-machine
+        machineHealthCheck:          # 為此 class 定義 MHC
+          unhealthyConditions:
+            - type: Ready
+              status: Unknown
+              timeout: 300s
+          maxUnhealthy: "40%"
+        namingStrategy:              # 自定義命名策略
+          template: "{{ .cluster.name }}-{{ .machineDeployment.topologyName }}-{{ .random }}"
+```
+
+`namingStrategy.template` 使用 Go template 語法，可引用 `.cluster.name`、`.machineDeployment.topologyName` 及 `.random` 等內建變數，讓產生的 MachineDeployment 物件名稱具有可讀性。
+
+---
+
+## ClusterClass 升級（版本管理）
+
+### ClusterClass 不可變性
+
+ClusterClass 的 `spec.infrastructure.ref`、`spec.controlPlane.ref` 等欄位指向的模板物件（如 KubeadmControlPlaneTemplate）本身可以更新。TopologyReconciler 在下次 reconcile 時，會偵測到模板已變更，並自動將變更傳播到所有使用此 ClusterClass 的叢集。
+
+若需要進行大幅度的結構性變更，建議建立全新版本的 ClusterClass（例如 `enterprise-standard-v2`），避免影響仍在使用舊版的叢集。叢集遷移到新 ClusterClass 時，只需修改 `Cluster.Spec.Topology.Class` 欄位即可。
+
+### 多叢集升級策略
+
+1. **更新模板物件**：修改 ClusterClass 引用的 template（例如調整 KubeadmControlPlaneTemplate 中的 kubeadm 配置）
+2. **自動偵測與重新協調**：TopologyReconciler 偵測到 ClusterClass 變更後，自動重新 reconcile 所有使用此 ClusterClass 的 Cluster
+3. **控制升級時機**：若 Cluster 設定了 `topology.rolloutAfter` 欄位，可指定一個時間點，確保升級在預定的維護視窗內才執行
+
+---
+
+## ClusterTopology 優缺點
+
+### 優點
+
+- **標準化建立流程**：統一的叢集建立方式，大幅減少人為設定錯誤
+- **集中管理多叢集配置**：修改一個 ClusterClass 即可影響所有使用它的叢集
+- **簡化版本升級**：升級 Kubernetes 版本只需修改 `topology.version` 一個欄位
+- **靈活的參數化**：透過 variable 和 patches 機制，讓同一個 ClusterClass 能適應不同場景的需求
+
+### 限制
+
+::: warning 使用限制
+- **學習曲線較高**：ClusterClass 涉及 variables、patches、selector 等多個抽象層，初期理解需要時間
+- **JSON Patch 語法複雜**：`spec.patches` 中的 JSON Patch 定義較為繁瑣，需要熟悉 RFC 6902 語法
+- **不適合高度客製化的叢集**：當每個叢集的差異極大時，強行使用 ClusterClass 反而會讓 patches 變得難以維護
+- **Template 物件必須預先存在**：ClusterClass 引用的所有模板物件（如 KubeadmControlPlaneTemplate）若不存在，Topology reconcile 將持續失敗，需確保相依物件已正確建立
+:::

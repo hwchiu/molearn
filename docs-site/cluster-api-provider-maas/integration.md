@@ -1,0 +1,285 @@
+---
+layout: doc
+title: MAAS Provider — 整合與部署指南
+---
+
+# MAAS Provider — 整合與部署指南
+
+::: info 相關章節
+- [專案總覽](./index.md)
+- [架構設計](./architecture.md)
+- [API 型別](./api-types.md)
+- [Controller 實作](./controllers.md)
+- [Machine 生命週期](./machine-lifecycle.md)
+:::
+
+本指南說明如何在既有環境中部署 MAAS Provider，並從零開始建立第一個裸金屬 Kubernetes 叢集。
+
+## 前置需求
+
+### Management Cluster 需求
+
+在開始之前，您需要一個已運行的 Kubernetes 叢集作為 **management cluster**：
+
+- **Cluster API core**：已透過 `clusterctl init` 初始化，包含 CAPI 核心 controller 與 CRD
+- **cert-manager**：用於 webhook 的 TLS 憑證自動簽發（Cluster API 依賴此元件）
+
+確認 cert-manager 已就緒：
+```bash
+kubectl get pods -n cert-manager
+```
+
+### MAAS 環境需求
+
+| 項目 | 說明 |
+|------|------|
+| MAAS 版本 | 建議 ≥ 2.9；若使用 in-memory 部署模式，需 ≥ 3.5.10 |
+| API 連線 | Management cluster 可以存取 MAAS API endpoint（HTTP/HTTPS）|
+| OS Images | 已匯入 MAAS 的 OS 映像檔，例如 Ubuntu 22.04 LTS 搭配 Kubernetes 元件 |
+| 機器狀態 | 機器已完成 **Enlist → Commission**，狀態為 `Ready`，等待被部署 |
+
+::: warning MAAS API Key 安全性
+MAAS API key 具有完整的機器控制權（包含部署、刪除、重開機）。請**妥善保管**並使用 Kubernetes Secret 儲存，**絕對不要**直接寫入 MaasCluster 或 MaasMachine 等 CRD spec 中。一旦洩漏，攻擊者可以透過 MAAS API 任意操控所有裸金屬機器。
+:::
+
+---
+
+## 安裝步驟
+
+### Step 1 — 建立 MAAS API 憑證 Secret
+
+將 MAAS API endpoint 與 API key 儲存為 Kubernetes Secret：
+
+```bash
+kubectl create secret generic maas-credentials \
+  --namespace capi-system \
+  --from-literal=MAAS_ENDPOINT=http://maas.example.com/MAAS \
+  --from-literal=MAAS_API_KEY=consumer_key:token_key:token_secret
+```
+
+MAAS API key 格式為 `consumer_key:token_key:token_secret`，可在 MAAS UI 的 **使用者設定 → API Keys** 頁面取得。
+
+### Step 2 — 安裝 MAAS Provider
+
+**方式一：透過 clusterctl（若 provider 已在 clusterctl 清單中）**
+
+```bash
+clusterctl init --infrastructure maas
+```
+
+**方式二：直接套用 Kustomize manifests**
+
+```bash
+kubectl apply -k https://github.com/spectrocloud/cluster-api-provider-maas/config/default
+```
+
+此方式會部署 CRD、RBAC、Deployment 等所有必要資源到 `capi-maas-system` namespace。
+
+### Step 3 — 確認 Controller 運行
+
+```bash
+kubectl get pods -n capi-maas-system
+# 應看到 capm-controller-manager pod 狀態為 Running
+
+kubectl logs -n capi-maas-system deployment/capm-controller-manager
+```
+
+確認日誌中沒有連線錯誤，且已成功讀取到 MAAS API 憑證。
+
+---
+
+## 建立第一個叢集
+
+以下範例建立一個 3 control plane 節點的 HA 叢集，使用 MAAS 作為 infrastructure provider。
+
+### 基礎叢集 YAML 範例
+
+```yaml
+# Cluster
+apiVersion: cluster.x-k8s.io/v1beta1
+kind: Cluster
+metadata:
+  name: my-maas-cluster
+  namespace: default
+spec:
+  clusterNetwork:
+    pods:
+      cidrBlocks: ["192.168.0.0/16"]
+    services:
+      cidrBlocks: ["10.96.0.0/12"]
+  infrastructureRef:
+    apiVersion: infrastructure.cluster.x-k8s.io/v1beta1
+    kind: MaasCluster
+    name: my-maas-cluster
+  controlPlaneRef:
+    apiVersion: controlplane.cluster.x-k8s.io/v1beta1
+    kind: KubeadmControlPlane
+    name: my-maas-cluster-cp
+---
+# MaasCluster
+apiVersion: infrastructure.cluster.x-k8s.io/v1beta1
+kind: MaasCluster
+metadata:
+  name: my-maas-cluster
+  namespace: default
+spec:
+  dnsDomain: k8s.example.com
+  failureDomains:
+    - zone-a
+---
+# KubeadmControlPlane
+apiVersion: controlplane.cluster.x-k8s.io/v1beta1
+kind: KubeadmControlPlane
+metadata:
+  name: my-maas-cluster-cp
+  namespace: default
+spec:
+  replicas: 3
+  version: v1.28.0
+  machineTemplate:
+    infrastructureRef:
+      apiVersion: infrastructure.cluster.x-k8s.io/v1beta1
+      kind: MaasMachineTemplate
+      name: my-maas-cluster-cp-template
+  kubeadmConfigSpec:
+    initConfiguration:
+      nodeRegistration:
+        kubeletExtraArgs:
+          cloud-provider: external
+    joinConfiguration:
+      nodeRegistration:
+        kubeletExtraArgs:
+          cloud-provider: external
+---
+# MaasMachineTemplate（Control Plane）
+apiVersion: infrastructure.cluster.x-k8s.io/v1beta1
+kind: MaasMachineTemplate
+metadata:
+  name: my-maas-cluster-cp-template
+  namespace: default
+spec:
+  template:
+    spec:
+      image: ubuntu-22.04-k8s-1.28
+      minCPU: 4
+      minMemoryInMB: 8192
+      tags:
+        - kubernetes
+        - control-plane
+      failureDomain: zone-a
+```
+
+套用此 YAML 後，CAPI 會開始協調，MAAS Provider 會向 MAAS 請求符合條件的機器並執行部署。
+
+### 取得 Workload Cluster 的 kubeconfig
+
+等待叢集就緒後，取得 workload cluster 的 kubeconfig：
+
+```bash
+# 等待叢集就緒（ControlPlaneReady = true）
+kubectl get cluster my-maas-cluster
+
+# 取得 kubeconfig
+clusterctl get kubeconfig my-maas-cluster > my-maas-cluster.kubeconfig
+
+# 驗證節點
+kubectl --kubeconfig my-maas-cluster.kubeconfig get nodes
+```
+
+---
+
+## 安裝 CNI（必要步驟）
+
+::: warning CNI 未安裝時叢集無法正常運作
+CAPI 建立的叢集**預設沒有 CNI**，所有節點會處於 `NotReady` 狀態，Pod 無法跨節點通訊。必須在叢集建立後手動安裝 CNI 才能讓叢集正常運作。
+:::
+
+以 Calico 為例：
+
+```bash
+kubectl --kubeconfig my-maas-cluster.kubeconfig apply \
+  -f https://docs.projectcalico.org/manifests/calico.yaml
+```
+
+> **注意：** `spec.clusterNetwork.pods.cidrBlocks` 必須與 CNI 設定一致。上方範例使用 `192.168.0.0/16`，請確認 Calico 的 `CALICO_IPV4POOL_CIDR` 設定相同。
+
+---
+
+## 擴縮 Worker 節點
+
+使用 `MachineDeployment` 管理 worker 節點群組：
+
+```yaml
+apiVersion: cluster.x-k8s.io/v1beta1
+kind: MachineDeployment
+metadata:
+  name: my-maas-cluster-workers
+  namespace: default
+spec:
+  clusterName: my-maas-cluster
+  replicas: 3
+  selector:
+    matchLabels: {}
+  template:
+    metadata:
+      labels:
+        nodepool: workers
+    spec:
+      clusterName: my-maas-cluster
+      version: v1.28.0
+      bootstrap:
+        configRef:
+          apiVersion: bootstrap.cluster.x-k8s.io/v1beta1
+          kind: KubeadmConfigTemplate
+          name: my-maas-cluster-worker-template
+      infrastructureRef:
+        apiVersion: infrastructure.cluster.x-k8s.io/v1beta1
+        kind: MaasMachineTemplate
+        name: my-maas-cluster-worker-template
+```
+
+套用後，使用 `kubectl scale` 調整節點數量：
+
+```bash
+# 擴充到 5 台 worker
+kubectl scale machinedeployment my-maas-cluster-workers --replicas=5
+```
+
+縮減時，CAPI 會自動選擇要刪除的 Machine，MAAS Provider 會對對應機器執行 release 操作，將機器歸還為 `Ready` 狀態供後續使用。
+
+---
+
+## 常見問題排查
+
+| 問題現象 | 可能原因 | 排查方式 |
+|---------|---------|---------|
+| Machine 停在 `Allocated` 狀態 | MAAS deploy 失敗（image 不存在、網路問題）| 檢查 MAAS UI 中機器的 deploy log |
+| Machine 停在 `Deploying` 狀態超過 30 分鐘 | OS 安裝緩慢或 cloud-init 失敗 | SSH 進機器查看 `/var/log/cloud-init-output.log` |
+| MaasMachine `DNSAttached = False` | MAAS DNS 設定問題 | 確認 `dnsDomain` 在 MAAS 中有對應的 DNS zone |
+| Node 不加入叢集（NotReady）| CNI 未安裝或 cloud-init userdata 錯誤 | 查看 kubelet 日誌：`journalctl -u kubelet -f` |
+| 無可用機器 / allocate 失敗 | MAAS 中無符合條件的機器 | 確認 MAAS 中有 `Ready` 狀態的機器，且符合 `minCPU`、`minMemoryInMB`、`tags` 條件 |
+
+---
+
+## 監控與觀測
+
+使用以下指令觀察 MAAS Provider 的運作狀態：
+
+```bash
+# 查看 MaasCluster 狀態與 Condition
+kubectl describe maascluster my-maas-cluster
+
+# 列出所有 namespace 中的 MaasMachine
+kubectl get maasmachine -A
+
+# 查看特定 MaasMachine 詳細狀態
+kubectl describe maasmachine my-worker-0
+
+# 即時追蹤 controller 日誌
+kubectl logs -n capi-maas-system deployment/capm-controller-manager -f
+
+# 使用 clusterctl 顯示叢集整體狀態（含 control plane、machine deployment）
+clusterctl describe cluster my-maas-cluster
+```
+
+`clusterctl describe cluster` 會以樹狀結構顯示叢集中所有 CAPI 物件的狀態，是排查問題時最快速的全局視圖工具。

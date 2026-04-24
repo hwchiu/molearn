@@ -70,6 +70,13 @@ const metal3Sidebar = [
       { text: '核心功能分析', link: '/cluster-api-provider-metal3/core-features' },
       { text: '控制器與 API', link: '/cluster-api-provider-metal3/controllers-api' },
       { text: 'BMH 生命週期', link: '/cluster-api-provider-metal3/bmh-lifecycle' },
+      { text: '叢集層級 CRD', link: '/cluster-api-provider-metal3/crds-cluster' },
+      { text: '機器層級 CRD', link: '/cluster-api-provider-metal3/crds-machine' },
+      { text: 'Label 同步機制', link: '/cluster-api-provider-metal3/labelsync' },
+      { text: 'Node Reuse', link: '/cluster-api-provider-metal3/node-reuse' },
+      { text: 'Data Templates 與 IPAM', link: '/cluster-api-provider-metal3/data-templates' },
+      { text: 'IPAM 整合', link: '/cluster-api-provider-metal3/ipam' },
+      { text: '進階功能', link: '/cluster-api-provider-metal3/advanced-features' },
     ],
   },
   {
@@ -77,6 +84,12 @@ const metal3Sidebar = [
     collapsed: true,
     items: [
       { text: '外部整合', link: '/cluster-api-provider-metal3/integration' },
+    ],
+  },
+  {
+    text: '自我評測',
+    items: [
+      { text: '互動式測驗', link: '/cluster-api-provider-metal3/quiz' },
     ],
   },
 ]

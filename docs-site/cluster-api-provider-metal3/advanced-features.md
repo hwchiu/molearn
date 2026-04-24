@@ -1,0 +1,222 @@
+---
+layout: doc
+title: Metal3 Provider — 進階功能
+---
+
+# Metal3 Provider — 進階功能
+
+:::info 相關章節
+- [架構概覽](/cluster-api-provider-metal3/architecture) — Metal3 系統架構設計
+- [IPAM 整合](/cluster-api-provider-metal3/ipam) — IP 位址管理整合
+- [Node Reuse](/cluster-api-provider-metal3/node-reuse) — 節點重複利用機制
+- [Label 同步](/cluster-api-provider-metal3/labelsync) — BMH 與 Node 標籤同步
+:::
+
+本頁涵蓋 Metal3 Provider 的進階功能，包括 ClusterClass 整合、多叢集隔離、Pivot 操作以及 Controller Manager 調校等主題。
+
+---
+
+## Metal3ClusterTemplate
+
+`Metal3ClusterTemplate` 是為 **ClusterClass**（CAPI ClusterTopology feature）設計的 infrastructure template CRD。它的結構與 `Metal3Cluster` 相同，但多了一層 `spec.template` 包裝。
+
+```yaml
+apiVersion: infrastructure.cluster.x-k8s.io/v1beta1
+kind: Metal3ClusterTemplate
+metadata:
+  name: metal3-cluster-template
+  namespace: metal3
+spec:
+  template:
+    spec:
+      controlPlaneEndpoint:
+        host: ""
+        port: 6443
+      noCloudProvider: false
+```
+
+### 欄位說明
+
+| 欄位 | 說明 |
+|------|------|
+| `spec.template.spec` | Metal3ClusterSpec 的模板（與 Metal3Cluster 相同結構）|
+| `controlPlaneEndpoint` | VIP 或負載均衡器地址（可由 ClusterClass 參數化）|
+| `noCloudProvider` | 是否跳過 cloud provider 設定 |
+
+:::info 使用時機
+`Metal3ClusterTemplate` 本身不常單獨使用，主要在 ClusterClass（CAPI ClusterTopology feature）中作為 infrastructure class 使用。搭配 `Metal3MachineTemplate` 可實現完整的拓樸化叢集建立流程。
+:::
+
+---
+
+## 多叢集 BMH 隔離
+
+在同一個 management cluster 中管理多個 workload cluster 時，需要確保不同叢集的 BareMetalHost（BMH）不會互相干擾。Metal3 提供兩種隔離機制。
+
+### Namespace 隔離
+
+最簡單也最推薦的隔離方式：
+
+- 每個 workload cluster 的 BMH、Metal3Cluster、Metal3Machine 放在同一個 **dedicated namespace**
+- `Metal3MachineReconciler` 只會選取**同 namespace** 的 BMH
+- 不同叢集的 BMH 因 namespace 不同而天然隔離，無需額外設定
+
+### Label 選擇器（HostSelector）隔離
+
+當多個叢集共用同一 namespace，或需要更細緻的硬體分類時，可在 `Metal3Machine` 使用 `hostSelector` 限制只選取特定 BMH：
+
+```yaml
+spec:
+  hostSelector:
+    matchLabels:
+      cluster-role: production
+      hardware-tier: high-memory
+    matchExpressions:
+      - key: rack
+        operator: In
+        values: ["rack-01", "rack-02"]
+```
+
+搭配 BMH 上的對應 labels：
+
+```yaml
+metadata:
+  labels:
+    cluster-role: production
+    hardware-tier: high-memory
+    rack: rack-01
+```
+
+`hostSelector` 支援標準的 Kubernetes label selector 語法（`matchLabels` 與 `matchExpressions`），讓你可以依硬體規格、機架位置或角色等維度劃分 BMH 資源池。
+
+---
+
+## 外部 kubeconfig 管理
+
+Metal3 Provider 本身**不直接負責** workload cluster kubeconfig 的建立與管理，這部分由 CAPI core controller 處理：
+
+- **KubeadmControlPlane（KCP）** 在 control plane 初始化完成後，會自動建立名稱為 `<cluster-name>-kubeconfig` 的 Secret
+- CAPI core controller 負責此 Secret 的生命週期管理
+- Metal3 Provider 只關注 infrastructure 層（BMH provisioning），不參與 kubeconfig 流程
+
+:::tip 取得 kubeconfig
+使用 `clusterctl` 工具可快速取得 workload cluster 的 kubeconfig：
+
+```bash
+clusterctl get kubeconfig <cluster-name> -n metal3 > workload-kubeconfig.yaml
+```
+
+之後即可使用此 kubeconfig 操作 workload cluster：
+
+```bash
+kubectl --kubeconfig=workload-kubeconfig.yaml get nodes
+```
+:::
+
+---
+
+## MachinePool 支援
+
+CAPI 提供 **MachinePool** feature gate（Alpha/Beta），允許一組機器以 Pool 形式統一管理，類似雲端供應商的 Auto Scaling Group。Metal3 Provider 對應提供 `Metal3MachinePool` CRD（需啟用對應 feature gate）。
+
+MachinePool 的設計初衷是讓一個物件代表多台機器，適合動態擴縮的場景，但裸機環境的特性（機器需要明確 provisioning）使得這個功能在 Metal3 中的語義較為複雜。
+
+:::warning 生產環境建議
+Metal3 的 MachinePool 支援尚在**早期階段**，功能尚未完全穩定。生產環境建議使用 `MachineDeployment` 搭配 `Metal3MachineTemplate`，這是目前最成熟、最廣泛驗證的方式。
+:::
+
+---
+
+## 健康狀態 Condition 與 Event
+
+### Metal3Machine Conditions
+
+`Metal3Machine` 物件上的 Conditions 提供細粒度的狀態追蹤：
+
+| Condition | 說明 |
+|-----------|------|
+| `AssociateBMH` | Metal3Machine 是否成功關聯到 BMH |
+| `WaitingForBaremetalHostReason` | 等待可用 BMH（無符合條件的 BMH 可用）|
+| `WaitingForBootstrapDataReason` | 等待 bootstrap data（kubeadm config 尚未就緒）|
+| `ProvisioningError` | Provisioning 過程中發生錯誤 |
+
+### Debug 常用指令
+
+當叢集建立卡住或節點無法加入時，依以下順序排查：
+
+```bash
+# 查看 Metal3Machine events 與 condition
+kubectl describe metal3machine <name> -n metal3
+
+# 查看 BMH 目前狀態與 events
+kubectl describe baremetalhost <name> -n metal3
+
+# 查看 CAPM3 controller 即時 logs
+kubectl logs -n capm3-system deployment/capm3-controller-manager -c manager
+```
+
+---
+
+## Pivot（搬移）操作
+
+### 什麼是 Pivot
+
+**Pivot** 是 CAPI 的 `clusterctl move` 功能，用於將 CAPI 管理資源從一個 management cluster 搬移到另一個。最常見的情境是：
+
+1. 使用臨時的 **bootstrap cluster**（如 kind）建立第一個 workload cluster
+2. 在 workload cluster 上安裝 CAPI + CAPM3 + BMO
+3. 將所有管理物件從 bootstrap cluster **pivot** 到 workload cluster，讓叢集自我管理（self-managed）
+
+涉及的 Metal3 相關物件包括：
+
+- `Metal3Cluster`、`Metal3Machine`、`Metal3MachineTemplate`
+- `IPPool`、`Metal3Data`、`Metal3DataTemplate`（若使用 IPAM）
+- `BareMetalHost`（BMO 管理）
+
+### Metal3 特有考量
+
+BMH 物件由 **Bare Metal Operator（BMO）** 管理，與一般 CAPI 物件不同：
+
+- Pivot 後目標 cluster 必須也有安裝 BMO，否則 BMH 物件將失去 controller 管理
+- BMH 的硬體狀態（provisioned/available）不會因為物件搬移而改變，機器不會重啟
+- 若 BMH 正在 provisioning 中，pivot 時機需特別謹慎
+
+:::warning 進階操作注意事項
+Pivot Metal3 workload cluster 是**進階操作**，涉及多個元件的版本相容性。請在執行前參考 [官方 Metal3 Pivot 文件](https://book.metal3.io/capm3/pivoting.html) 確認版本相容性，並在非生產環境充分測試。
+:::
+
+---
+
+## 多架構支援
+
+Metal3 支援 **ARM64** 和 **x86_64** 兩種架構的裸機，只需在 `Metal3MachineTemplate` 中指定對應架構的 OS image 即可：
+
+- `image.url`：指向對應架構的 OS image（如 Ubuntu ARM64 或 CentOS x86_64）
+- `image.checksum`：對應 image 的 checksum，確保完整性
+
+當使用 **ClusterClass** 時，可將 `image.url` 和 `image.checksum` 定義為 ClusterClass 變數（variables），讓同一份 ClusterClass 模板可透過參數化支援多架構部署，不需要分開維護不同架構的模板。
+
+---
+
+## CAPM3 Controller Manager 重要啟動參數
+
+調整 CAPM3 controller manager 的行為可透過 Deployment 的啟動參數完成：
+
+| 參數 | 預設值 | 說明 |
+|------|--------|------|
+| `--leader-elect` | `true` | 啟用 leader election（HA 部署必要）|
+| `--baremetal-operator-label-prefix` | `infrastructure.metal3.io/` | BMH → Node label 同步前綴 |
+| `--enable-bmh-name-based-preallocation` | `false` | 啟用 BMH 名稱基礎的 IP 預分配 |
+| `--watchAllNamespaces` | `false` | 監控所有 namespace（預設只監控安裝 namespace）|
+| `--sync-period` | `10m` | 強制 reconcile 週期（定期重新同步狀態）|
+| `--metrics-bind-address` | `:8080` | Metrics server 地址（供 Prometheus 抓取）|
+| `--health-probe-bind-address` | `:9440` | Health probe server 地址（liveness/readiness）|
+
+修改啟動參數範例（直接 patch Deployment）：
+
+```bash
+kubectl patch deployment capm3-controller-manager \
+  -n capm3-system \
+  --type=json \
+  -p='[{"op":"add","path":"/spec/template/spec/containers/0/args/-","value":"--watchAllNamespaces=true"}]'
+```
