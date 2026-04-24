@@ -1,0 +1,207 @@
+---
+layout: doc
+title: MAAS Provider — API 型別與 CRD
+---
+
+# MAAS Provider — API 型別與 CRD
+
+
+<Callout type="info" title="相關章節">
+
+- [專案總覽](/cluster-api-provider-maas/)
+- [架構概覽](/cluster-api-provider-maas/architecture)
+
+</Callout>
+
+
+## API Group 與版本
+
+| 項目 | 值 |
+|------|-----|
+| **API Group** | `infrastructure.cluster.x-k8s.io` |
+| **Version** | `v1beta1` |
+
+此 Provider 實作了 CAPI 所定義的兩個核心合約：
+
+- **InfrastructureCluster 合約** → 由 `MaasCluster` 資源實作，負責管理叢集層級的基礎設施（DNS、Control Plane 端點）
+- **InfrastructureMachine 合約** → 由 `MaasMachine` 資源實作，負責管理單台裸金屬機器的生命週期
+
+CAPI Core Controller 透過 `infrastructureRef` 欄位引用這些資源，並依照合約協議讀取 `status.ready` 來判斷基礎設施是否就緒。
+
+---
+
+## MaasCluster
+
+`MaasCluster` 代表一個叢集所需的 MAAS 基礎設施，Controller 會依據其 Spec 在 MAAS 建立 DNS 記錄並追蹤 Control Plane 端點狀態。
+
+### Spec 欄位
+
+| 欄位 | 類型 | 必填 | 說明 |
+|------|------|:----:|------|
+| `dnsDomain` | `string` | ✅ | DNS 域名，例如 `k8s.example.com`。Control Plane FQDN 將以此為基礎建立。建立後**不可更改**（immutable） |
+| `controlPlaneEndpoint` | `APIEndpoint` | ❌ | Control Plane API server 端點（`host:port`）。通常由 Controller 自動填入，不需手動設定 |
+| `failureDomains` | `[]string` | ❌ | 可用區域列表，對應 MAAS 的 zones 或 resource pools，用於跨區域部署 |
+
+### Status 欄位
+
+| 欄位 | 類型 | 說明 |
+|------|------|------|
+| `ready` | `bool` | Infrastructure 是否就緒。CAPI Core 會等待此欄位為 `true` 才繼續建立 Machine |
+| `failureDomains` | `FailureDomains` | 從 MAAS 發現並回填的 failure domain 資訊，供 CAPI 進行分散部署 |
+| `conditions` | `Conditions` | 目前各子系統的服務狀態，使用標準 CAPI Conditions 格式 |
+
+### MaasCluster Conditions
+
+| Condition | 說明 |
+|-----------|------|
+| `LoadBalancerReady` / `DNSReadyCondition` | DNS FQDN 已在 MAAS 中建立並可解析 |
+| `APIServerAvailable` | Control Plane API server 可達（HTTP 200 回應） |
+
+---
+
+## MaasMachine
+
+`MaasMachine` 代表單台由 MAAS 管理的裸金屬機器。Controller 會根據 Spec 中的篩選條件向 MAAS 申請（allocate）合適的機器，並執行部署流程。
+
+### Spec 欄位
+
+| 欄位 | 類型 | 必填 | 說明 |
+|------|------|:----:|------|
+| `image` | `string` | ✅ | 部署的 OS image 名稱或 ID，必須已預先上傳至 MAAS |
+| `minCPU` | `int` | ❌ | 最低 CPU 核心數需求，用於 MAAS allocate 篩選 |
+| `minMemoryInMB` | `int` | ❌ | 最低記憶體需求（單位：MB），用於 MAAS allocate 篩選 |
+| `tags` | `[]string` | ❌ | 機器標籤篩選條件，只會分配帶有指定標籤的機器 |
+| `resourcePool` | `string` | ❌ | 指定 MAAS resource pool 名稱，限定從該 pool 分配機器 |
+| `failureDomain` | `string` | ❌ | 指定 failure domain（對應 MAAS zone），用於多可用區部署 |
+| `deployInMemory` | `bool` | ❌ | 啟用 in-memory 部署模式（ephemeral deploy）。需要 MAAS ≥ 3.5.10 且機器至少 16GB RAM |
+| `systemID` | `string` | ❌（唯讀） | MAAS 分配機器後由 Controller 回填的 System ID，**不應手動設定** |
+| `providerID` | `string` | ❌（唯讀） | 格式為 `maas://<systemID>`，由 Controller 在 Deployed 狀態後設定 |
+
+### Status 欄位
+
+| 欄位 | 類型 | 說明 |
+|------|------|------|
+| `ready` | `bool` | Machine 是否就緒。當 `providerID` 已設定時為 `true` |
+| `addresses` | `[]MachineAddress` | 機器的 IP 地址列表，從 MAAS 取得並回填 |
+| `machineState` | `MachineState` | 目前 MAAS machine 的狀態（詳見下方枚舉值說明） |
+| `conditions` | `Conditions` | 目前各子系統的服務狀態，使用標準 CAPI Conditions 格式 |
+
+### MaasMachine Conditions
+
+| Condition | 說明 |
+|-----------|------|
+| `MachineDeployed` | MAAS 機器已完成 OS 部署（state 達到 `Deployed`）|
+| `DNSAttached` | Control Plane 機器的 DNS A 記錄已在 MAAS 建立（**僅 Control Plane 機器適用**）|
+
+---
+
+## machineState 枚舉值
+
+`status.machineState` 反映 MAAS 中機器的當前狀態，Controller 會依據不同狀態執行對應的動作。
+
+| State | 說明 | Controller 動作 |
+|-------|------|----------------|
+| `New` | 機器已登記至 MAAS，但尚未被分配 | 等待分配（allocate）完成 |
+| `Allocated` | 機器已分配給此叢集 | 停用 swap、開始部署（deploy） |
+| `Deploying` | OS 正在安裝中 | 輪詢等待，不執行額外操作 |
+| `Deployed` | OS 已安裝完成，機器已上電並可存取 | 填入 `addresses`、建立 DNS（CP）、設定 `providerID` |
+| `Ready` | 機器已完全就緒，可正常使用 | 正常運行，持續 reconcile 狀態 |
+| `DiskErasing` | 機器正在釋放中，磁碟清除進行中 | 等待清除完成 |
+| `Releasing` | 磁碟清除完成，正在釋放回 MAAS pool | 等待釋放完成 |
+
+
+<Callout type="info" title="正常建立流程">
+
+機器建立時的狀態轉換：
+
+```
+New → Allocated → Deploying → Deployed → Ready
+```
+
+- **New**：機器在 MAAS pool 中等待
+- **Allocated**：Controller 呼叫 MAAS API allocate，機器被保留
+- **Deploying**：Controller 呼叫 deploy，MAAS 開始安裝 OS
+- **Deployed**：OS 安裝完成，Controller 設定 DNS 與 ProviderID
+- **Ready**：Machine 進入穩定運行狀態
+
+</Callout>
+
+
+<Callout type="info" title="刪除（釋放）流程">
+
+當 MaasMachine 被刪除時的狀態轉換：
+
+```
+Deployed → DiskErasing → Releasing → New
+```
+
+- **DiskErasing**：MAAS 清除磁碟資料，確保資料安全
+- **Releasing**：機器完成清除，正式歸還至 MAAS resource pool
+- **New**：機器回到可分配狀態，供下次使用
+
+</Callout>
+
+
+---
+
+## MaasMachineTemplate
+
+`MaasMachineTemplate` 是 `MaasMachine` Spec 的**不可變模板（immutable template）**，用於批量建立具有相同規格的機器。
+
+**主要用途：**
+- 在 `MachineDeployment.spec.template.spec.infrastructureRef` 中被引用
+- 讓 CAPI 能夠批量建立多台規格一致的 Worker 機器
+
+**重要注意事項：**
+- `MaasMachineTemplate` 建立後**不可修改**（immutable）
+- 若需要更新機器規格，必須建立新的 `MaasMachineTemplate` 並更新 `MachineDeployment` 的引用
+- 更新 `MachineDeployment` 引用新模板後，CAPI 會執行 rolling update，逐步替換現有機器
+
+---
+
+## Conditions 總表
+
+以下為所有 Conditions 的完整說明，包含各種狀態的 Reason 代碼：
+
+| Condition | Status | Reason | 說明 |
+|-----------|--------|--------|------|
+| `LoadBalancerReady` | `True` | `LoadBalancerProvisioned` | DNS 已成功建立並就緒 |
+| `LoadBalancerReady` | `False` | `LoadBalancerProvisioningFailed` | DNS 建立失敗，詳見 message 欄位 |
+| `APIServerAvailable` | `True` | `APIServerReachable` | Control Plane API server 可正常回應 |
+| `APIServerAvailable` | `False` | `APIServerUnreachable` | Control Plane API server 無法存取 |
+| `MachineDeployed` | `True` | `MachineDeploySucceeded` | MAAS 機器 OS 部署成功完成 |
+| `MachineDeployed` | `False` | `MachineDeployFailed` | MAAS 機器部署失敗，詳見 message 欄位 |
+| `DNSAttached` | `True` | `DNSAttachSucceeded` | DNS A 記錄已成功建立 |
+| `DNSAttached` | `False` | `DNSAttachFailed` | DNS 記錄建立失敗，詳見 message 欄位 |
+
+---
+
+## YAML 範例
+
+以下為完整的 `MaasCluster` 與 `MaasMachine` 資源範例：
+
+```yaml
+apiVersion: infrastructure.cluster.x-k8s.io/v1beta1
+kind: MaasCluster
+metadata:
+  name: my-cluster
+spec:
+  dnsDomain: k8s.example.com
+  failureDomains:
+    - zone-a
+    - zone-b
+---
+apiVersion: infrastructure.cluster.x-k8s.io/v1beta1
+kind: MaasMachine
+metadata:
+  name: my-worker-0
+spec:
+  image: ubuntu-22.04-k8s
+  minCPU: 4
+  minMemoryInMB: 8192
+  tags:
+    - kubernetes
+    - worker
+  resourcePool: production-pool
+  failureDomain: zone-a
+```

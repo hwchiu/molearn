@@ -1,0 +1,242 @@
+---
+layout: doc
+title: Metal3 Provider — Data Templates 與 IPAM
+---
+
+# Metal3 Provider — Data Templates 與 IPAM
+
+
+<Callout type="info" title="相關章節">
+
+- [架構設計](./architecture.md)
+- [BMH 生命週期](./bmh-lifecycle.md)
+- [機器層級 CRD](./crds-machine.md)
+- [專案總覽](./index.md)
+
+</Callout>
+
+
+---
+
+## 什麼是 Metal3 Data Templates
+
+裸機節點部署時，每台機器需要特定的設定——例如靜態 IP 位址、hostname、UUID 等。這些資訊無法預先硬編碼到映像檔中，必須在部署時動態注入。
+
+CAPM3 透過三個相互關聯的 CRD 實現這個需求：
+
+**Metal3DataTemplate → Metal3DataClaim → Metal3Data → K8s Secrets → BareMetalHost**
+
+| 物件 | 角色 |
+|------|------|
+| **Metal3DataTemplate** | 定義 metadata 與 networkdata 的模板（一對多，可供多台機器使用） |
+| **Metal3DataClaim** | 每台機器向模板請求資料的宣告（由 Metal3MachineReconciler 自動建立） |
+| **Metal3Data** | 每台機器渲染後的實際資料（由 Metal3DataTemplateReconciler 建立） |
+| **K8s Secrets** | 儲存最終渲染結果（metadata Secret + networkdata Secret） |
+| **BareMetalHost** | 在 `spec.metaData` / `spec.networkData` 引用上述 Secrets |
+
+完整的資料流向如下：
+
+```
+Metal3DataTemplate（模板定義）
+    ↓ 被 Metal3DataTemplateReconciler 監控
+Metal3DataClaim（每台機器的請求）
+    ↓ 觸發建立
+Metal3Data（每台機器渲染後的實際資料）
+    ↓ 產生
+K8s Secrets（metadata Secret + networkdata Secret）
+    ↓ 被 BMH 引用
+BareMetalHost.spec.metaData / BareMetalHost.spec.networkData
+```
+
+---
+
+## Metal3DataTemplate
+
+### 概念說明
+
+Metal3DataTemplate 定義 metadata 和 networkdata 的 Jinja2 模板。一個模板可被多個 Metal3Machine 使用（一對多關係）。模板本身不包含任何機器特定的值，所有動態部分（如 IP 位址、hostname）都透過變數引用，在渲染 Metal3Data 時才填入。
+
+### Spec 欄位
+
+| 欄位 | 類型 | 說明 |
+|------|------|------|
+| `metaData` | MetaData | metadata 模板（可選）|
+| `networkData` | NetworkData | networkdata 模板（可選）|
+
+### MetaData 支援的欄位
+
+MetaData 的內容最終會成為 cloud-init metadata 的鍵值對，傳遞給作業系統初始化使用。
+
+| 欄位 | 說明 |
+|------|------|
+| `strings` | 靜態字串鍵值對 |
+| `objectNames` | 使用物件名稱（如 Metal3Machine 名稱） |
+| `indexes` | 索引值（0, 1, 2...），根據 Metal3Data 的 index 欄位填入 |
+| `ipAddressesFromIPPool` | 從 IPPool 分配的 IP 地址 |
+| `prefixesFromIPPool` | 從 IPPool 取得的子網路前綴 |
+| `gatewaysFromIPPool` | 從 IPPool 取得的 gateway |
+| `dnsServersFromIPPool` | 從 IPPool 取得的 DNS servers |
+| `fromHostInterfaces` | 從 BMH 的網路介面取得 MAC 地址等資訊 |
+| `fromAnnotations` | 從 BMH 的 annotations 取得值 |
+
+### NetworkData 說明
+
+NetworkData 定義每台機器的網路設定，格式為 cloud-init network-config v1/v2 格式，主要包含三個區段：
+
+| 區段 | 說明 |
+|------|------|
+| `links` | 網路介面定義（如 ethernet、bond、vlan） |
+| `networks` | IP 設定（IPv4/IPv6 地址、子網路、路由） |
+| `services` | 服務設定（如 DNS nameservers） |
+
+每個 network 的 IP 位址可以直接來自 IPPool，由 IPAM 負責分配不重複的 IP。
+
+### 完整 YAML 範例（含 IPPool 整合）
+
+```yaml
+apiVersion: infrastructure.cluster.x-k8s.io/v1beta1
+kind: Metal3DataTemplate
+metadata:
+  name: my-cluster-worker-data-template
+  namespace: metal3
+spec:
+  clusterName: my-cluster
+  metaData:
+    objectNames:
+      - key: name
+        object: metal3machine
+      - key: local-hostname
+        object: metal3machine
+    ipAddressesFromIPPool:
+      - key: provisioningIP
+        name: my-provisioning-pool
+    prefixesFromIPPool:
+      - key: provisioningCIDR
+        name: my-provisioning-pool
+    gatewaysFromIPPool:
+      - key: provisioningGateway
+        name: my-provisioning-pool
+    fromHostInterfaces:
+      - key: bootMAC
+        interface: "eth0"
+  networkData:
+    links:
+      ethernets:
+        - type: phy
+          id: eth0
+          macAddress:
+            fromHostInterface: eth0
+    networks:
+      ipv4:
+        - id: eth0
+          link: eth0
+          ipAddressFromIPPool: my-worker-pool
+          routes:
+            - network: 0.0.0.0
+              prefix: 0
+              gateway:
+                fromIPPool: my-worker-pool
+    services:
+      dns:
+        - 8.8.8.8
+        - 8.8.4.4
+```
+
+---
+
+## Metal3DataClaim
+
+### 概念說明
+
+Metal3DataClaim 是每個 Metal3Machine 向 Metal3DataTemplate 請求 Metal3Data 的宣告物件。
+
+- **由 Metal3MachineReconciler 自動建立**，無需使用者手動建立
+- 名稱格式與對應的 Metal3Machine 相同
+- 建立後，Metal3DataTemplateReconciler 偵測到新的 Metal3DataClaim，並建立對應的 Metal3Data 物件（同時分配 index）
+
+### Spec 欄位
+
+| 欄位 | 類型 | 說明 |
+|------|------|------|
+| `template` | ObjectReference | 引用對應的 Metal3DataTemplate |
+
+### Status 欄位
+
+| 欄位 | 類型 | 說明 |
+|------|------|------|
+| `renderedData` | ObjectReference | 指向建立的 Metal3Data 物件 |
+| `errorMessage` | string | 錯誤訊息（若渲染失敗） |
+
+---
+
+## Metal3Data
+
+### 概念說明
+
+Metal3Data 是每台機器的實際渲染結果：
+
+- 由 **Metal3DataTemplateReconciler** 建立（負責分配 index）
+- **Metal3DataReconciler** 讀取對應的 Metal3DataTemplate，將機器特定變數（IP、hostname、MAC 等）填入模板，渲染產生最終的 metadata 和 networkdata
+- 渲染結果儲存在兩個 Kubernetes Secrets 中：一個存放 metadata，一個存放 networkdata
+
+### Spec 欄位
+
+| 欄位 | 類型 | 說明 |
+|------|------|------|
+| `template` | ObjectReference | 對應的 Metal3DataTemplate |
+| `claim` | ObjectReference | 對應的 Metal3DataClaim |
+| `index` | int | 機器索引（用於 IPPool IP 分配，保證每台機器取得唯一 IP） |
+
+### Status 欄位
+
+| 欄位 | 類型 | 說明 |
+|------|------|------|
+| `ready` | bool | 渲染是否完成 |
+| `metaData` | SecretReference | 產生的 metadata Secret |
+| `networkData` | SecretReference | 產生的 networkdata Secret |
+| `errorMessage` | string | 渲染錯誤訊息 |
+
+---
+
+## 完整資料流程
+
+以下為從模板定義到裸機 provisioning 的完整流程：
+
+1. **使用者建立 Metal3DataTemplate**，定義 metadata 和 networkdata 的模板格式，並指定 IPPool 等資源引用。
+2. **CAPI 建立 Machine**，Metal3MachineReconciler 建立對應的 Metal3Machine。
+3. **Metal3MachineReconciler 偵測到 `spec.dataTemplate` 有設定** → 自動建立 Metal3DataClaim 物件，引用指定的 Metal3DataTemplate。
+4. **Metal3DataTemplateReconciler 偵測到新的 Metal3DataClaim** → 建立 Metal3Data 物件，並分配唯一的 index（用於 IPPool 分配）。
+5. **Metal3DataReconciler 偵測到新的 Metal3Data** → 讀取對應的 Metal3DataTemplate → 根據 index、BMH 資訊、IPPool 結果填入變數進行渲染 → 建立 metadata Secret 和 networkdata Secret。
+6. **Metal3Data.Status.ready 設為 true**，Status 中填入 metaData 和 networkData 的 Secret 引用。
+7. **Metal3MachineReconciler 偵測到 Metal3Data 已 ready** → 取得 Secret 引用 → 將引用設定到 `BMH.spec.metaData` 和 `BMH.spec.networkData`。
+8. **BMO（Bare Metal Operator）讀取 Secrets** → 在 provisioning 時透過 Ironic 將 metadata 和 networkdata 注入裸機。
+
+---
+
+## 常見使用場景
+
+
+<Callout type="tip" title="場景 1：靜態 IP 分配（使用 Data Templates）">
+
+適合需要靜態 IP 的生產環境，透過 IPPool（`ipam.metal3.io`）分配固定 IP：
+
+1. 建立 `IPPool` 物件，定義可用的 IP 範圍、子網路前綴與 gateway
+2. 在 Metal3DataTemplate 的 `networkData` 中，以 `ipAddressFromIPPool` 引用 IPPool
+3. Metal3Data 渲染時，根據機器的 `index` 從 IPPool 取得唯一 IP
+4. 每台機器獲得固定、不重複的靜態 IP 位址
+
+此方式可確保叢集中每台裸機擁有可預期的靜態網路設定，便於 DNS 管理與安全策略設定。
+
+</Callout>
+
+
+<Callout type="tip" title="場景 2：DHCP 網路（不使用 Data Templates）">
+
+若環境中已有 DHCP 服務，可以完全跳過 Data Templates 機制：
+
+- Metal3Machine 的 `spec.dataTemplate` 留空，不設定任何引用
+- 不需要建立 Metal3DataTemplate、Metal3DataClaim、Metal3Data 等物件
+- BMH 的 `spec.networkData` 保持空白，裸機開機後自動透過 DHCP 取得 IP
+- 適合測試環境、概念驗證（PoC），或生產環境中已有成熟 DHCP 基礎設施的情況
+
+</Callout>

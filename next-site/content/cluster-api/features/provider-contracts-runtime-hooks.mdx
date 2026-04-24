@@ -1,0 +1,267 @@
+---
+layout: doc
+title: Cluster API — Provider 合約與 Runtime Hooks
+---
+
+# Provider 合約與 Runtime Hooks
+
+
+<Callout type="info" title="相關章節">
+
+- [架構概覽](/cluster-api/architecture)
+- [Core Controller](/cluster-api/controller-core)
+- [ClusterClass 與 Topology](/cluster-api/clusterclass-topology)
+
+</Callout>
+
+
+## Provider 合約概念
+
+**Provider Contract** 是 CAPI core controller 與各 Provider（Infrastructure、Bootstrap、ControlPlane）之間的介面約定。這套合約定義了雙方透過 Kubernetes 物件的特定欄位和狀態進行通訊的方式。
+
+核心設計理念：
+- **介面導向**：CAPI core 只依賴合約中規定的欄位，不關心 Provider 內部實作細節
+- **可替換性**：只要實作符合合約的 CRD 與 Controller，任何廠商都可以提供自己的 Provider
+- **鬆耦合**：各 Provider 彼此獨立，CAPI core 透過標準化的欄位讀寫來協調整個生命週期
+
+例如，Metal3、MaaS、AWS 都實作了 InfrastructureCluster 合約，CAPI core 對它們一視同仁，統一使用 `status.ready` 和 `spec.controlPlaneEndpoint` 等欄位判斷進度。
+
+---
+
+## InfrastructureCluster 合約
+
+InfrastructureCluster（如 `Metal3Cluster`、`MaasCluster`）代表在特定 Infrastructure Provider 上建立叢集所需的基礎設施資源。
+
+### 必要欄位
+
+| 欄位 | 類型 | 說明 |
+|------|------|------|
+| `spec.controlPlaneEndpoint.host` | string | Control Plane 的 API Server 地址（VIP 或 LB IP）|
+| `spec.controlPlaneEndpoint.port` | int32 | API Server 的 port（通常 6443）|
+| `status.ready` | bool | Infrastructure 是否就緒（必須為 true 才能繼續）|
+
+### 可選欄位
+
+| 欄位 | 說明 |
+|------|------|
+| `status.failureReason` | 失敗原因（機器可讀的錯誤碼）|
+| `status.failureMessage` | 失敗訊息（人類可讀的描述）|
+| `status.conditions` | 健康狀態條件列表（使用 CAPI 標準 Condition 格式）|
+
+### CAPI 如何使用這些欄位
+
+`ClusterReconciler` 在協調過程中會：
+
+1. 讀取 `status.ready`，若為 `false` 則等待（不繼續推進）
+2. `status.ready = true` 後，讀取 `spec.controlPlaneEndpoint` 填入 `Cluster.Spec.ControlPlaneEndpoint`
+3. 若 `status.failureReason` 已設定，將 Cluster 物件推進到 `Failed` 狀態並停止協調
+
+---
+
+## InfrastructureMachine 合約
+
+InfrastructureMachine（如 `Metal3Machine`、`MaasMachine`）代表在 Infrastructure 上建立單台機器（實體機或虛擬機）所需的資源。
+
+### 必要欄位
+
+| 欄位 | 類型 | 說明 |
+|------|------|------|
+| `spec.providerID` | string | 機器在 Infrastructure 中的唯一識別符（如 `metal3://namespace/baremetalhost-name`）|
+| `status.ready` | bool | 機器是否就緒（OS 安裝並啟動完成）|
+
+### 可選欄位
+
+| 欄位 | 說明 |
+|------|------|
+| `status.addresses` | 機器的 IP/hostname 列表（NodeAddress 格式）|
+| `status.failureReason` | 失敗原因（機器可讀）|
+| `status.failureMessage` | 失敗訊息（人類可讀）|
+| `status.conditions` | 健康狀態條件 |
+| `status.interruptible` | 是否可被中斷（適用於 Spot Instance 等可搶占機器）|
+
+### CAPI 如何使用這些欄位
+
+`MachineReconciler` 在協調過程中會：
+
+1. 等待 `status.ready = true`，之後將 Machine 推進到 `Provisioned` 狀態
+2. 讀取 `spec.providerID`，寫入 `Machine.Spec.ProviderID`
+3. 透過 ProviderID 在 workload cluster 中尋找對應的 K8s Node，完成 Node 與 Machine 的關聯
+
+---
+
+## Bootstrap Provider 合約
+
+Bootstrap Provider（如 `KubeadmConfig`）負責產生機器啟動時所需的 cloud-init / ignition 腳本，讓機器加入叢集。
+
+### 必要欄位
+
+| 欄位 | 類型 | 說明 |
+|------|------|------|
+| `status.ready` | bool | Bootstrap 資料是否已就緒 |
+| `status.dataSecretName` | string | 含 bootstrap 資料的 Secret 名稱（Machine Controller 會掛載此 Secret）|
+
+### 可選欄位
+
+| 欄位 | 說明 |
+|------|------|
+| `status.failureReason` | 失敗原因（機器可讀）|
+| `status.failureMessage` | 失敗訊息（人類可讀）|
+| `status.conditions` | 健康狀態條件 |
+
+CAPI Machine Controller 等待 `status.ready = true` 且 `status.dataSecretName` 非空後，才會將 bootstrap data secret 傳遞給 InfrastructureMachine，觸發機器的實際 provisioning 流程。
+
+---
+
+## ControlPlane Provider 合約
+
+ControlPlane Provider（如 `KubeadmControlPlane`）負責管理 Control Plane 節點的完整生命週期，包括建立、升級和擴縮。
+
+### 必要欄位
+
+| 欄位 | 類型 | 說明 |
+|------|------|------|
+| `status.initialized` | bool | 第一台 CP 是否完成初始化（API Server 已可接受連線）|
+| `status.ready` | bool | CP 整體是否完全就緒（所有節點健康）|
+
+### 可選但重要的欄位
+
+| 欄位 | 說明 |
+|------|------|
+| `status.replicas` | 目前 CP 節點總數量 |
+| `status.readyReplicas` | 就緒的 CP 節點數量 |
+| `status.updatedReplicas` | 已更新至目標版本的 CP 節點數量 |
+| `status.unavailableReplicas` | 目前不可用的 CP 節點數量 |
+| `status.version` | 目前 CP 的 Kubernetes 版本 |
+| `status.externalManagedControlPlane` | 若為 `true`，表示 CP 由外部服務管理（如 EKS），CAPI 不直接管理 CP 機器 |
+| `spec.machineTemplate` | 機器模板定義，供 topology controller 計算 rollout 使用 |
+
+CAPI Cluster Controller 依賴 `status.initialized` 判斷是否可以開始加入 Worker 節點，依賴 `status.ready` 判斷叢集整體是否進入 Ready 狀態。
+
+---
+
+## Provider 合約版本化
+
+
+<Callout type="info" title="合約版本與相容性">
+
+每個 CAPI 版本都對應特定的合約版本。合約在 `cluster.x-k8s.io/v1beta1` API 穩定後趨於穩定，但每個 CAPI minor 版本仍可能引入新的可選欄位或行為調整。
+
+Provider 需要在自己的 manifest 中聲明支援的合約版本（通常透過 label 或 annotation）。使用 `clusterctl` 安裝 Provider 時，工具會自動驗證 Provider 版本與目標叢集 CAPI 版本的相容性，若不相容會顯示警告或阻止安裝。
+
+建議追蹤 CAPI 官方的 [Provider Contract 文件](https://cluster-api.sigs.k8s.io/developer/providers/contracts)，確認每個版本的欄位要求變更。
+
+</Callout>
+
+
+---
+
+## Runtime Hooks（Runtime SDK）
+
+Runtime SDK（Feature Gate: `RuntimeSDK`，目前為 Alpha，預設關閉）允許外部系統透過 webhook 參與 CAPI 的生命週期決策，是一種事件驅動的「插件」機制。
+
+### ExtensionConfig CRD
+
+要注冊一個 Runtime Extension，需要建立 `ExtensionConfig` 物件：
+
+```yaml
+apiVersion: runtime.cluster.x-k8s.io/v1alpha1
+kind: ExtensionConfig
+metadata:
+  name: my-extension
+spec:
+  clientConfig:
+    service:
+      name: my-extension-webhook
+      namespace: my-extension-system
+      port: 443
+      path: /hooks
+  namespaceSelector:
+    matchExpressions:
+      - key: kubernetes.io/metadata.name
+        operator: In
+        values: ["default", "production"]
+  settings:
+    failurePolicy: Fail    # 若 webhook 失敗，阻止 CAPI 繼續
+```
+
+`namespaceSelector` 可限制此 Extension 只對特定 namespace 的 Cluster 生效。`failurePolicy: Fail` 表示若 webhook 無法連線或回傳錯誤，CAPI 會阻止對應的操作繼續進行。
+
+### 支援的 Runtime Hooks
+
+| Hook | 觸發時機 | 說明 |
+|------|---------|------|
+| `BeforeClusterCreate` | Cluster 建立前 | 可阻止建立、注入額外設定或進行配額驗證 |
+| `AfterControlPlaneInitialized` | CP 初始化後 | 可執行初始化後動作，如配置監控或 DNS |
+| `BeforeClusterUpgrade` | Cluster 升級前 | 可阻止升級、執行升級前檢查或備份 |
+| `AfterControlPlaneUpgrade` | CP 升級後 | 可在 CP 升級後、Worker 節點升級前執行中間步驟 |
+| `BeforeClusterDelete` | Cluster 刪除前 | 可阻止刪除、觸發資料備份或通知外部系統 |
+| `TopologyMutationHook` | Topology 計算時 | 可修改 topology 計算結果，實作動態配置注入 |
+
+### Runtime Hook 請求/回應格式
+
+CAPI 以 HTTP POST 方式呼叫 webhook，格式如下：
+
+```json
+// CAPI 發送給 webhook 的請求
+{
+  "apiVersion": "hooks.runtime.cluster.x-k8s.io/v1alpha1",
+  "kind": "BeforeClusterCreateRequest",
+  "cluster": { ... }
+}
+
+// webhook 回應
+{
+  "apiVersion": "hooks.runtime.cluster.x-k8s.io/v1alpha1",
+  "kind": "BeforeClusterCreateResponse",
+  "status": "Success",
+  "message": "",
+  "retryAfterSeconds": 0
+}
+```
+
+`retryAfterSeconds` 欄位控制重試行為：
+- `0`：CAPI 不重試（視為最終結果）
+- `> 0`：CAPI 在指定秒數後重新呼叫 webhook（適合非同步場景，如等待備份完成）
+
+### 適用場景
+
+- 升級前自動備份 etcd 資料
+- 建立叢集前驗證雲端配額是否充足
+- 升級前通知外部監控系統進入維護模式
+- 透過 `TopologyMutationHook` 注入自定義標籤或資源設定
+
+
+<Callout type="warning" title="RuntimeSDK 尚未穩定">
+
+RuntimeSDK 目前是 Alpha 功能，API 可能在未來版本中發生不相容的變更。生產環境使用前需謹慎評估風險，並密切關注 CAPI 發布說明中的 breaking changes。
+
+</Callout>
+
+
+---
+
+## Webhook 強制執行的不可變欄位
+
+CAPI 透過 admission webhook 強制執行部分欄位的不可變性，防止不安全的原地修改操作。
+
+### 不可變欄位一覽
+
+| 物件 | 不可變欄位 |
+|------|----------|
+| `Machine` | `spec.clusterName`、`spec.bootstrap.configRef`、`spec.infrastructureRef` |
+| `MachineSet` | `spec.clusterName`、`spec.selector` |
+| `MachineDeployment` | `spec.clusterName`、`spec.selector` |
+| `MachineHealthCheck` | `spec.clusterName`、`spec.selector` |
+| `IPAddress` | `spec.clusterName`、`spec.poolRef`、`spec.address`、`spec.prefix`、`spec.gateway` |
+| `ClusterResourceSet` | `spec.strategy`、`spec.clusterSelector` |
+
+這些欄位一旦建立後不得修改，原因是它們是關鍵識別符，修改可能導致 Controller 狀態不一致或孤兒資源（orphaned resources）。
+
+
+<Callout type="tip" title="若需要變更不可變欄位">
+
+刪除並重建相關物件是唯一的方法。例如，若需要更換 Machine 的 `infrastructureRef`（更換 InfrastructureMachine 物件），必須先刪除舊的 Machine 物件，再重新建立新的 Machine 並指向正確的 InfrastructureMachine。
+
+執行此類操作前，請確認已備份相關狀態，並了解重建期間該節點的工作負載會被重新排程。
+
+</Callout>

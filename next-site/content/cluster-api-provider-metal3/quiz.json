@@ -1,0 +1,182 @@
+[
+  {
+    "id": 1,
+    "question": "Q1. Metal3 Provider 的 ProviderID 格式為何？",
+    "options": [
+      "metal3://<namespace>/<bmh-name>/<m3machine-name>",
+      "metal3://<systemID>",
+      "metal3://<cluster-name>/<machine-name>",
+      "baremetal://<namespace>/<bmh-name>"
+    ],
+    "answer": 0,
+    "explanation": "Metal3 Provider 的 ProviderID 格式為 metal3://<namespace>/<bmh-name>/<m3machine-name>，由三個部分組成：Metal3Machine 所在的 namespace、關聯的 BareMetalHost 名稱，以及 Metal3Machine 名稱。"
+  },
+  {
+    "id": 2,
+    "question": "Q2. 以下哪個元件負責直接與 IPMI/Redfish 通訊來管理裸機電源？",
+    "options": [
+      "CAPM3（cluster-api-provider-metal3）",
+      "Bare Metal Operator（BMO）",
+      "CAPI core controller",
+      "Metal3MachineReconciler"
+    ],
+    "answer": 1,
+    "explanation": "Bare Metal Operator（BMO）負責直接與 IPMI/Redfish 等帶外管理介面通訊，管理 BareMetalHost 的電源狀態、韌體更新和 OS 安裝。CAPM3 是 CAPI 的 Infrastructure Provider，透過管理 BMH 物件間接控制裸機。"
+  },
+  {
+    "id": 3,
+    "question": "Q3. BMH 的 automatedCleaningMode 設為何值時，可以跳過磁碟清除流程？",
+    "options": [
+      "metadata",
+      "skip",
+      "disabled",
+      "none"
+    ],
+    "answer": 2,
+    "explanation": "automatedCleaningMode 設為 disabled 時，BMO 不會在 deprovisioning 時執行磁碟清除（disk wipe）流程，讓 BMH 能更快回到 Available 狀態。這在 Node Reuse 場景中特別有用，可大幅縮短升級時間。"
+  },
+  {
+    "id": 4,
+    "question": "Q4. Metal3Data 物件由誰負責建立？",
+    "options": [
+      "使用者手動建立",
+      "Metal3Machine controller",
+      "BMO controller",
+      "CAPI core controller"
+    ],
+    "answer": 1,
+    "explanation": "Metal3Data 物件由 Metal3MachineReconciler 在 provisioning 時自動建立，每台 Metal3Machine 對應一個 Metal3Data，用於儲存渲染後的 metadata 和 networkdata。"
+  },
+  {
+    "id": 5,
+    "question": "Q5. Metal3DataTemplate 使用什麼模板語言來渲染 networkdata？",
+    "options": [
+      "Go template",
+      "Helm template",
+      "Jinja2",
+      "ERB（Embedded Ruby）"
+    ],
+    "answer": 2,
+    "explanation": "Metal3DataTemplate 使用 Jinja2 模板語言來渲染 networkdata 和 metadata，這與 cloud-init 的設計一致。Jinja2 語法用 &#123;&#123; &#125;&#125; 表示變數，可以引用機器名稱、IP 地址等動態資訊。"
+  },
+  {
+    "id": 6,
+    "question": "Q6. 以下哪個不是 Metal3 Provider 的 CRD？",
+    "options": [
+      "Metal3Cluster",
+      "Metal3DataClaim",
+      "Metal3IPPool",
+      "Metal3RemediationTemplate"
+    ],
+    "answer": 2,
+    "explanation": "Metal3IPPool 並不是 Metal3 Provider（CAPM3）的 CRD。IPAM 功能由獨立的 ip-address-manager 元件提供，其 CRD 名稱是 IPPool（API group: ipam.metal3.io/v1alpha1）。Metal3Cluster、Metal3DataClaim 和 Metal3RemediationTemplate 都是 CAPM3 的 CRD。"
+  },
+  {
+    "id": 7,
+    "question": "Q7. 啟用 Node Reuse 功能時，哪個 label 會被設定在 BMH 上以預留給特定 Metal3Machine？",
+    "options": [
+      "metal3.io/reserved-for",
+      "infrastructure.cluster.x-k8s.io/metal3machine",
+      "cluster.x-k8s.io/reuse",
+      "metal3.io/keep-bmh"
+    ],
+    "answer": 1,
+    "explanation": "Node Reuse 機制透過在 BMH 上設定 infrastructure.cluster.x-k8s.io/metal3machine: &lt;new-metal3machine-name&gt; 這個 label，告知 Metal3MachineReconciler 在建立新 Metal3Machine 時，優先選取帶有此 label 的 BMH，實現 BMH 的重用。"
+  },
+  {
+    "id": 8,
+    "question": "Q8. 使用 Metal3 自帶 IPAM（IPPool）時，IP 分配是由哪個流程觸發？",
+    "options": [
+      "BMO 在 provisioning 時觸發",
+      "Metal3DataReconciler 建立 IPClaim 時觸發",
+      "CAPI core controller 觸發",
+      "使用者手動建立 IPClaim"
+    ],
+    "answer": 1,
+    "explanation": "Metal3DataReconciler 在渲染 Metal3DataTemplate 時，會為需要 IP 的欄位建立 IPClaim 物件。IPPool controller 偵測到 IPClaim 後，從 IP 範圍分配一個未使用的 IP，建立 IPAddress 物件，供 DataReconciler 讀取並填入模板。"
+  },
+  {
+    "id": 9,
+    "question": "Q9. enableBMHNameBasedPreallocation 功能的主要用途是什麼？",
+    "options": [
+      "讓 BMH 名稱自動成為 hostname",
+      "確保特定 BMH 每次都取得相同的 IP 地址",
+      "根據 BMH 名稱自動選擇 OS image",
+      "讓多台 BMH 共用同一個 IPPool"
+    ],
+    "answer": 1,
+    "explanation": "enableBMHNameBasedPreallocation 功能啟用後，Metal3Machine 的名稱與 BMH 名稱建立固定映射，結合 IPPool 的 preAllocations 設定，確保同一台 BMH 每次 provisioning 都取得相同的 IP 地址，適合需要 IP 穩定性的生產環境。"
+  },
+  {
+    "id": 10,
+    "question": "Q10. CAPI 標準 IPAM（ipam.cluster.x-k8s.io）與 Metal3 自帶 IPAM 最大的差異是什麼？",
+    "options": [
+      "CAPI IPAM 只支援 IPv6",
+      "CAPI IPAM 不支援 preAllocations",
+      "CAPI IPAM 可對接任意 IPAM 後端（Infoblox 等），不限於 Metal3 自帶工具",
+      "Metal3 IPAM 需要 DHCP 伺服器"
+    ],
+    "answer": 2,
+    "explanation": "ipam.cluster.x-k8s.io 是 CAPI 定義的標準 IPAM 介面，任何實作此介面的工具（如 Infoblox、in-cluster IPAM）都可以與 Metal3 整合。而 ipam.metal3.io 是 Metal3 ecosystem 內部的 IPPool 實作，較為封閉但整合更緊密。"
+  },
+  {
+    "id": 11,
+    "question": "Q11. Metal3 Remediation 的 Reboot 策略超過 retryLimit 後會發生什麼？",
+    "options": [
+      "Metal3Remediation 保持 Running 狀態等待人工介入",
+      "Metal3Remediation 標記為 Failed，MachineHealthCheck 改用 CAPI 預設策略（刪除 Machine）",
+      "自動增加 retryLimit 繼續重試",
+      "直接刪除 BMH 並請求新的裸機"
+    ],
+    "answer": 1,
+    "explanation": "當 Reboot 重試次數超過 retryLimit 後，Metal3Remediation 的 Status.Phase 會被標記為 Failed。此時 MachineHealthCheck controller 會改用 CAPI 預設的 Remediation 策略——刪除不健康的 Machine，讓 MachineSet 或 KCP 建立新的 Machine（需要完整的 deprovisioning 和 reprovisioning 流程）。"
+  },
+  {
+    "id": 12,
+    "question": "Q12. LabelSync 的 Label 同步方向為何？",
+    "options": [
+      "K8s Node → BareMetalHost",
+      "BareMetalHost → K8s Node",
+      "Metal3Machine → BareMetalHost",
+      "雙向同步"
+    ],
+    "answer": 1,
+    "explanation": "LabelSync 是單向同步：將 BareMetalHost 上帶有特定前綴（預設 infrastructure.metal3.io/）的 labels 同步到 workload cluster 的 K8s Node 物件上。反向（Node → BMH）不會同步。若直接修改 Node 上的這些 labels，下次 reconcile 時會被 BMH 的值覆蓋。"
+  },
+  {
+    "id": 13,
+    "question": "Q13. 下列哪種場景最適合使用 Node Reuse 功能？",
+    "options": [
+      "首次安裝新叢集",
+      "更換損壞的裸機硬體",
+      "Control Plane K8s 版本滾動升級",
+      "水平擴展 Worker 節點"
+    ],
+    "answer": 2,
+    "explanation": "Node Reuse 目前只支援 KubeadmControlPlane（KCP）的 Control Plane 升級場景。它讓升級時跳過 deprovisioning 和 disk cleaning 流程，直接在同一台 BMH 上重新安裝新版本的 K8s，大幅縮短升級時間（約縮短 40-50%）。Worker node 升級不支援此功能。"
+  },
+  {
+    "id": 14,
+    "question": "Q14. Metal3Machine 關聯 BMH 的優先順序（由高到低）為何？",
+    "options": [
+      "Ready > Available > node-reuse label > name-based preallocation",
+      "node-reuse label > name-based preallocation > Ready > Available",
+      "name-based preallocation > node-reuse label > Available > Ready",
+      "Available > Ready > node-reuse label > name-based preallocation"
+    ],
+    "answer": 1,
+    "explanation": "Metal3MachineReconciler 選取 BMH 的優先順序為：1) 帶有 node-reuse label（infrastructure.cluster.x-k8s.io/metal3machine）的 BMH 2) 透過名稱預分配（name-based preallocation）指定的 BMH 3) 狀態為 Ready 的 BMH 4) 狀態為 Available 的 BMH。優先選用預先指定的 BMH 確保升級時機器的一致性。"
+  },
+  {
+    "id": 15,
+    "question": "Q15. 以下哪個說法正確描述了 Metal3Data、Metal3DataClaim 和 Metal3DataTemplate 的關係？",
+    "options": [
+      "Metal3DataTemplate 直接提供資料給 BMH，不需要其他物件",
+      "Metal3DataClaim 是使用者建立的，Metal3Data 是 Metal3Machine 自動建立的",
+      "Metal3DataTemplate 是模板，Metal3DataClaim 請求資料，Metal3Data 是渲染結果",
+      "Metal3Data 和 Metal3DataClaim 是同一個物件的兩個版本"
+    ],
+    "answer": 2,
+    "explanation": "三者的關係是：Metal3DataTemplate 定義模板（包含 metaData 和 networkData 的 Jinja2 模板）；Metal3DataClaim 是 Metal3Machine controller 建立的「請求」，引用 Metal3DataTemplate；Metal3Data 是 Metal3DataReconciler 根據 Metal3DataTemplate 渲染後的具體結果，包含每台機器的實際 IP、hostname 等資訊，最終作為 Secret 注入 BMH。"
+  }
+]

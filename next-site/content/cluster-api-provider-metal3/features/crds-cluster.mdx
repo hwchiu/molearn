@@ -1,0 +1,181 @@
+---
+layout: doc
+title: Metal3 Provider — 叢集層級 CRD
+---
+
+# Metal3 Provider — 叢集層級 CRD
+
+
+<Callout type="info" title="相關章節">
+
+- [專案總覽](./index.md)
+- [架構與設計](./architecture.md)
+- [BareMetalHost 生命週期](./bmh-lifecycle.md)
+
+</Callout>
+
+
+## 概覽
+
+Metal3 Provider 定義兩個叢集層級的 CRD，對應 CAPI 的 **InfraCluster 合約**，負責叢集層級的基礎設施抽象：
+
+| CRD | 用途 |
+|-----|------|
+| `Metal3Cluster` | 實作 CAPI InfraCluster 合約，描述叢集的基礎設施端點 |
+| `Metal3ClusterTemplate` | Metal3Cluster 的不可變模板，用於 ClusterClass（Topology）模式 |
+
+與其他 Infrastructure Provider（如 CAPV、CAPA）相比，Metal3 的叢集層級邏輯非常精簡——Metal3 **不管理 Load Balancer**，`controlPlaneEndpoint` 必須由外部工具預先準備。
+
+---
+
+## Metal3Cluster
+
+### 概念說明
+
+`Metal3Cluster` 是 CAPM3 實作 CAPI InfraCluster 合約的核心 CRD。每個由 CAPI 管理的裸機叢集，都對應一個 `Metal3Cluster` 物件。
+
+
+<Callout type="info" title="重要設計決策">
+
+Metal3 **不負責建立或管理 Load Balancer**。`controlPlaneEndpoint`（Control Plane 的 VIP 位址）必須由外部工具（keepalived、MetalLB 等）提供，使用者需在建立叢集前先準備好 VIP。
+
+這與 CAPA（AWS Provider）或 CAPV（vSphere Provider）不同，後兩者會自動建立對應的負載均衡資源。
+
+</Callout>
+
+
+### Spec 欄位
+
+| 欄位 | 類型 | 必填 | 說明 |
+|------|------|------|------|
+| `controlPlaneEndpoint` | APIEndpoint | ✅ | Control Plane API server 端點（host:port），必須預先配置 VIP |
+| `noCloudProvider` | bool | ❌ | 是否禁用 cloud provider 整合（預設 false） |
+| `cloudName` | string | ❌ | cloud provider 名稱（若啟用 cloud provider 時使用） |
+
+### Status 欄位
+
+| 欄位 | 類型 | 說明 |
+|------|------|------|
+| `ready` | bool | Infrastructure 是否就緒（由 controller 設定為 true） |
+| `conditions` | Conditions | 目前服務狀態 |
+
+### Conditions
+
+| Condition | 說明 |
+|-----------|------|
+| `Ready` | Metal3Cluster 是否就緒 |
+
+### YAML 範例
+
+```yaml
+apiVersion: infrastructure.cluster.x-k8s.io/v1beta1
+kind: Metal3Cluster
+metadata:
+  name: my-metal3-cluster
+  namespace: metal3
+spec:
+  controlPlaneEndpoint:
+    host: 192.168.1.100   # 預先配置的 VIP
+    port: 6443
+  noCloudProvider: false
+```
+
+---
+
+## Metal3ClusterTemplate
+
+### 概念說明
+
+`Metal3ClusterTemplate` 是 `Metal3Cluster` 的**不可變模板**，主要用於 ClusterClass（Topology）模式。當使用 ClusterClass 時，叢集基礎設施模板透過 `Metal3ClusterTemplate` 定義，讓多個叢集共享同一份基礎設施規格。
+
+### Spec 欄位
+
+| 欄位 | 類型 | 說明 |
+|------|------|------|
+| `template.spec` | Metal3ClusterSpec | 與 `Metal3Cluster.spec` 相同的欄位 |
+
+### YAML 範例
+
+```yaml
+apiVersion: infrastructure.cluster.x-k8s.io/v1beta1
+kind: Metal3ClusterTemplate
+metadata:
+  name: my-cluster-template
+  namespace: metal3
+spec:
+  template:
+    spec:
+      controlPlaneEndpoint:
+        host: ""   # 在 ClusterClass 中通常留空，由 topology 填入
+        port: 6443
+      noCloudProvider: false
+```
+
+---
+
+## Cluster → Metal3Cluster 關聯
+
+CAPI 的 `Cluster` 物件透過 `infrastructureRef` 引用 `Metal3Cluster`，建立兩者之間的關聯：
+
+```yaml
+apiVersion: cluster.x-k8s.io/v1beta1
+kind: Cluster
+metadata:
+  name: my-cluster
+spec:
+  infrastructureRef:
+    apiVersion: infrastructure.cluster.x-k8s.io/v1beta1
+    kind: Metal3Cluster          # 引用 Metal3Cluster
+    name: my-metal3-cluster
+  controlPlaneRef:
+    apiVersion: controlplane.cluster.x-k8s.io/v1beta1
+    kind: KubeadmControlPlane
+    name: my-cluster-cp
+```
+
+當 `Cluster` 物件建立後，CAPI core controller 會：
+1. 找到 `infrastructureRef` 指向的 `Metal3Cluster`
+2. 等待 `Metal3Cluster.Status.Ready == true`
+3. 繼續推進叢集的 provisioning 流程
+
+---
+
+## Metal3ClusterReconciler 流程說明
+
+`Metal3Cluster` controller 的 reconcile 邏輯採用**簡單的 pass-through 模式**，步驟如下：
+
+1. **取得 Metal3Cluster 物件**
+2. **取得 CAPI Cluster**（透過 owner reference）
+3. **Pause 檢查**：若叢集已暫停，則跳過 reconcile
+4. 若有 `DeletionTimestamp` → **reconcileDelete**（移除 finalizer）
+5. 否則 → **reconcileNormal**：
+   - 確認 `controlPlaneEndpoint` 已設定（若未設定則 requeue）
+   - 設定 finalizer
+   - 設定 `Metal3Cluster.Status.Ready = true`
+   - 觸發 Cluster reconcile（透過 owner reference）
+
+
+<Callout type="info" title="Metal3Cluster reconcile 為何如此簡單？">
+
+Metal3Cluster 的 reconcile 邏輯非常簡單，因為 Metal3 **不需要建立任何 Load Balancer 資源**。Controller 唯一的職責是確認 `controlPlaneEndpoint` 已由外部工具配置完畢，然後將狀態標記為 ready，讓 CAPI core 得以繼續後續流程。
+
+相比之下，AWS Provider 或 vSphere Provider 的 InfraCluster controller 需要建立並等待 Load Balancer 資源就緒，邏輯複雜得多。
+
+</Callout>
+
+
+---
+
+## controlPlaneEndpoint VIP 設定方式
+
+
+<Callout type="tip" title="常見的 VIP 解決方案">
+
+在裸機環境中，以下是幾種常見的 Control Plane VIP 設定方式：
+
+- **keepalived + kube-vip**：在 Control Plane 節點上運行 keepalived 或 kube-vip，使用 VRRP 實現 VIP failover。這是裸機環境最常見的選擇。
+- **MetalLB**：若已有現有的 MetalLB 環境，可分配一個 LoadBalancer 類型的 VIP 給 API server 使用。
+- **硬體負載均衡器**：企業環境可使用 F5、Nginx Plus 等硬體或商業負載均衡解決方案。
+- **固定 IP（僅測試用）**：在測試環境中可直接使用第一台 CP 節點的 IP 作為端點，但此方式不具備高可用性，**不建議用於生產環境**。
+
+</Callout>

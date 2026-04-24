@@ -1,0 +1,209 @@
+---
+layout: doc
+title: Metal3 Provider — 架構設計
+---
+
+# Metal3 Provider — 架構設計
+
+
+<Callout type="info" title="相關章節">
+
+- [Metal3 Provider 首頁](./index.md)
+
+</Callout>
+
+
+## 整體架構概覽
+
+CAPM3（Cluster API Provider Metal3）的核心設計原則是**不直接控制硬體**，而是透過 BareMetalHost（BMH）CRD 與 Baremetal Operator（BMO）溝通，形成清晰的責任分層：
+
+- **CAPM3**：負責將 CAPI 的機器請求（Machine）轉換為 BMH 的設定，包含 image、userdata、metadata、networkdata
+- **BMO（Baremetal Operator）**：接收 BMH 設定後，驅動 Ironic 執行實際的硬體操作
+- **Ironic**：執行 PXE boot、IPMI、Redfish 等底層操作，完成實體機器的開機與 OS 部署
+
+這個設計讓 CAPM3 保持輕量，無需了解 Ironic 的細節，只需要操作 Kubernetes API（BMH CRD）即可完成裸機的生命週期管理。
+
+![CAPM3 架構圖](/diagrams/metal3/architecture.png)
+
+---
+
+## 三層架構說明
+
+CAPM3 的整體系統由三個層次組成，各層職責明確：
+
+1. **CAPI 層**：`Cluster`、`Machine`、`MachineDeployment`
+   - 提供宣告式叢集管理介面
+   - 使用者透過這層描述「我想要幾台機器、什麼規格」
+
+2. **CAPM3 層**：`Metal3Cluster`、`Metal3Machine`、`Metal3Data`
+   - 橋接 CAPI 與 Metal3 底層
+   - 負責選擇 BMH、渲染設定模板、追蹤 provisioning 狀態
+
+3. **Metal3 層**：`BareMetalHost`、Ironic
+   - 實際執行硬體控制
+   - BMO 監控 BMH 物件，並透過 Ironic 操作實體機器
+
+---
+
+## 七個 Controller 詳細說明
+
+CAPM3 包含七個主要 Controller，各自負責不同的協調邏輯。
+
+### Metal3ClusterReconciler
+
+**職責**：pass-through 模式，管理 `Metal3Cluster`
+
+主要工作流程：
+- 從 `Metal3Cluster.spec.controlPlaneEndpoint` 取得 API Server 端點
+- 驗證端點設定後，將 `status.ready` 設為 `true`
+
+> **注意**：Metal3 本身**不管理 Load Balancer**。`controlPlaneEndpoint` 必須由使用者或外部工具（如 keepalived、kube-vip）預先設定好，CAPM3 只負責讀取並回報狀態。
+
+---
+
+### Metal3MachineReconciler
+
+**職責**：最複雜的 Controller，負責選擇可用的 BareMetalHost，設定所有必要欄位，並等待 BMO 完成 provisioning。
+
+#### chooseHost 邏輯（依優先順序）
+
+1. **節點重用（Node Reuse）**：優先檢查是否有帶有 `infrastructure.cluster.x-k8s.io/node-reuse` label 的 BMH，適用於滾動升級場景
+2. **預先分配（Name-Based Preallocation）**：若啟用 `enableBMHNameBasedPreallocation`，依名稱規則比對
+3. **Ready 狀態的 BMH**：無 `errorMsg`、無 pause annotation、無 unhealthy annotation
+4. **Available 狀態的 BMH**：同上篩選條件，但來自 `available` 狀態的主機池
+
+#### 設定 BMH 流程
+
+選定 BMH 後，依序設定以下欄位：
+
+- `spec.consumerRef` → 指向 Metal3Machine
+- `spec.image` → OS image URL 與 checksum
+- `spec.userData.secretRef` → cloud-init / ignition 設定
+- `spec.metaData.secretRef` → 機器元資料（hostname、IP 等）
+- `spec.networkData.secretRef` → 網路設定
+
+#### Provisioning 等待
+
+Controller 持續監控 `BMH.Status.Provisioning.State`，直到狀態變為 `provisioned` 才視為完成。
+
+#### ProviderID 設定
+
+Provisioning 完成後，設定：
+
+```
+metal3://<namespace>/<bmh-name>/<metal3machine-name>
+```
+
+---
+
+### Metal3DataReconciler
+
+**職責**：渲染 Jinja2 模板，產生每台機器專屬的 metadata / networkdata Secrets。
+
+工作流程：
+- 從 `Metal3DataTemplate` 讀取模板內容
+- 填入變數：IP 位址、MAC 位址、hostname、index 等
+- 渲染結果寫入 Kubernetes Secret
+- BMH 透過 `spec.metaData.secretRef` 與 `spec.networkData.secretRef` 引用這些 Secrets
+
+這個設計讓每台機器的網路設定可以高度客製化，同時保持模板統一管理。
+
+---
+
+### Metal3DataTemplateReconciler
+
+**職責**：監控 `Metal3DataClaim`，為每個 `Metal3Machine` 建立對應的 `Metal3Data` 物件。
+
+- 當 `Metal3Machine` 建立時，會產生一個 `Metal3DataClaim`
+- 此 Controller 偵測到 Claim 後，依據指定的 `Metal3DataTemplate` 建立 `Metal3Data` 實例
+- `Metal3Data` 建立後，`Metal3DataReconciler` 才能開始渲染模板
+
+---
+
+### Metal3MachineTemplateReconciler
+
+**職責**：管理節點重用（Node Reuse）labels，支援滾動升級場景。
+
+- 在升級時，為即將被替換的舊機器所對應的 BMH 打上 `infrastructure.cluster.x-k8s.io/node-reuse` label
+- 新建立的 `Metal3Machine` 在 chooseHost 時，會優先選擇帶有此 label 的 BMH
+- 確保升級過程中同一台實體機器被重新使用，避免不必要的硬體切換
+
+---
+
+### Metal3LabelSyncReconciler
+
+**職責**：將 BMH 的 labels 單向同步到對應的 Kubernetes Node。
+
+- 只同步帶有特定 prefix 的 labels（預設前綴：`metal3.io`）
+- 適合用途：
+  - 記錄硬體資訊（CPU 型號、機架位置、NIC 規格）到 Node labels
+  - 供 Kubernetes Scheduler 或 affinity 規則使用
+  - 讓應用程式可以感知底層硬體特性
+
+---
+
+### Metal3RemediationReconciler
+
+**職責**：執行 Metal3 自定義 remediation，目前支援 **Reboot 策略**。
+
+與 CAPI 整合流程：
+1. `MachineHealthCheck` 偵測到不健康的機器（Node NotReady 等）
+2. 建立 `Metal3Remediation` 物件，指定 remediation 策略
+3. `Metal3RemediationReconciler` 讀取策略後，對對應的 BMH 執行 reboot 操作
+4. 等待機器重新上線後，更新 remediation 狀態
+
+---
+
+## 目錄結構
+
+```
+cluster-api-provider-metal3/
+├── api/v1beta1/              # 所有 CRD 定義（9 個）
+├── baremetal/                # Metal3Machine controller 核心邏輯
+│   ├── metal3machine_manager.go
+│   ├── metal3data_manager.go
+│   ├── metal3cluster_manager.go
+│   └── baremetalhost.go      # BMH 操作封裝
+├── controllers/              # Controller 入口（reconcile loops）
+├── config/                   # RBAC、webhook、CRD manifests
+├── test/                     # e2e 和 unit tests
+└── hack/                     # 開發工具腳本
+```
+
+`baremetal/` 目錄是 CAPM3 的核心業務邏輯層，`controllers/` 則是薄薄的進入點，負責監聽 Kubernetes 事件並呼叫 `baremetal/` 中的 manager 函式。
+
+---
+
+## 環境與相依說明
+
+| 相依 | 版本要求 | 說明 |
+|------|---------|------|
+| Cluster API | v1beta1 | CAPI 核心，提供 Machine、Cluster 等基礎 CRD |
+| Baremetal Operator | >= v0.5.0 | BMH CRD 提供者，負責驅動 Ironic |
+| Ironic | - | 透過 BMO 間接使用，執行實際硬體操作 |
+| cert-manager | >= v1.0.0 | Webhook TLS 憑證管理 |
+
+---
+
+## ProviderID 格式
+
+
+<Callout type="info" title="ProviderID 說明">
+
+**格式**：
+
+```
+metal3://<namespace>/<bmh-name>/<metal3machine-name>
+```
+
+**範例**：
+
+```
+metal3://default/worker-0/my-cluster-worker-0
+```
+
+**設定時機**：由 `Metal3MachineReconciler` 在 BMH provisioning 完成後，寫入 `Metal3Machine.spec.providerID`，CAPI 再將此值同步至 `Node.spec.providerID`。
+
+**用途**：此格式讓 `cloud-provider-metal3` 可以透過 ProviderID 識別 Kubernetes Node 所對應的 BMH，進而實現 Node 的雲端整合功能（如 CCM 節點生命週期管理）。
+
+</Callout>

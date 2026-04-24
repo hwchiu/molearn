@@ -1,0 +1,245 @@
+---
+layout: doc
+title: Cluster API — MachineHealthCheck
+---
+
+# MachineHealthCheck
+
+
+<Callout type="info" title="相關章節">
+
+- [Core Controller（含 MHC Reconciler 說明）](/cluster-api/controller-core)
+- [Machine 生命週期](/cluster-api/machine-lifecycle)
+- [Metal3 Remediation](/cluster-api-provider-metal3/remediation)
+
+</Callout>
+
+
+## 什麼是 MachineHealthCheck
+
+MachineHealthCheck（MHC）是 Cluster API 的自動健康監控機制，負責持續監控叢集中節點的健康狀態，並在節點持續不健康時自動觸發修復流程。
+
+MHC 的核心運作邏輯：
+
+- **持續監控**：定期檢查受監控 Machine 對應 Node 的 Condition 狀態
+- **自動 Remediation**：當節點持續不健康超過指定時間，自動觸發修復
+- **兩種 Remediation 策略**：
+  - CAPI 預設策略：直接刪除不健康的 Machine，由 MachineSet/KCP 重新建立
+  - 自定義策略：透過 `remediationTemplate` 指定（如 Metal3Remediation 執行 BMC 重開機）
+- **Circuit Breaker 保護**：透過 `maxUnhealthy` 防止大量節點同時被 remediate，避免叢集雪崩
+
+MHC 是保持叢集高可用性的重要機制，特別是在裸機環境中，節點硬體故障時可自動觸發 BMC 重開機或重新 provisioning。
+
+---
+
+## MachineHealthCheck Spec 欄位
+
+| 欄位 | 類型 | 說明 |
+|------|------|------|
+| `clusterName` | string | 監控的叢集名稱 |
+| `selector` | LabelSelector | 選取要監控的 Machine |
+| `unhealthyConditions` | []UnhealthyCondition | 判斷不健康的條件 |
+| `maxUnhealthy` | IntOrString | Circuit Breaker：最多允許幾台不健康（數量或百分比）|
+| `nodeStartupTimeout` | Duration | 等待 Node 加入叢集的超時時間（預設 10m）|
+| `remediationTemplate` | ObjectReference | 自定義 Remediation 模板（可選，不設定則用預設刪除）|
+
+---
+
+## UnhealthyCondition 欄位
+
+| 欄位 | 類型 | 說明 |
+|------|------|------|
+| `type` | ConditionType | Node Condition 類型（如 Ready）|
+| `status` | ConditionStatus | 期望的狀態（如 False, Unknown）|
+| `timeout` | Duration | 持續此狀態多久才觸發 remediation |
+
+**常用設定範例：**
+
+```yaml
+unhealthyConditions:
+  - type: Ready
+    status: Unknown
+    timeout: 300s    # Node 失聯 5 分鐘
+  - type: Ready
+    status: "False"
+    timeout: 300s    # Node NotReady 5 分鐘
+  - type: MemoryPressure
+    status: "True"
+    timeout: 600s    # 記憶體壓力 10 分鐘
+  - type: DiskPressure
+    status: "True"
+    timeout: 600s    # 磁碟壓力 10 分鐘
+```
+
+---
+
+## MachineHealthCheck Status 欄位
+
+| 欄位 | 類型 | 說明 |
+|------|------|------|
+| `expectedMachines` | int32 | 受 MHC 監控的 Machine 總數 |
+| `currentHealthy` | int32 | 目前健康的 Machine 數量 |
+| `remediationsAllowed` | int32 | 還允許多少台 Machine 被 remediate |
+| `conditions` | []Condition | MHC 本身的健康狀態 |
+| `observedGeneration` | int64 | 最後觀察到的 generation |
+| `targets` | []string | 受監控的 Machine 名稱列表 |
+
+---
+
+## Circuit Breaker 機制
+
+`maxUnhealthy` 是 MHC 的 Circuit Breaker 保護機制，防止叢集中過多節點同時被 remediate。
+
+**數值設定：**
+
+```yaml
+maxUnhealthy: 2      # 最多允許 2 台不健康
+# 或
+maxUnhealthy: "40%"  # 最多允許 40% 不健康
+```
+
+**Circuit Breaker 邏輯：**
+
+- 計算當前不健康 Machine 數量
+- 若不健康數量 >= `maxUnhealthy`：停止所有 remediation，設定 `RemediationAllowed: False`
+- 若不健康數量 < `maxUnhealthy`：允許繼續 remediation
+
+
+<Callout type="warning" title="注意事項">
+
+- 若 `maxUnhealthy` 設定過低（如 `"0%"`），任何不健康都會觸發 Circuit Breaker，反而停止自動修復
+- 建議 Control Plane 設定 `maxUnhealthy: 1`（3 台 CP 中最多 1 台不健康才修復）
+- Worker 節點可設定較高百分比（如 `"40%"`）
+
+</Callout>
+
+
+---
+
+## 預設 Remediation 策略（刪除 Machine）
+
+當未設定 `remediationTemplate` 時，MHC 使用預設的刪除策略：
+
+1. MHC Controller 直接刪除不健康的 Machine 物件
+2. MachineSet／KCP Controller 偵測到 Machine 少一台，自動建立新的 Machine
+3. 新 Machine 需要完整的 provisioning 流程（包含 infra 資源建立、OS 安裝、kubeadm join 等）
+
+**適用場景：**
+
+- 雲端環境（VM provisioning 快，通常 5–10 分鐘）
+- 不需要保留現有節點的場景
+- Worker 節點（Control Plane 節點建議使用自定義 Remediation 以降低風險）
+
+---
+
+## 自定義 Remediation 策略
+
+透過 `remediationTemplate` 可以指定由外部 Remediation Controller 負責修復，例如 Metal3RemediationReconciler 執行 BMC 重開機。
+
+```yaml
+spec:
+  remediationTemplate:
+    apiVersion: infrastructure.cluster.x-k8s.io/v1beta1
+    kind: Metal3RemediationTemplate
+    name: my-cluster-remediation-template
+    namespace: metal3
+```
+
+運作流程：
+
+- MHC Controller 根據 template 建立 Remediation 物件（如 Metal3Remediation）
+- 由對應的 Remediation Controller 處理（如 Metal3RemediationReconciler 執行 BMC 重開機）
+- 若 Remediation 失敗（超過 `retryLimit`），Remediation Controller 標記失敗後，MHC 改用預設刪除策略
+
+---
+
+## nodeStartupTimeout 說明
+
+
+<Callout type="info" title="nodeStartupTimeout 行為">
+
+當 Machine 建立後，若在 `nodeStartupTimeout` 時間內 Node 仍未加入叢集，MHC 會將此 Machine 標記為不健康，進而觸發 remediation。
+
+- **預設值**：10 分鐘（對裸機環境可能不夠，建議設定 20–30 分鐘）
+- **設為 `0` 或不設定**：停用此檢查
+
+</Callout>
+
+
+**裸機環境建議：**
+
+```yaml
+nodeStartupTimeout: 30m    # 裸機環境 provisioning 可能需要 20-30 分鐘
+```
+
+裸機環境因需要 IPMI/Redfish 開機、PXE 啟動、OS 安裝等步驟，整體 provisioning 時間較雲端 VM 長，務必調整此值以避免誤觸 remediation。
+
+---
+
+## 完整 MachineHealthCheck 範例
+
+```yaml
+# Control Plane MHC（使用自定義 Remediation）
+apiVersion: cluster.x-k8s.io/v1beta1
+kind: MachineHealthCheck
+metadata:
+  name: my-cluster-cp-mhc
+  namespace: metal3
+spec:
+  clusterName: my-cluster
+  selector:
+    matchLabels:
+      cluster.x-k8s.io/cluster-name: my-cluster
+      cluster.x-k8s.io/control-plane: ""
+  unhealthyConditions:
+    - type: Ready
+      status: Unknown
+      timeout: 300s
+    - type: Ready
+      status: "False"
+      timeout: 300s
+  maxUnhealthy: 1
+  nodeStartupTimeout: 30m
+  remediationTemplate:
+    apiVersion: infrastructure.cluster.x-k8s.io/v1beta1
+    kind: Metal3RemediationTemplate
+    name: my-cluster-cp-remediation-template
+    namespace: metal3
+---
+# Worker MHC（使用預設刪除策略）
+apiVersion: cluster.x-k8s.io/v1beta1
+kind: MachineHealthCheck
+metadata:
+  name: my-cluster-worker-mhc
+  namespace: metal3
+spec:
+  clusterName: my-cluster
+  selector:
+    matchLabels:
+      cluster.x-k8s.io/cluster-name: my-cluster
+      cluster.x-k8s.io/deployment-name: my-cluster-workers
+  unhealthyConditions:
+    - type: Ready
+      status: Unknown
+      timeout: 300s
+    - type: Ready
+      status: "False"
+      timeout: 300s
+  maxUnhealthy: "40%"
+  nodeStartupTimeout: 30m
+  # 不設定 remediationTemplate：使用預設刪除策略
+```
+
+---
+
+## MHC 的限制與注意事項
+
+
+<Callout type="warning" title="限制與注意事項">
+
+- MHC 只能選取與 `clusterName` 相同叢集的 Machine，`selector` 不能跨叢集選取
+- `selector` 必須能正確選到目標 Machine，設定錯誤會導致 MHC 無法監控任何節點
+- 若叢集 API Server 不可用，MHC 無法查詢 Node 狀態，不會誤觸 remediation（fail-safe 設計）
+- 建議為 Control Plane 和 Worker 分別建立不同的 MHC，設定不同的 `maxUnhealthy` 策略
+
+</Callout>

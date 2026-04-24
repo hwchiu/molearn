@@ -1,0 +1,23 @@
+{
+  "projectId": "cluster-api-provider-metal3",
+  "nodes": [
+    {"id": "metal3cluster", "label": "Metal3Cluster", "description": "InfraCluster 實作，管理 APIEndpoint", "featureSlug": "crds-cluster", "category": "api", "position": {"x": 400, "y": 50}},
+    {"id": "metal3machine", "label": "Metal3Machine", "description": "InfraMachine 實作，綁定 BareMetalHost", "featureSlug": "crds-machine", "category": "api", "position": {"x": 200, "y": 200}},
+    {"id": "metal3machinetemplate", "label": "Metal3MachineTemplate", "description": "Machine 範本，用於 MachineSet/KCP", "featureSlug": "crds-machine", "category": "api", "position": {"x": 400, "y": 200}},
+    {"id": "bmh", "label": "BareMetalHost (BMO)", "description": "Metal3 BMO 管理的裸機 CRD", "featureSlug": "bmh-lifecycle", "category": "infra", "position": {"x": 0, "y": 200}},
+    {"id": "bmh-lifecycle", "label": "BMH Lifecycle", "description": "Provisioning → Running → Deprovisioning 狀態機", "featureSlug": "bmh-lifecycle", "category": "lifecycle", "position": {"x": 200, "y": 350}},
+    {"id": "datatemplate", "label": "Metal3DataTemplate", "description": "為每台機器注入網路 / cloud-init 資料", "featureSlug": "data-templates", "category": "infra", "position": {"x": 600, "y": 200}},
+    {"id": "ipam", "label": "IPAM", "description": "IP 位址池分配管理", "featureSlug": "ipam", "category": "infra", "position": {"x": 600, "y": 350}},
+    {"id": "labelsync", "label": "Label Sync", "description": "BMH 標籤同步到 Node", "featureSlug": "labelsync", "category": "lifecycle", "position": {"x": 400, "y": 350}},
+    {"id": "remediation", "label": "Metal3Remediation", "description": "故障節點自動修復策略", "featureSlug": "remediation", "category": "lifecycle", "position": {"x": 0, "y": 350}},
+    {"id": "nodereuse", "label": "Node Reuse", "description": "升級時重用已存在節點，保留 PV 等資源", "featureSlug": "node-reuse", "category": "lifecycle", "position": {"x": 800, "y": 350}}
+  ],
+  "edges": [
+    {"id": "e-m3m-bmh", "source": "metal3machine", "target": "bmh", "label": "consumerRef"},
+    {"id": "e-bmh-lifecycle", "source": "bmh", "target": "bmh-lifecycle", "label": "drives", "animated": true},
+    {"id": "e-m3m-data", "source": "metal3machine", "target": "datatemplate", "label": "dataTemplate"},
+    {"id": "e-data-ipam", "source": "datatemplate", "target": "ipam", "label": "allocates"},
+    {"id": "e-m3m-label", "source": "metal3machine", "target": "labelsync", "label": "syncs"},
+    {"id": "e-remediation-bmh", "source": "remediation", "target": "bmh", "label": "reboots", "animated": true}
+  ]
+}

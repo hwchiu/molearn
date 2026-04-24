@@ -1,0 +1,214 @@
+---
+layout: doc
+title: Metal3 Provider — 機器層級 CRD
+---
+
+# Metal3 Provider — 機器層級 CRD
+
+
+<Callout type="info" title="相關章節">
+
+- [專案總覽](./index.md)
+- [架構與設計](./architecture.md)
+- [BareMetalHost 生命週期](./bmh-lifecycle.md)
+- [叢集層級 CRD](./crds-cluster.md)
+
+</Callout>
+
+
+## 概覽
+
+Metal3 Provider 定義兩個機器層級的 CRD，對應 CAPI 的 **InfraMachine 合約**，負責將 CAPI Machine 映射到實際的裸機伺服器：
+
+| CRD | 用途 |
+|-----|------|
+| `Metal3Machine` | 實作 CAPI InfraMachine 合約，描述單一機器的基礎設施設定 |
+| `Metal3MachineTemplate` | Metal3Machine spec 的不可變模板，供 MachineDeployment / KCP 引用 |
+
+每個 CAPI Machine 對應一個 Metal3Machine；Metal3Machine 再與一台 BareMetalHost（BMH）關聯，由 Bare Metal Operator（BMO）執行實際的 provisioning。
+
+---
+
+## Metal3Machine
+
+### 概念說明
+
+每個 CAPI Machine 建立時，CAPI 會同步建立（或引用）一個 Metal3Machine。`Metal3MachineReconciler` 負責以下四個步驟：
+
+1. **選擇合適的 BareMetalHost** — 根據 `hostSelector` 條件過濾出可用的 BMH
+2. **設定 BMH 參數** — 將 image / userdata / metadata / networkdata 寫入 BMH spec
+3. **等待 BMO 完成 provisioning** — 監控 BMH 進入 `provisioned` 狀態
+4. **設定 ProviderID** — 標記 Metal3Machine 就緒，觸發 CAPI Machine 進入 Running
+
+### Spec 欄位
+
+| 欄位 | 類型 | 必填 | 說明 |
+|------|------|:----:|------|
+| `image` | Image | ✅ | OS image 設定（url、checksum、checksumType、format）|
+| `userDataKey` | SecretReference | ❌ | 自訂 userdata Secret（若不使用 CAPI Bootstrap）|
+| `dataTemplate` | SecretReference | ❌ | 引用 Metal3DataTemplate，產生 metadata / networkdata |
+| `hostSelector` | HostSelector | ❌ | 選取 BMH 的 label selector 條件 |
+| `automatedCleaningMode` | string | ❌ | `metadata`（預設，清除磁碟）或 `disabled`（跳過清除）|
+| `providerID` | string | ❌（唯讀）| 格式：`metal3://<ns>/<bmh-name>/<m3m-name>`，由 controller 設定 |
+| `metaData` | SecretReference | ❌（唯讀）| 渲染後的 metadata Secret 引用（由 Data controller 填入）|
+| `networkData` | SecretReference | ❌（唯讀）| 渲染後的 networkdata Secret 引用（由 Data controller 填入）|
+
+#### Image 子欄位
+
+| 欄位 | 說明 |
+|------|------|
+| `url` | OS image 的 HTTP URL |
+| `checksum` | image 的 checksum 值 |
+| `checksumType` | `md5`、`sha256` 或 `sha512` |
+| `format` | `raw`、`qcow2`、`vdi`、`vmdk` 或 `live-iso` |
+
+#### HostSelector 說明
+
+`hostSelector` 讓 Metal3Machine 只選取帶有特定 labels 的 BMH，支援 `matchLabels` 精確匹配與 `matchExpressions` 運算式匹配：
+
+```yaml
+hostSelector:
+  matchLabels:
+    environment: production
+    rack: rack-01
+  matchExpressions:
+    - key: "hardware-profile"
+      operator: In
+      values: ["high-memory", "standard"]
+```
+
+若未設定 `hostSelector`，controller 會從所有可用的 BMH 中隨機選取一台。
+
+### Status 欄位
+
+| 欄位 | 類型 | 說明 |
+|------|------|------|
+| `ready` | bool | Machine 是否就緒（ProviderID 已設定）|
+| `addresses` | []MachineAddress | BMH 的 IP 地址列表 |
+| `phase` | string | 目前 Metal3Machine phase |
+| `renderedData` | ObjectReference | 指向 Metal3Data 物件（若有 dataTemplate）|
+| `conditions` | Conditions | 目前服務狀態 |
+
+### Conditions
+
+| Condition | 說明 |
+|-----------|------|
+| `AssociateBMH` | BMH 是否已與此 Metal3Machine 關聯 |
+| `WaitForBootstrapReady` | Bootstrap Secret 是否已就緒 |
+| `Ready` | Machine 是否完全就緒 |
+
+### YAML 範例
+
+以下範例展示一個含 dataTemplate 引用的 Metal3Machine 設定：
+
+```yaml
+apiVersion: infrastructure.cluster.x-k8s.io/v1beta1
+kind: Metal3Machine
+metadata:
+  name: my-cluster-worker-0
+  namespace: metal3
+spec:
+  image:
+    url: http://images.example.com/ubuntu-22.04-k8s.qcow2
+    checksum: http://images.example.com/ubuntu-22.04-k8s.qcow2.sha256
+    checksumType: sha256
+    format: qcow2
+  dataTemplate:
+    name: my-cluster-worker-template
+  automatedCleaningMode: metadata
+  hostSelector:
+    matchLabels:
+      environment: production
+```
+
+---
+
+## Metal3MachineTemplate
+
+### 概念說明
+
+`Metal3MachineTemplate` 是 Metal3Machine spec 的**不可變模板**，用於以下場景的 infrastructureRef 引用：
+
+- `MachineDeployment.spec.template.spec.infrastructureRef`
+- `KubeadmControlPlane.spec.machineTemplate.infrastructureRef`
+- `ClusterClass` 中的 machineInfrastructure 引用
+
+建立後不可修改（immutable）。若要更新節點設定（例如更換 OS image），需建立一個新的 MachineTemplate，再更新 MachineDeployment 或 KubeadmControlPlane 的引用，觸發滾動更新。
+
+### YAML 範例
+
+```yaml
+apiVersion: infrastructure.cluster.x-k8s.io/v1beta1
+kind: Metal3MachineTemplate
+metadata:
+  name: my-cluster-worker-template
+  namespace: metal3
+spec:
+  template:
+    spec:
+      image:
+        url: http://images.example.com/ubuntu-22.04-k8s.qcow2
+        checksum: http://images.example.com/ubuntu-22.04-k8s.qcow2.sha256
+        checksumType: sha256
+        format: qcow2
+      dataTemplate:
+        name: my-cluster-worker-data-template
+      automatedCleaningMode: metadata
+  nodeReuse: false
+```
+
+### nodeReuse 欄位說明
+
+
+<Callout type="info" title="nodeReuse 行為說明">
+
+`nodeReuse` 欄位控制叢集升級時的 BMH 重用策略：
+
+- **`nodeReuse: false`**（預設）：升級時建立新機器，不考慮舊機器所使用的 BMH，舊 BMH 釋放後回到可用池
+- **`nodeReuse: true`**：升級時優先重用舊機器的 BMH，減少 BMH 資源消耗，適合 BMH 數量有限的環境
+
+啟用 `nodeReuse` 時，建議同時設定 `automatedCleaningMode: disabled`，跳過磁碟清除步驟以加速 BMH 釋放與重用。
+
+</Callout>
+
+
+---
+
+## Machine → Metal3Machine → BMH 關聯鏈
+
+三層物件之間的關聯如下：
+
+```
+CAPI Machine
+  └── spec.infrastructureRef → Metal3Machine
+                                  └── spec.hostSelector  → BareMetalHost（選取條件）
+                                  └── status.selectedHostRef → BareMetalHost（已選取）
+```
+
+各物件的 OwnerReference 設定：
+
+| 物件 | OwnerReference 指向 |
+|------|-------------------|
+| Metal3Machine | CAPI Machine |
+| Metal3Data | Metal3Machine |
+| Metal3DataClaim | Metal3Machine |
+
+Metal3Machine 透過 `status.selectedHostRef` 記錄已選取的 BMH 名稱。BMH 被選取後，controller 會在 BMH 的 annotations 中加入 `metal3.io/metal3machine` 標記，確保雙向可追蹤。
+
+---
+
+## automatedCleaningMode 使用建議
+
+`automatedCleaningMode` 控制 BMH 被釋放後是否執行磁碟清除（透過 Ironic 的 cleaning 流程）：
+
+| 模式 | Disk Cleaning | 釋放速度 | 適用場景 |
+|------|:-------------:|:--------:|---------|
+| `metadata` | 執行（清除磁碟資料）| 較慢（數分鐘到十幾分鐘）| 生產環境、安全要求高 |
+| `disabled` | 跳過 | 極快（數秒到數分鐘）| 升級場景（Node Reuse）、CI/CD 環境 |
+
+
+<Callout type="info" title="安全注意事項">
+
+在生產環境中，若將 `automatedCleaningMode` 設為 `disabled`，舊節點的磁碟資料（包含 kubelet 憑證、容器資料等）不會被清除。請確保在受信任的內部網路環境中才使用此模式，或搭配其他安全措施（如全磁碟加密）。
+
+</Callout>

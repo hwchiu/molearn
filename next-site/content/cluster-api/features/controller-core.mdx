@@ -1,0 +1,230 @@
+---
+layout: doc
+title: Cluster API — Core Controller 詳解
+---
+
+# Core Controller 詳解
+
+
+<Callout type="info" title="相關章節">
+
+- [架構概覽](/cluster-api/architecture)
+- [Cluster 與 Machine](/cluster-api/api-cluster-machine)
+- [Machine 生命週期](/cluster-api/machine-lifecycle)
+- [MachineHealthCheck](/cluster-api/machine-health-check)
+
+</Callout>
+
+
+## Core Controller 概覽
+
+CAPI core manager 啟動後會運行以下 controllers，各自負責不同資源的生命週期管理：
+
+| Controller | 負責資源 | 主要職責 |
+|-----------|---------|---------|
+| `ClusterReconciler` | Cluster | 協調 Infrastructure + Control Plane，管理 Cluster 生命週期 |
+| `MachineReconciler` | Machine | 協調 Bootstrap + Infrastructure，管理 Machine 生命週期 |
+| `MachineSetReconciler` | MachineSet | 維護指定數量的 Machine |
+| `MachineDeploymentReconciler` | MachineDeployment | 管理 MachineSet 的滾動更新 |
+| `MachineHealthCheckReconciler` | MachineHealthCheck | 監控節點健康，觸發 Remediation |
+| `ClusterCacheReconciler` | Cluster | 管理到 workload cluster 的連線快取 |
+
+---
+
+## ClusterReconciler 詳解
+
+`ClusterReconciler` 是 CAPI 的核心，負責將 Cluster 物件對應到底層的 InfrastructureCluster 與 ControlPlane，並協調兩者的建立順序。
+
+### Reconcile 主流程
+
+**Step 1 — 取得 Cluster 物件**
+
+從 API Server 取得 Cluster 物件；若不存在則直接返回（可能已被刪除）。
+
+**Step 2 — 處理 Finalizer**
+
+若 Cluster 尚未有 `cluster.cluster.x-k8s.io` finalizer，先加入，確保刪除時能正確清理相關資源。
+
+**Step 3 — 若 Cluster 正在刪除（有 DeletionTimestamp）**
+
+執行刪除流程，依序：
+1. 刪除所有隸屬的 Machine（確保節點先被清理）
+2. 等待所有 Machine 刪除完成
+3. 刪除 InfrastructureCluster
+4. 刪除 ControlPlane
+5. 移除 Finalizer，讓 Kubernetes 完成物件刪除
+
+**Step 4 — 正常 reconcile**
+
+1. **協調 Infrastructure Provider**：建立或更新 InfrastructureCluster 物件（如 AWSCluster、VSphereCluster）
+2. **等待 InfraCluster 就緒**：輪詢直到 `InfraCluster.Status.Ready = true`
+3. **協調 Control Plane Provider**：建立或更新 ControlPlane 物件（如 KubeadmControlPlane）
+4. **等待 ControlPlane Initialized**：輪詢直到 `ControlPlane.Status.Initialized = true`（API Server 可接受請求）
+5. **更新 Cluster.Status.ControlPlaneReady**
+6. **建立 ClusterCache**：連到 workload cluster 的 API Server，供後續 Machine drain/Node 查詢使用
+
+### Cluster 狀態轉換
+
+| 狀態 | 條件 |
+|------|------|
+| `Pending` | Cluster 剛建立，尚未開始 reconcile |
+| `Provisioning` | InfraCluster 或 ControlPlane 尚未就緒 |
+| `Provisioned` | `InfraCluster.Ready=true` 且 `ControlPlane.Ready=true` |
+| `Deleting` | Cluster 正在刪除（有 DeletionTimestamp） |
+| `Failed` | 發生不可恢復的錯誤 |
+| `Unknown` | 狀態不明（通常是短暫過渡狀態） |
+
+---
+
+## MachineReconciler 詳解
+
+`MachineReconciler` 負責單一 Machine 的完整生命週期，包含 Bootstrap data 取得、實際機器建立、Node 加入確認，以及節點優雅刪除。
+
+### Reconcile 主流程
+
+**Step 1 — 取得 Machine 物件，確認所屬 Cluster**
+
+取得 Machine 後，透過 `cluster.x-k8s.io/cluster-name` label 找到對應的 Cluster 物件，確認 Cluster 存在且未刪除。
+
+**Step 2 — 若 Machine 正在刪除（有 DeletionTimestamp）**
+
+進入刪除流程（詳見下方「Machine 刪除流程」）。
+
+**Step 3 — 正常 reconcile**
+
+1. **協調 Bootstrap Provider**：等待 bootstrap data（`dataSecretName`）就緒，bootstrap data 包含節點初始化所需的 cloud-init 或類似腳本
+2. **協調 Infrastructure Provider**：建立實際機器，等待回填 `ProviderID` 與 `addresses` 到 Machine.Status
+3. **等待 Node 加入 workload cluster**：透過 ClusterCache 查找 workload cluster 中 `spec.providerID` 相符的 Node
+4. **設定 Machine.Status.NodeRef**：記錄對應的 Node 名稱
+5. **更新 Machine.Status.Phase = Running**
+
+### Machine 刪除流程
+
+
+<Callout type="info" title="Lifecycle Hooks">
+
+Machine 支援兩種 lifecycle hook annotation，允許外部系統介入刪除流程：
+
+- `pre-drain.delete.hook.machine.cluster.x-k8s.io/<name>`：drain 前等待外部系統回應
+- `pre-terminate.delete.hook.machine.cluster.x-k8s.io/<name>`：terminate 前等待外部系統
+
+外部系統完成準備後，移除對應 annotation 以允許流程繼續。
+
+```yaml
+metadata:
+  annotations:
+    pre-drain.delete.hook.machine.cluster.x-k8s.io/backup: "external-system"
+    # 外部系統完成後移除此 annotation 以允許繼續
+```
+
+</Callout>
+
+
+完整刪除步驟：
+
+1. **Pre-drain hook**：若有 `pre-drain` lifecycle hook annotation，暫停並等待 hook 完成（annotation 被移除）
+2. **Cordon 節點**：對 workload cluster 中的 Node 執行 Cordon，禁止新 Pod 排程到此節點
+3. **Drain 節點**：驅逐所有 Pod，遵守 PodDisruptionBudget；若 `Machine.Spec.NodeDrainTimeout` 超時，強制繼續
+4. **等待 Volume Detach**：等待所有 CSI volumes 卸除完成；若 `Machine.Spec.NodeVolumeDetachTimeout` 超時，繼續下一步
+5. **Pre-terminate hook**：若有 `pre-terminate` lifecycle hook annotation，暫停並等待 hook 完成
+6. **刪除 InfrastructureMachine**：觸發 Infrastructure Provider 刪除實際的底層機器
+7. **刪除 BootstrapConfig**：清理 bootstrap 相關資源（如 KubeadmConfig）
+8. **移除 Finalizer**：Machine 物件完全刪除
+
+---
+
+## MachineSetReconciler 詳解
+
+`MachineSetReconciler` 確保 workload cluster 中始終運行指定數量的 Machine，類似 Kubernetes 原生的 ReplicaSet。
+
+### 核心邏輯
+
+1. **Sync**：列出所有符合 `selector` 的 Machine，更新 MachineSet 的狀態（replicas、readyReplicas 等）
+2. **採納（Adoption）**：將沒有 ownerReference 但符合 label selector 的 Machine 採納進來，設定 ownerRef 指向此 MachineSet
+3. **擴展（Scale Up）**：若目前 Machine 數量 < `spec.replicas`，依據 template 建立新 Machine
+4. **縮減（Scale Down）**：若目前 Machine 數量 > `spec.replicas`，根據 `deletePolicy` 選取要刪除的 Machine：
+   - `Random`：隨機選取
+   - `Newest`：優先刪除最新建立的
+   - `Oldest`：優先刪除最舊建立的
+   - 無論何種策略，都優先刪除 `Failed` 狀態的 Machine，以及沒有對應 Node 的 Machine
+
+### MachineSet Conditions
+
+| Condition | 說明 |
+|-----------|------|
+| `MachinesReady` | 所有 Machine 是否就緒（Phase=Running 且 NodeRef 已設定） |
+| `MachinesUpToDate` | 所有 Machine 的版本（bootstrap/infra template）是否為最新 |
+| `ScalingUp` | 是否正在擴展（目前數量 < replicas） |
+| `ScalingDown` | 是否正在縮減（目前數量 > replicas） |
+
+---
+
+## MachineHealthCheckReconciler 詳解
+
+`MachineHealthCheckReconciler` 持續監控 workload cluster 節點健康狀態，並在節點不健康時觸發 Remediation。
+
+### 健康檢查流程
+
+1. **列出受管 Machine**：根據 `spec.selector` 找到所有相關 Machine（通常對應一個 MachineDeployment 的 workers）
+
+2. **評估健康狀態**：
+   - 透過 ClusterCache 查詢 workload cluster 中對應 Node 的 Conditions
+   - 若 `Node.Status.Conditions[Ready] = False` 或 `Unknown`，且持續時間超過 `unhealthyConditions[*].timeout`，標記此 Machine 為不健康
+   - 若 Machine 沒有對應 Node（NodeRef 未設定）且超過 `nodeStartupTimeout`，標記為不健康
+
+3. **Circuit Breaker**：計算不健康 Machine 的比例，若超過 `spec.maxUnhealthy` 則停止所有 remediation，避免大規模刪除節點造成服務中斷
+
+4. **觸發 Remediation**：
+   - 若 MachineHealthCheck 指定了 `remediationTemplate`（如 Metal3RemediationTemplate）：建立對應的 Remediation 物件，由外部 controller 處理
+   - 若未指定：刪除不健康的 Machine（CAPI 預設策略），讓 MachineSet/MachineDeployment 建立替換機器
+
+### MachineHealthCheck 範例
+
+```yaml
+apiVersion: cluster.x-k8s.io/v1beta1
+kind: MachineHealthCheck
+metadata:
+  name: my-cluster-mhc
+spec:
+  clusterName: my-cluster
+  selector:
+    matchLabels:
+      cluster.x-k8s.io/deployment-name: my-cluster-workers
+  unhealthyConditions:
+    - type: Ready
+      status: Unknown
+      timeout: 300s
+    - type: Ready
+      status: "False"
+      timeout: 300s
+  maxUnhealthy: "40%"
+  nodeStartupTimeout: 20m
+```
+
+---
+
+## ClusterCache（RemoteClusterCache）
+
+### 為什麼需要 ClusterCache
+
+CAPI core controllers 在 management cluster 運行，但需要存取 workload cluster 內部資源（如查詢 Node 狀態、執行 cordon/drain）。ClusterCache 為每個 workload cluster 維護一個帶有 informer 的 cached client，避免每次操作都直接呼叫遠端 API Server。
+
+### 運作方式
+
+- 透過 `<cluster-name>-kubeconfig` Secret 取得 workload cluster 的 kubeconfig
+- 為每個 workload cluster 建立獨立的 controller-runtime client（帶 cache）
+- 使用 informer 機制監控 workload cluster 資源（Node、Pod 等），減少 API Server 負擔
+- 其他 controllers（如 MachineReconciler、MachineHealthCheckReconciler）透過 ClusterCache 取得對應的 client
+
+### Cache 刷新機制
+
+- 預設每 10 分鐘強制刷新一次（重建 informer）
+- 若 `<cluster-name>-kubeconfig` Secret 更新（如憑證輪換），自動重建 cache
+- 若連線失敗（workload cluster 暫時不可達），進入 exponential backoff 重試
+
+
+<Callout type="tip" title="ClusterCache 重構說明">
+
+ClusterCache 是 CAPI v1.4+ 引入的重構，取代舊的 RemoteClusterCache，提供更好的連線管理和錯誤處理。新版本支援更精細的健康狀態回報，並改善了在 workload cluster 暫時失聯時的行為。
+
+</Callout>
