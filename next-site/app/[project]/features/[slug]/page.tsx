@@ -6,6 +6,7 @@ import { MDX_COMPONENTS } from '@/components/MDXComponents'
 import matter from 'gray-matter'
 import Link from 'next/link'
 import { ChevronLeft, ChevronRight } from 'lucide-react'
+import remarkGfm from 'remark-gfm'
 
 export function generateStaticParams() {
   const params: { project: string; slug: string }[] = []
@@ -47,7 +48,7 @@ export default async function FeaturePage({ params }: { params: { project: strin
         </div>
       )}
       <div className="prose-content">
-        <MDXRemote source={content} components={MDX_COMPONENTS as any} />
+        <MDXRemote source={content} components={MDX_COMPONENTS as any} options={{ mdxOptions: { remarkPlugins: [remarkGfm] } }} />
       </div>
 
       <div className="mt-12 pt-6 border-t border-[#30363d] flex items-center justify-between">
