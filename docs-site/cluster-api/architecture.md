@@ -1,9 +1,9 @@
 ---
 layout: doc
-title: Cluster API — 系統架構與 Provider 模型
+title: Cluster API — 架構概覽
 ---
 
-# Cluster API — 系統架構與 Provider 模型
+# Cluster API — 架構概覽
 
 ::: info 相關章節
 - [專案總覽](./index.md) — 核心概念與 CRD 一覽
@@ -320,3 +320,421 @@ fd := failuredomains.PickFewest(cluster.Status.FailureDomains, existingMachines)
 1. 統計每個 failure domain 中現有 Machine 的數量
 2. 選擇數量最少的 domain 部署新的 Machine
 3. 當多個 domain 數量相同時，以確定性方式（consistent hashing）選擇，避免隨機分配導致不均勻
+
+---
+
+## Controller 間的事件驅動機制
+
+CAPI 的每個 Controller 都透過 `SetupWithManager` 宣告自己關心哪些資源的事件，controller-runtime 會根據這些宣告自動建立 informer 並將事件路由到對應的 reconcile queue。
+
+### ClusterReconciler 的事件來源
+
+`ClusterReconciler` 使用以下程式碼設定監聽：
+
+```go
+// internal/controllers/cluster/cluster_controller.go
+b := capicontrollerutil.NewControllerManagedBy(mgr, predicateLog).
+    For(&clusterv1.Cluster{}).
+    WatchesRawSource(r.ClusterCache.GetClusterSource("cluster",
+        func(_ context.Context, o client.Object) []ctrl.Request {
+            return []ctrl.Request{{NamespacedName: client.ObjectKeyFromObject(o)}}
+        },
+        clustercache.WatchForProbeFailure(r.RemoteConnectionGracePeriod),
+    )).
+    Watches(
+        &clusterv1.Machine{},
+        handler.EnqueueRequestsFromMapFunc(r.controlPlaneMachineToCluster),
+    ).
+    Watches(
+        &clusterv1.MachineDeployment{},
+        handler.EnqueueRequestsFromMapFunc(r.machineDeploymentToCluster),
+    )
+```
+
+觸發 `ClusterReconciler` 的事件來源有三個：
+
+1. **`For(&clusterv1.Cluster{})`**：`Cluster` 物件本身的 Create / Update / Delete 事件，例如使用者修改 `spec.controlPlaneRef` 或新增 annotation 時都會觸發。
+2. **`WatchesRawSource(ClusterCache.GetClusterSource(...))`**：ClusterCache 對 workload cluster 連線狀態的通知。當連線建立（Connect）或斷開（Disconnect）時，會發送 reconcile 請求。若配置了 `WatchForProbeFailure`，健康探測連續失敗超過設定時間後也會觸發，讓 Cluster controller 更新 Conditions。
+3. **`Watches(&clusterv1.Machine{}, mapFunc)`**：當屬於此 Cluster 的 `Machine` 發生變化時，透過 `controlPlaneMachineToCluster` 函數反向查找並觸發對應 `Cluster` 的 reconcile。這讓 Cluster 的 Status 能即時反映 Control Plane Machine 的最新狀態。
+
+### MachineReconciler 的事件來源
+
+```go
+// internal/controllers/machine/machine_controller.go
+c, err := capicontrollerutil.NewControllerManagedBy(mgr, *r.predicateLog).
+    For(&clusterv1.Machine{}).
+    Watches(
+        &clusterv1.Cluster{},
+        handler.EnqueueRequestsFromMapFunc(clusterToMachines),
+        predicates.ClusterControlPlaneInitialized(mgr.GetScheme(), *r.predicateLog),
+    ).
+    WatchesRawSource(r.ClusterCache.GetClusterSource("machine",
+        clusterToMachines,
+        clustercache.WatchForProbeFailure(r.RemoteConditionsGracePeriod),
+    )).
+    Watches(&clusterv1.MachineSet{},
+        handler.EnqueueRequestsFromMapFunc(msToMachines),
+    ).
+    Watches(&clusterv1.MachineDeployment{},
+        handler.EnqueueRequestsFromMapFunc(mdToMachines),
+    ).
+    Build(r)
+```
+
+`MachineReconciler` 的事件來源：
+
+1. **`For(&clusterv1.Machine{})`**：Machine 自身的事件。
+2. **`Watches(&clusterv1.Cluster{}, clusterToMachines, ClusterControlPlaneInitialized)`**：當 Cluster 的 ControlPlane 完成初始化後，才開始觸發該 Cluster 下所有 Machine 的 reconcile。這個 predicate 確保 Bootstrap 機制（例如 kubeadm join）只在 API server 已可用後才執行。
+3. **`WatchesRawSource(ClusterCache.GetClusterSource(...))`**：workload cluster 連線狀態變化時，重新 reconcile 所有該 Cluster 的 Machine，以便更新 Node 狀態。
+4. **`Watches(&clusterv1.MachineSet{}, ...)` 和 `Watches(&clusterv1.MachineDeployment{}, ...)`**：當 MachineSet 或 MachineDeployment 的標籤、ownerReference 等變更時，重新 reconcile 旗下 Machine，確保 selector 和 owner 資訊同步。
+
+### ExternalObject 的動態 Watch
+
+對於 InfrastructureRef（如 `AWSMachine`）和 BootstrapRef（如 `KubeadmConfig`）這類「外部物件」，CAPI 無法事先知道 CRD 類型，因此使用 `external.ObjectTracker` 在 reconcile 時動態建立 Watch：
+
+```go
+// 在第一次 reconcile 時發現外部物件，動態加入 Watch
+r.externalTracker.Watch(predicateLog, infraObj,
+    handler.EnqueueRequestForOwner(mgr.GetScheme(), mgr.GetRESTMapper(), &clusterv1.Cluster{}, ...))
+```
+
+這樣當 `AWSCluster` 的 `status.ready` 變為 `true` 時，CAPI 核心就能立即感知並繼續推進 Cluster 的 reconcile 流程。
+
+---
+
+## ClusterCache 實作深度解析
+
+### 資料結構：per-cluster accessor 的儲存方式
+
+ClusterCache 的核心資料結構是一個以 `client.ObjectKey`（即 namespace/name）為 key 的 map：
+
+```go
+// controllers/clustercache/cluster_cache.go
+type clusterCacheReconciler struct {
+    // ...
+    clusterAccessorsLock sync.RWMutex
+    // key 為 {Namespace: "...", Name: "cluster-name"}
+    clusterAccessors     map[client.ObjectKey]*clusterAccessor
+}
+```
+
+每個 `clusterAccessor` 代表對一個 workload cluster 的完整連線狀態，包含：
+
+```go
+// controllers/clustercache/cluster_accessor.go
+type clusterAccessorLockedConnectionState struct {
+    restConfig    *rest.Config    // REST 設定（含 TLS、QPS 等）
+    restClient    RESTClient      // 用於健康探測的原始 REST client
+    cachedClient  client.Client   // 帶快取的 client（Get/List 走 informer）
+    uncachedClient client.Client  // 不走快取的 live client
+    cache         *stoppableCache // informer cache（可停止）
+    watches       sets.Set[string] // 已註冊的 watch 名稱（去重用）
+}
+```
+
+健康檢查狀態單獨存放：
+
+```go
+type clusterAccessorLockedHealthCheckingState struct {
+    lastProbeTime        time.Time // 上次健康探測時間
+    lastProbeSuccessTime time.Time // 上次成功探測時間
+    consecutiveFailures  int       // 連續失敗次數
+}
+```
+
+### kubeconfig Secret 命名規範
+
+ClusterCache 使用固定格式的 Secret 名稱來取得 workload cluster 的連線憑證：
+
+```
+Secret 名稱 = "<cluster-name>-kubeconfig"
+Secret 命名空間 = 與 Cluster 物件相同的命名空間
+Secret 類型 = "cluster.x-k8s.io/secret"（即 secret.Kubeconfig）
+```
+
+為了效能，ClusterCache 使用一個只快取此類 Secret 的專用 client（`SecretClient`），而非快取所有 Secret，避免大型叢集中因 Secret 數量龐大造成記憶體浪費。
+
+### 連線建立與斷線恢復機制
+
+當 ClusterCache 需要連接到 workload cluster 時，流程如下：
+
+1. 讀取 `<cluster-name>-kubeconfig` Secret，解析其中的 kubeconfig
+2. 建立 `rest.Config`（套用 QPS、Burst、Timeout 等限制）
+3. 建立 `stoppableCache`（包含 informer），啟動後等待 sync
+4. 建立 `cachedClient` 和 `uncachedClient`
+
+若建立失敗（例如 API server 尚未就緒），`clusterAccessorLockedState.lastConnectionCreationErrorTime` 會記錄失敗時間，下次 reconcile 時根據 `ConnectionCreationRetryInterval` 決定是否重試，避免頻繁打 API server。
+
+### 健康探測機制
+
+ClusterCache 定期對每個 workload cluster 執行健康探測（透過 `restClient.Get()` 呼叫 `/readyz` 或 `/healthz`），並維護三個指標：
+
+- `lastProbeTime`：上次執行探測的時間
+- `lastProbeSuccessTime`：上次成功的時間
+- `consecutiveFailures`：連續失敗計數
+
+當連續失敗次數超過 `FailureThreshold`（預設 5 次），ClusterCache 會主動呼叫 `Disconnect()` 拆除連線，停止所有 informer，並通知訂閱者（透過 `GetClusterSource()` 的 disconnect 事件）。Controller 收到通知後，會將 Cluster 的 Conditions 更新為反映連線斷開的狀態。
+
+### Watch 訂閱與去重
+
+各 Controller 透過 `ClusterCache.Watch()` 在 workload cluster 上建立 informer：
+
+```go
+// machine_controller_noderef.go（概念示意）
+r.ClusterCache.Watch(ctx, util.ObjectKey(cluster), clustercache.NewWatcher(clustercache.WatcherOptions{
+    Name:         "machine/node",
+    Watcher:      r.controller,
+    Kind:         &corev1.Node{},
+    EventHandler: handler.EnqueueRequestsFromMapFunc(nodeToMachine),
+}))
+```
+
+`watches sets.Set[string]` 欄位確保每次 disconnect/reconnect 後同名的 Watch 不會重複建立。當 `Disconnect()` 被呼叫時，`stoppableCache` 停止，所有 informer 一併關閉；重連後 Controller 再次呼叫 `Watch()` 重新訂閱。
+
+---
+
+## Finalizer 鏈與刪除順序
+
+CAPI 使用 Kubernetes finalizer 機制確保資源按正確順序刪除，防止孤立（orphaned）資源殘留。
+
+### Finalizer 清單
+
+| 資源 | Finalizer 名稱 | 設定時機 |
+|------|---------------|---------|
+| `Cluster` | `cluster.cluster.x-k8s.io` | ClusterReconciler 在第一次 reconcile 時設定 |
+| `Machine` | `machine.cluster.x-k8s.io` | MachineReconciler 在第一次 reconcile 時設定 |
+
+兩個 Finalizer 都在各自 controller 的 Reconcile 函數一開始就使用 `finalizers.EnsureFinalizer()` 設定：
+
+```go
+// internal/controllers/cluster/cluster_controller.go
+if finalizerAdded, err := finalizers.EnsureFinalizer(ctx, r.Client, cluster,
+    clusterv1.ClusterFinalizer); err != nil || finalizerAdded {
+    return ctrl.Result{}, err
+}
+
+// internal/controllers/machine/machine_controller.go
+if finalizerAdded, err := finalizers.EnsureFinalizer(ctx, r.Client, m,
+    clusterv1.MachineFinalizer); err != nil || finalizerAdded {
+    return ctrl.Result{}, err
+}
+```
+
+### 完整刪除序列
+
+當使用者執行 `kubectl delete cluster my-cluster` 時，完整的刪除串聯如下：
+
+**第一階段：Cluster finalizer 阻止 Cluster 物件被刪除**
+
+1. Kubernetes 設定 `Cluster.metadata.deletionTimestamp`，但不立即刪除，因為 `cluster.cluster.x-k8s.io` finalizer 存在
+2. ClusterReconciler 偵測到 `deletionTimestamp` 非零，進入刪除流程
+3. 如果存在 `spec.controlPlaneRef`（如 `KubeadmControlPlane`），先對其發出 Delete 請求，等待 CP 物件消失後才繼續
+4. 如果仍有子 Machine 存在，等待所有 Machine 刪除完成
+5. 最後刪除 `spec.infrastructureRef`（如 `AWSCluster`），等待其消失
+6. 確認所有子資源都消失後，`controllerutil.RemoveFinalizer(cluster, clusterv1.ClusterFinalizer)` 移除 finalizer，Cluster 物件真正被 Kubernetes GC 刪除
+
+**第二階段：Machine finalizer 阻止 Machine 被刪除**
+
+每台 Machine 的刪除流程（由 MachineReconciler 管理）：
+
+1. Kubernetes 設定 `Machine.metadata.deletionTimestamp`
+2. MachineReconciler 先執行 Node drain（驅逐 Pod），遵循 `MachineDrainRule` 定義的順序與超時
+3. drain 完成後，刪除 workload cluster 中對應的 `Node` 物件
+4. 刪除 `spec.infrastructureRef`（如 `AWSMachine`），等待 InfraMachine 物件消失（代表雲端 VM 已刪除）
+5. 刪除 `spec.bootstrap.configRef`（如 `KubeadmConfig`）
+6. 移除 `machine.cluster.x-k8s.io` finalizer，Machine 物件真正被刪除
+
+**第三階段：InfraCluster Provider 清理底層資源**
+
+`AWSCluster`（或其他 InfraCluster）物件被刪除後，Infrastructure Provider 的 controller 負責清理雲端資源（VPC、Load Balancer、安全群組等）。InfraCluster controller 同樣維護自己的 finalizer，確保雲端資源清理完畢後才讓物件真正消失。
+
+整個刪除序列確保不會出現「Node 已從 etcd 刪除但雲端 VM 還在」或「Cluster 物件消失但底層網路仍存在」的不一致狀態。
+
+---
+
+## Phase 管理（Cluster / Machine 狀態階段）
+
+### Phase 與 Conditions 的設計差異
+
+CAPI 同時提供兩個層次的狀態表達：
+
+- **Phase（`status.phase`）**：粗粒度的整體狀態摘要，給人類讀者快速判斷資源處於哪個生命週期階段，類似交通燈
+- **Conditions（`status.conditions`）**：細粒度的具體狀態，每個 condition 描述一個特定面向（如 InfrastructureReady、ControlPlaneInitialized 等），適合自動化工具做精確判斷
+
+### Cluster Phase
+
+`Cluster.Status.Phase` 由 `setPhase()` 函數在每次 reconcile 結束時計算，採用覆蓋式更新（後面的條件會覆蓋前面的）：
+
+```go
+// internal/controllers/cluster/cluster_controller_status.go
+func setPhase(_ context.Context, cluster *clusterv1.Cluster) bool {
+    if cluster.Status.Phase == "" {
+        cluster.Status.SetTypedPhase(clusterv1.ClusterPhasePending)
+    }
+    if cluster.Spec.InfrastructureRef.IsDefined() || cluster.Spec.ControlPlaneRef.IsDefined() {
+        cluster.Status.SetTypedPhase(clusterv1.ClusterPhaseProvisioning)
+    }
+    if ptr.Deref(cluster.Status.Initialization.InfrastructureProvisioned, false) &&
+        cluster.Spec.ControlPlaneEndpoint.IsValid() {
+        cluster.Status.SetTypedPhase(clusterv1.ClusterPhaseProvisioned)
+    }
+    if !cluster.DeletionTimestamp.IsZero() {
+        cluster.Status.SetTypedPhase(clusterv1.ClusterPhaseDeleting)
+    }
+    // ...
+}
+```
+
+| Phase | 觸發條件 |
+|-------|---------|
+| `Pending` | 初始狀態，`status.phase` 為空時設定 |
+| `Provisioning` | 已設定 `spec.infrastructureRef` 或 `spec.controlPlaneRef`，表示已開始建立 |
+| `Provisioned` | Infrastructure 已就緒（`initialization.infrastructureProvisioned=true`）且 `spec.controlPlaneEndpoint` 已填入 |
+| `Deleting` | `metadata.deletionTimestamp` 非零，正在刪除 |
+| `Failed` | 發生不可復原的錯誤（如 InfraCluster 回報 `failureReason`）|
+| `Unknown` | 狀態無法判斷（通常是剛建立 ClusterAccessor 還沒成功連線時）|
+
+### Machine Phase
+
+`Machine.Status.Phase` 由 `setMachinePhaseAndLastUpdated()` 計算，每次 phase 變更都會更新 `status.lastUpdated` 時間戳：
+
+```go
+// internal/controllers/machine/machine_controller_status.go
+func setMachinePhaseAndLastUpdated(_ context.Context, m *clusterv1.Machine) {
+    if m.Status.Phase == "" {
+        m.Status.SetTypedPhase(clusterv1.MachinePhasePending)
+    }
+    // bootstrap 已就緒但 infra 還沒
+    if ptr.Deref(m.Status.Initialization.BootstrapDataSecretCreated, false) &&
+        !ptr.Deref(m.Status.Initialization.InfrastructureProvisioned, false) {
+        m.Status.SetTypedPhase(clusterv1.MachinePhaseProvisioning)
+    }
+    // infra 已就緒（providerID 已填入）
+    if m.Spec.ProviderID != "" {
+        m.Status.SetTypedPhase(clusterv1.MachinePhaseProvisioned)
+    }
+    // node 已加入叢集且 infra 就緒
+    if m.Status.NodeRef.IsDefined() && ptr.Deref(m.Status.Initialization.InfrastructureProvisioned, false) {
+        m.Status.SetTypedPhase(clusterv1.MachinePhaseRunning)
+    }
+    if conditions.IsTrue(m, clusterv1.MachineUpdatingCondition) {
+        m.Status.SetTypedPhase(clusterv1.MachinePhaseUpdating)
+    }
+    if !m.DeletionTimestamp.IsZero() {
+        m.Status.SetTypedPhase(clusterv1.MachinePhaseDeleting)
+    }
+}
+```
+
+| Phase | 觸發條件 |
+|-------|---------|
+| `Pending` | 初始狀態，等待 Bootstrap data 生成 |
+| `Provisioning` | Bootstrap data 已生成（`status.initialization.bootstrapDataSecretCreated=true`），等待 InfraMachine 建立 VM |
+| `Provisioned` | InfraMachine 已填入 `spec.providerID`，VM 已建立 |
+| `Running` | Node 已加入叢集（`status.nodeRef` 已設定）且 Infrastructure 就緒 |
+| `Updating` | `MachineUpdatingCondition` 為 True，正在進行 in-place update |
+| `Deleting` | `metadata.deletionTimestamp` 非零 |
+| `Deleted` | Machine 物件已消失（通常只在 event 中出現）|
+| `Failed` | 發生不可復原的錯誤 |
+| `Unknown` | 狀態無法判斷 |
+
+Phase 的設計刻意使用覆蓋式更新而非狀態機，因此不會有「從 Running 回到 Provisioning」的問題，只能單向前進（除了 Deleting 會覆蓋任何 phase）。
+
+---
+
+## Scheme 登記與 API 版本轉換
+
+### Manager 的 Scheme 登記
+
+CAPI controller-manager 在啟動時（`main.go` 的 `init()` 函數）將所有 API group 的 scheme 都登記到同一個 `runtime.Scheme`：
+
+```go
+// main.go
+func init() {
+    _ = clientgoscheme.AddToScheme(scheme)   // k8s 核心資源（Pod、Node 等）
+    _ = apiextensionsv1.AddToScheme(scheme)  // CRD 本身的 schema
+    _ = storagev1.AddToScheme(scheme)        // StorageClass、VolumeAttachment
+
+    // cluster.x-k8s.io (v1beta1 和 v1beta2)
+    _ = clusterv1beta1.AddToScheme(scheme)
+    _ = clusterv1.AddToScheme(scheme)        // v1beta2
+
+    // addons.cluster.x-k8s.io
+    _ = addonsv1beta1.AddToScheme(scheme)
+    _ = addonsv1.AddToScheme(scheme)
+
+    // runtime.cluster.x-k8s.io
+    _ = runtimev1alpha1.AddToScheme(scheme)
+    _ = runtimev1.AddToScheme(scheme)
+
+    // ipam.cluster.x-k8s.io
+    _ = ipamv1alpha1.AddToScheme(scheme)
+    _ = ipamv1beta1.AddToScheme(scheme)
+    _ = ipamv1.AddToScheme(scheme)
+}
+```
+
+同時登記 v1beta1 和 v1beta2 讓 manager 能同時處理兩個版本的 API 請求，並在中間做自動轉換。
+
+### Hub-Spoke 轉換模型
+
+CAPI 採用 controller-runtime 的 **Hub-Spoke** 轉換模型來處理多個 API 版本的共存：
+
+- **Hub（轉換樞紐）**：`v1beta2` 是所有 CAPI 資源的 Hub 版本。所有 controller 內部邏輯都基於 v1beta2 物件操作
+- **Spoke（對接版本）**：`v1beta1` 是 Spoke 版本。當 API server 收到 v1beta1 的請求時，會透過 conversion webhook 轉換為 v1beta2 再儲存
+
+Hub 宣告方式非常簡單：
+
+```go
+// api/core/v1beta2/conversion.go
+func (*Cluster) Hub()            {}
+func (*ClusterClass) Hub()       {}
+func (*Machine) Hub()            {}
+func (*MachineSet) Hub()         {}
+func (*MachineDeployment) Hub()  {}
+func (*MachineHealthCheck) Hub() {}
+func (*MachinePool) Hub()        {}
+func (*MachineDrainRule) Hub()   {}
+```
+
+v1beta1 的 Spoke 則實作 `ConvertTo` 和 `ConvertFrom` 方法：
+
+```go
+// api/core/v1beta1/conversion.go
+func (src *Cluster) ConvertTo(dstRaw conversion.Hub) error {
+    dst := dstRaw.(*clusterv1.Cluster) // 轉換目標是 v1beta2.Cluster
+    if err := Convert_v1beta1_Cluster_To_v1beta2_Cluster(src, dst, nil); err != nil {
+        return err
+    }
+    // ... 處理無法自動對應的欄位 ...
+}
+```
+
+轉換過程中，若 v1beta2 有欄位在 v1beta1 中不存在，會將這些欄位序列化後存入 v1beta1 物件的 annotation（`cluster.x-k8s.io/conversion-data`），下次 `ConvertFrom` 時再還原，確保無資料遺失。
+
+### Conversion Webhook 設定
+
+Conversion webhook 由 `setupWebhooks()` 統一設定，並整合到 controller-runtime 的 webhook server 中：
+
+```go
+// main.go
+func setupWebhooks(ctx context.Context, mgr ctrl.Manager, ...) {
+    // 設定 apiVersionGetter（讓 v1beta1 → v1beta2 轉換知道目標 GVK）
+    clusterv1beta1.SetAPIVersionGetter(func(gk schema.GroupKind) (string, error) {
+        return contract.GetAPIVersion(ctx, mgr.GetClient(), gk)
+    })
+
+    // 為每個 CRD 分別設定 webhook（驗證 + 預設值 + 轉換）
+    (&webhooks.Cluster{...}).SetupWebhookWithManager(mgr)
+    (&webhooks.Machine{}).SetupWebhookWithManager(mgr)
+    (&webhooks.MachineSet{}).SetupWebhookWithManager(mgr)
+    (&webhooks.MachineDeployment{}).SetupWebhookWithManager(mgr)
+    (&webhooks.ClusterResourceSet{}).SetupWebhookWithManager(mgr)
+    (&webhooks.MachineHealthCheck{}).SetupWebhookWithManager(mgr)
+    // ... 其他資源 ...
+}
+```
+
+Webhook server 監聽 `:9443`（可由 `--webhook-port` 調整），TLS 憑證位於 `--webhook-cert-dir` 指定目錄。管理面需確保 `ValidatingWebhookConfiguration` 和 `MutatingWebhookConfiguration` 中的 `caBundle` 與 webhook server 的憑證相符。
+
+這個架構確保了 CAPI 使用者在升級 API 版本時的向後相容性：現有使用 v1beta1 API 的工具（如 GitOps manifest）不需要立即更新，CAPI 的 conversion webhook 會自動處理版本橋接。
