@@ -15,7 +15,7 @@ title: Metal3 Provider — Label 同步機制
 
 <Callout type="tip" title="本文適用對象">
 
-- 🟢 **初學者**：了解「為什麼需要把硬體資訊傳到 K8s Node 上」是本頁核心，先看「行李箱標籤」類比
+- 🟢 **初學者**：了解「為什麼需要把硬體資訊傳到 K8s Node 上」是本頁核心，先看「行李箱label」類比
 - 🟡 **中階工程師**：直接閱讀，重點關注前綴設定規則與實際應用場景
 - 🔴 **資深工程師**：了解 LabelSync 與 Node Reuse 的互動關係，以及自定義前綴設計
 
@@ -25,25 +25,25 @@ title: Metal3 Provider — Label 同步機制
 
 LabelSync 是 Metal3 Provider 提供的一項功能，能夠將 **BareMetalHost（BMH）** 上設定的 labels 自動同步到 workload cluster 中對應的 **Kubernetes Node** 物件。
 
-這對於需要依據裸機硬體特性進行 workload 排程的場景非常有用，例如：
+這對於需要依據裸機硬體特性進行 workload scheduling scenarios非常有用，例如：
 
-- **GPU 節點**：標記具有特定 GPU 型號的裸機伺服器
-- **高速網路節點**：標記配備 25G / 100G 網路卡的節點
+- **GPU node**：標記具有特定 GPU 型號的裸機伺服器
+- **高速網路node**：標記配備 25G / 100G 網路卡的node
 - **特定機型**：標記特定廠牌機型（Dell R740、HPE DL380 等）
-- **機架位置**：標記所在機架，用於 topology-aware 排程
+- **機架位置**：標記所在機架，用於 topology-aware scheduling
 
-透過 LabelSync，平台工程師只需在 BMH 上維護硬體標籤，CAPM3 會自動將這些資訊傳播到 Node 層，讓應用開發者能夠使用 `nodeSelector` 或 `affinity` 來精確控制 workload 的排程位置。
+透過 LabelSync，平台工程師只需在 BMH 上維護硬體label，CAPM3 會自動將這些資訊傳播到 Node 層，讓應用開發者能夠使用 `nodeSelector` 或 `affinity` 來精確控制 workload 的scheduling target。
 
-<Callout type="info" title="概念類比：行李箱的硬體規格標籤">
+<Callout type="info" title="概念類比：行李箱的硬體規格label">
 
 想像你在管理一個機場行李系統：
 
 - **BMH** = 每個行李箱（每台裸機伺服器）
-- **BMH labels** = 貼在行李箱上的硬體標籤（「內含 GPU」、「高速 NIC」、「機架 A3」）
-- **LabelSync** = 行李資訊同步系統，自動把行李箱的標籤資訊傳到托運系統（K8s Node）
-- **K8s Node labels** = 托運系統中的記錄（讓排程系統知道「這台機器有 GPU」）
+- **BMH labels** = 貼在行李箱上的硬體label（「內含 GPU」、「高速 NIC」、「機架 A3」）
+- **LabelSync** = 行李資訊同步系統，自動把行李箱的label資訊傳到托運系統（K8s Node）
+- **K8s Node labels** = 托運系統中的記錄（讓scheduling系統知道「這台機器有 GPU」）
 
-沒有 LabelSync，應用程式（Pod）就不知道哪台節點有 GPU，只能隨機排程，可能把 AI 工作負載排到沒有 GPU 的機器上。
+沒有 LabelSync，應用程式（Pod）就不知道哪台node有 GPU，只能隨機scheduling，可能把 AI workload排到沒有 GPU 的機器上。
 
 </Callout>
 
@@ -78,9 +78,9 @@ metadata:
   name: node-worker-01
   namespace: metal3
   labels:
-    # 標準 Metal3 識別標籤（不會被同步）
+    # 標準 Metal3 識別label（不會被同步）
     metal3.io/uuid: "abc-123"
-    # 自定義硬體特性標籤（將被同步到 K8s Node）
+    # 自定義硬體特性label（將被同步到 K8s Node）
     infrastructure.metal3.io/server-type: dell-r740
     infrastructure.metal3.io/rack: rack-03
     infrastructure.metal3.io/gpu: "true"
@@ -102,11 +102,11 @@ kind: Node
 metadata:
   name: node-worker-01
   labels:
-    # Kubernetes 標準標籤
+    # Kubernetes 標準label
     kubernetes.io/hostname: node-worker-01
     kubernetes.io/arch: amd64
     node.kubernetes.io/instance-type: baremetal
-    # 從 BMH 同步過來的硬體標籤
+    # 從 BMH 同步過來的硬體label
     infrastructure.metal3.io/server-type: dell-r740
     infrastructure.metal3.io/rack: rack-03
     infrastructure.metal3.io/gpu: "true"
@@ -116,18 +116,18 @@ metadata:
 
 ## 實際應用場景
 
-### 場景 1 — GPU Workload 排程
+### 場景 1 — GPU Workload scheduling
 
-在 BMH 設定 GPU 相關標籤，再透過 Pod 的 `nodeSelector` 將工作負載排程到 GPU 節點：
+在 BMH 設定 GPU 相關label，再透過 Pod 的 `nodeSelector` 將workloadscheduled to GPU node：
 
 ```yaml
-# 在 BMH 設定 GPU 標籤
+# 在 BMH 設定 GPU label
 infrastructure.metal3.io/gpu: "true"
 infrastructure.metal3.io/gpu-type: nvidia-a100
 ```
 
 ```yaml
-# 在 Pod 使用 nodeSelector 排程到 GPU 節點
+# 在 Pod 使用 nodeSelector scheduled to GPU node
 apiVersion: v1
 kind: Pod
 spec:
@@ -142,7 +142,7 @@ spec:
 
 ### 場景 2 — Rack-aware 部署
 
-利用 BMH 的機架標籤，結合 Pod Anti-Affinity 確保高可用應用的副本分散到不同機架：
+利用 BMH 的機架label，結合 Pod Anti-Affinity 確保高可用應用的副本分散到不同機架：
 
 ```yaml
 # 使用 Pod Anti-Affinity 確保 Pod 分散到不同 Rack
@@ -160,7 +160,7 @@ spec:
               topologyKey: infrastructure.metal3.io/rack
 ```
 
-此配置使 Kubernetes scheduler 在排程時，確保同一 Deployment 的 Pod 不會落在相同機架的節點上，從而降低機架層級故障的影響範圍。
+此配置使 Kubernetes scheduler 在scheduling時，確保同一 Deployment 的 Pod 不會落在相同機架的node上，從而降低機架層級故障的影響範圍。
 
 ## Label 同步的時機
 
@@ -205,7 +205,7 @@ spec:
 
 - 使用**組織域名**作為前綴，避免與標準 Kubernetes labels 或其他工具的 labels 衝突
 - 前綴**必須包含斜線 `/`**，例如 `hardware.mycompany.io/`
-- 建議在整個組織內統一使用同一前綴，方便跨叢集管理
+- 建議在整個組織內統一使用同一前綴，方便跨cluster管理
 
 </Callout>
 
@@ -214,7 +214,7 @@ spec:
 
 當 Node Reuse 功能（`keepBMH`）啟用時，機器縮減後再擴展會重用同一台 BMH。由於 BMH 物件本身保持不變，其上的 labels 也不會消失，因此在機器重建後，Node 上的硬體特性 labels 仍然一致。
 
-這確保了節點特性標籤的**持久性**：無論機器經歷多少次重建，Kubernetes scheduler 都能持續依據正確的硬體特性來排程 workload，不受機器生命週期影響。
+這確保了node特性label的**持久性**：無論機器經歷多少次重建，Kubernetes scheduler 都能持續依據正確的硬體特性來schedule workload，不受機器生命週期影響。
 
 ---
 

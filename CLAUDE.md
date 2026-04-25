@@ -76,7 +76,7 @@ description: 一句話說明這頁的核心概念
 ```
 
 - 所有文件內容使用**繁體中文**，術語保留英文原名
-- **基礎設施名詞一律不翻譯**：`bare-metal`、`node`、`pod`、`cluster`、`namespace` 等直接使用英文
+- **以下詞彙一律不翻譯**（直接使用英文）：`bare-metal`、`node`、`cluster`、`controller`、`label`、`image`、`workload`、`gateway`、`scheduling`、`rolling update`、`namespace`、`container`
 - **不要使用 Mermaid**，改用 `skills/fireworks-tech-graph/` 產生靜態 PNG
 - 圖檔放在 `next-site/public/diagrams/{project}/`，文件內以 `![說明](/diagrams/{project}/name.png)` 引用
 - 圖表 generator 腳本放在 `scripts/diagram-generators/`

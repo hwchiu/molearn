@@ -1,17 +1,17 @@
 {
   "projectId": "cluster-api",
   "nodes": [
-    {"id": "cluster", "label": "Cluster", "description": "叢集核心 CRD，聚合 InfraCluster 與 ControlPlane", "featureSlug": "api-cluster-machine", "category": "api", "position": {"x": 400, "y": 50}},
-    {"id": "machine", "label": "Machine", "description": "單一節點抽象，對應 InfraMachine + BootstrapConfig", "featureSlug": "api-cluster-machine", "category": "api", "position": {"x": 200, "y": 200}},
-    {"id": "machineset", "label": "MachineSet", "description": "Machine 副本集，控制器維持期望副本數", "featureSlug": "api-machineset-machinedeployment", "category": "api", "position": {"x": 400, "y": 200}},
+    {"id": "cluster", "label": "Cluster", "description": "cluster核心 CRD，聚合 InfraCluster 與 ControlPlane", "featureSlug": "api-cluster-machine", "category": "api", "position": {"x": 400, "y": 50}},
+    {"id": "machine", "label": "Machine", "description": "單一node抽象，對應 InfraMachine + BootstrapConfig", "featureSlug": "api-cluster-machine", "category": "api", "position": {"x": 200, "y": 200}},
+    {"id": "machineset", "label": "MachineSet", "description": "Machine 副本集，controller維持期望副本數", "featureSlug": "api-machineset-machinedeployment", "category": "api", "position": {"x": 400, "y": 200}},
     {"id": "md", "label": "MachineDeployment", "description": "宣告式滾動升級，管理多個 MachineSet", "featureSlug": "api-machineset-machinedeployment", "category": "api", "position": {"x": 600, "y": 200}},
     {"id": "kcp", "label": "KubeadmControlPlane", "description": "Kubeadm 控制平面管理，含 etcd 與 API Server", "featureSlug": "api-kubeadm-controlplane", "category": "controller", "position": {"x": 800, "y": 200}},
-    {"id": "mhc", "label": "MachineHealthCheck", "description": "節點健康偵測與自動修復", "featureSlug": "machine-health-check", "category": "lifecycle", "position": {"x": 200, "y": 350}},
-    {"id": "topology", "label": "ClusterClass Topology", "description": "宣告式叢集拓撲範本", "featureSlug": "clusterclass-topology", "category": "api", "position": {"x": 600, "y": 350}},
-    {"id": "crs", "label": "ClusterResourceSet", "description": "叢集建立後自動套用 ConfigMap/Secret", "featureSlug": "addons-clusterresourceset", "category": "addon", "position": {"x": 400, "y": 350}},
+    {"id": "mhc", "label": "MachineHealthCheck", "description": "node健康偵測與自動修復", "featureSlug": "machine-health-check", "category": "lifecycle", "position": {"x": 200, "y": 350}},
+    {"id": "topology", "label": "ClusterClass Topology", "description": "宣告式cluster拓撲範本", "featureSlug": "clusterclass-topology", "category": "api", "position": {"x": 600, "y": 350}},
+    {"id": "crs", "label": "ClusterResourceSet", "description": "cluster建立後自動套用 ConfigMap/Secret", "featureSlug": "addons-clusterresourceset", "category": "addon", "position": {"x": 400, "y": 350}},
     {"id": "hooks", "label": "Runtime Hooks", "description": "生命週期擴充點，外部 Provider 攔截事件", "featureSlug": "provider-contracts-runtime-hooks", "category": "lifecycle", "position": {"x": 800, "y": 350}},
     {"id": "clusterctl", "label": "clusterctl", "description": "CLI 工具：init / upgrade / move / generate", "featureSlug": "clusterctl", "category": "tooling", "position": {"x": 400, "y": 500}},
-    {"id": "bootstrap", "label": "KubeadmConfig", "description": "Bootstrap 設定，產生節點初始化腳本", "featureSlug": "bootstrap-kubeadmconfig", "category": "infra", "position": {"x": 0, "y": 350}}
+    {"id": "bootstrap", "label": "KubeadmConfig", "description": "Bootstrap 設定，產生node初始化腳本", "featureSlug": "bootstrap-kubeadmconfig", "category": "infra", "position": {"x": 0, "y": 350}}
   ],
   "edges": [
     {"id": "e-cluster-machine", "source": "cluster", "target": "machine", "label": "owns"},

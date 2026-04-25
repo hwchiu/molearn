@@ -147,10 +147,10 @@
     "id": 13,
     "question": "Q13. 下列哪種場景最適合使用 Node Reuse 功能？",
     "options": [
-      "首次安裝新叢集",
+      "首次安裝新cluster",
       "更換損壞的裸機硬體",
       "Control Plane K8s 版本滾動升級",
-      "水平擴展 Worker 節點"
+      "水平擴展 Worker node"
     ],
     "answer": 2,
     "explanation": "Node Reuse 目前只支援 KubeadmControlPlane（KCP）的 Control Plane 升級場景。它讓升級時跳過 deprovisioning 和 disk cleaning 流程，直接在同一台 BMH 上重新安裝新版本的 K8s，大幅縮短升級時間（約縮短 40-50%）。Worker node 升級不支援此功能。"

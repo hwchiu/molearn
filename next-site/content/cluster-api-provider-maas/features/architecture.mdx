@@ -22,7 +22,7 @@ title: MAAS Provider — 架構設計
 
 ![MAAS 互動架構](/diagrams/maas/interaction-architecture.png)
 
-MAAS Provider 以標準 CAPI Infrastructure Provider 模式運作。MAAS（Metal as a Service）是 Canonical 開發的裸機雲端管理平台，能夠像管理雲端虛擬機一樣管理實體伺服器。CAPM 的職責是當 CAPI 說「給我一台機器」時，透過 MAAS API 自動分配、部署 OS、設定網路，最終回傳一台可以加入 Kubernetes 叢集的實體節點。
+MAAS Provider 以標準 CAPI Infrastructure Provider 模式運作。MAAS（Metal as a Service）是 Canonical 開發的裸機雲端管理平台，能夠像管理雲端虛擬機一樣管理實體伺服器。CAPM 的職責是當 CAPI 說「給我一台機器」時，透過 MAAS API 自動分配、部署 OS、設定網路，最終回傳一台可以加入 Kubernetes cluster的實體node。
 
 ![架構元件圖](/diagrams/maas/architecture-components.png)
 
@@ -34,16 +34,16 @@ MAAS Provider 以標準 CAPI Infrastructure Provider 模式運作。MAAS（Metal
 2. **MaasMachineReconciler（CP）** 呼叫 MAAS allocate API 選取機器，再呼叫 deploy API 部署 OS + 注入 cloud-init userdata，等待機器上線
 3. **MaasClusterReconciler** 偵測到 API Server 上線後，設定 `MaasCluster.Status.Ready = true`
 4. **MaasMachineReconciler（Workers）** 為每台 Worker 重複 allocate → deploy 流程，設定 `Node.Spec.ProviderID` 與 `MaasMachine.Status.Ready = true`
-5. 刪除叢集時，呼叫 MAAS release API 歸還機器，清除 DNS 記錄
+5. 刪除cluster時，呼叫 MAAS release API 歸還機器，清除 DNS 記錄
 
 ## 🧩 元件總覽
 
 | CRD / Controller | 用途 |
 |-----------------|------|
-| `MaasCluster` | 叢集層級：DNS domain、controlPlaneEndpoint、failure domains |
+| `MaasCluster` | cluster層級：DNS domain、controlPlaneEndpoint、failure domains |
 | `MaasMachine` | 機器層級：分配條件（CPU/記憶體/資源池）、OS image、部署參數 |
 | `MaasMachineTemplate` | 不可變模板，供 MachineDeployment 批次建立機器 |
-| `MaasClusterReconciler` | 管理 DNS FQDN、監控 API Server 可用性、設定叢集 Ready 狀態 |
+| `MaasClusterReconciler` | 管理 DNS FQDN、監控 API Server 可用性、設定cluster Ready 狀態 |
 | `MaasMachineReconciler` | Allocate → Deploy → ProviderID → Ready 完整機器生命週期 |
 | `spectrocloud/maas-client-go` | 封裝 MAAS REST API 的 Go SDK |
 
@@ -115,7 +115,7 @@ func (r *MaasClusterReconciler) reconcileNormal(_ context.Context, clusterScope 
 	// 呼叫 MAAS DNS API 建立 FQDN
 	dnsService.ReconcileDNS()
 
-	// 設定 ControlPlaneEndpoint 並標記叢集 Ready
+	// 設定 ControlPlaneEndpoint 並標記cluster Ready
 	maasCluster.Spec.ControlPlaneEndpoint = infrav1beta1.APIEndpoint{
 		Host: maasCluster.Status.Network.DNSName,
 		Port: clusterScope.APIServerPort(),

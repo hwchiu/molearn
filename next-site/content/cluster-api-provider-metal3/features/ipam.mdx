@@ -10,7 +10,7 @@ title: Metal3 Provider — IPAM 整合
 
 - [Data Templates 與 IPAM](/cluster-api-provider-metal3/features/data-templates) — Metal3DataTemplate 模板系統詳解
 - [機器層級 CRD](/cluster-api-provider-metal3/features/crds-machine) — Metal3Machine、Metal3MachineTemplate 結構
-- [叢集層級 CRD](/cluster-api-provider-metal3/features/crds-cluster) — Metal3Cluster 與叢集資源
+- [cluster層級 CRD](/cluster-api-provider-metal3/features/crds-cluster) — Metal3Cluster 與cluster資源
 
 </Callout>
 
@@ -24,11 +24,11 @@ title: Metal3 Provider — IPAM 整合
 
 ## 什麼是 IPAM
 
-在裸機（Bare Metal）環境中，IP 位址管理（IP Address Management，IPAM）是不可或缺的基礎設施能力。與雲端環境不同，裸機節點通常無法依賴 DHCP 動態取得 IP，原因在於：
+在裸機（Bare Metal）環境中，IP 位址管理（IP Address Management，IPAM）是不可或缺的基礎設施能力。與雲端環境不同，裸機node通常無法依賴 DHCP 動態取得 IP，原因在於：
 
-- **穩定性需求**：生產環境要求節點 IP 固定，以確保 DNS 記錄、防火牆規則、監控設定不受影響
+- **穩定性需求**：生產環境要求node IP 固定，以確保 DNS 記錄、防火牆規則、監控設定不受影響
 - **網路隔離**：裸機網路環境常有嚴格的 VLAN 或 ACL 限制，DHCP 服務可能不存在於所有網段
-- **可預測性**：Kubernetes 叢集的節點 IP 應在整個生命週期中保持一致，尤其是 Control Plane 節點
+- **可預測性**：Kubernetes cluster的node IP 應在整個生命週期中保持一致，尤其是 Control Plane node
 
 Metal3 支援兩種 IPAM 機制，適應不同的部署需求：
 
@@ -39,7 +39,7 @@ Metal3 支援兩種 IPAM 機制，適應不同的部署需求：
 
 <Callout type="info" title="概念類比：大樓的門牌號碼系統">
 
-把裸機叢集的 IP 管理想像成一棟大樓的**門牌號碼系統**：
+把裸機cluster的 IP 管理想像成一棟大樓的**門牌號碼系統**：
 
 - **IPPool**：大樓的門牌號碼清單（101–150 號）
 - **每台 BMH**：一間公寓，需要被分配一個固定門牌
@@ -65,10 +65,10 @@ Metal3 支援兩種 IPAM 機制，適應不同的部署需求：
 | `start` | string | IP 範圍起始地址 |
 | `end` | string | IP 範圍結束地址 |
 | `subnet` | string | 子網路（CIDR 格式，例如 `192.168.1.0/24`）|
-| `gateway` | string | 預設閘道 |
+| `gateway` | string | 預設gateway |
 | `dns` | []string | DNS server 列表 |
 | `namePrefix` | string | 分配的 IP 物件名稱前綴 |
-| `clusterName` | string | 關聯的叢集名稱 |
+| `clusterName` | string | 關聯的cluster名稱 |
 | `preAllocations` | map[string]string | 預先分配的 IP（索引 → IP）|
 
 **IPPool YAML 範例：**
@@ -133,7 +133,7 @@ spec:
                 fromIPPool: my-worker-pool
 ```
 
-`metaData` 中的 IPPool 引用會將分配到的 IP、前綴長度、閘道位址分別對應為模板變數，供 cloud-init 或其他初始化腳本使用。`networkData` 中的 `ipAddressFromIPPool` 則直接控制網路介面的 IP 設定。
+`metaData` 中的 IPPool 引用會將分配到的 IP、前綴長度、gateway位址分別對應為模板變數，供 cloud-init 或其他初始化腳本使用。`networkData` 中的 `ipAddressFromIPPool` 則直接控制網路介面的 IP 設定。
 
 ### preAllocations 功能
 
@@ -154,7 +154,7 @@ spec:
 
 ## CAPI 標準 IPAM（ipam.cluster.x-k8s.io）
 
-Cluster API 定義了通用的 IPAM 介面規範，讓不同的 IPAM 後端都能與 CAPI 生態系整合。Metal3 支援這套標準介面，讓使用者可以將企業現有的 IPAM 系統接入 Metal3 叢集管理流程。
+Cluster API 定義了通用的 IPAM 介面規範，讓不同的 IPAM 後端都能與 CAPI 生態系整合。Metal3 支援這套標準介面，讓使用者可以將企業現有的 IPAM 系統接入 Metal3 cluster管理流程。
 
 ### IPAddressClaim
 
@@ -195,7 +195,7 @@ spec:
   gateway: 192.168.1.1
 ```
 
-Metal3DataReconciler 讀取此 `IPAddress` 物件，將 `address`、`prefix`、`gateway` 填入 networkData 模板，完成節點網路設定。
+Metal3DataReconciler 讀取此 `IPAddress` 物件，將 `address`、`prefix`、`gateway` 填入 networkData 模板，完成node網路設定。
 
 ### 支援的 IPAM 後端
 
@@ -244,14 +244,14 @@ Metal3DataReconciler 讀取此 `IPAddress` 物件，將 `address`、`prefix`、`
 
 **升級場景應用：**
 
-在叢集升級過程中，舊的 Metal3Machine 物件會被刪除，新的 Metal3Machine 物件被建立。若升級策略是原地重建（重用同一台 BMH），啟用此功能後，新機器會繼承舊機器的 BMH 名稱映射，從而取得相同的 IP 地址，整個升級過程對外部系統（DNS、防火牆、監控）完全透明。
+在cluster升級過程中，舊的 Metal3Machine 物件會被刪除，新的 Metal3Machine 物件被建立。若升級策略是原地重建（重用同一台 BMH），啟用此功能後，新機器會繼承舊機器的 BMH 名稱映射，從而取得相同的 IP 地址，整個升級過程對外部系統（DNS、防火牆、監控）完全透明。
 
 **適用場景：**
 
-- 節點 IP 被記錄在 DNS 中，IP 改變會導致解析失敗
+- node IP 被記錄在 DNS 中，IP 改變會導致解析失敗
 - 防火牆規則、安全群組依賴固定 IP 白名單
 - 監控系統（Prometheus、Zabbix）以 IP 為目標進行配置
-- 合規要求需要網路存取記錄與節點 IP 一一對應
+- 合規要求需要網路存取記錄與node IP 一一對應
 
 **注意事項：**
 
@@ -273,7 +273,7 @@ Metal3DataReconciler 讀取此 `IPAddress` 物件，將 `address`、`prefix`、`
 → 兩者解決不同問題。`preAllocations` 確保 IP 不變；Node Reuse 確保同一台 BMH 被重用（省去 deprovisioning 時間）。搭配使用效果最好。
 
 **誤解 4：「IPPool 耗盡後機器會自動等待 IP 釋放」**
-→ 是的，但會造成機器卡在 provisioning 佇列。建議在 IPPool 建立時預留足夠的 IP 範圍，並在 `preAllocations` 中為 Control Plane 節點固定 IP。
+→ 是的，但會造成機器卡在 provisioning 佇列。建議在 IPPool 建立時預留足夠的 IP 範圍，並在 `preAllocations` 中為 Control Plane node固定 IP。
 
 </Callout>
 

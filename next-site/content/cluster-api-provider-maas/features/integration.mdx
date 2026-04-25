@@ -17,13 +17,13 @@ title: MAAS Provider — 整合與部署指南
 </Callout>
 
 
-本指南說明如何在既有環境中部署 MAAS Provider，並從零開始建立第一個bare-metal Kubernetes 叢集。
+本指南說明如何在既有環境中部署 MAAS Provider，並從零開始建立第一個bare-metal Kubernetes cluster。
 
 ## 前置需求
 
 ### Management Cluster 需求
 
-在開始之前，您需要一個已運行的 Kubernetes 叢集作為 **management cluster**：
+在開始之前，您需要一個已運行的 Kubernetes cluster作為 **management cluster**：
 
 - **Cluster API core**：已透過 `clusterctl init` 初始化，包含 CAPI 核心 controller 與 CRD
 - **cert-manager**：用於 webhook 的 TLS 憑證自動簽發（Cluster API 依賴此元件）
@@ -39,7 +39,7 @@ kubectl get pods -n cert-manager
 |------|------|
 | MAAS 版本 | 建議 ≥ 2.9；若使用 in-memory 部署模式，需 ≥ 3.5.10 |
 | API 連線 | Management cluster 可以存取 MAAS API endpoint（HTTP/HTTPS）|
-| OS Images | 已匯入 MAAS 的 OS 映像檔，例如 Ubuntu 22.04 LTS 搭配 Kubernetes 元件 |
+| OS Images | 已匯入 MAAS 的 OS image，例如 Ubuntu 22.04 LTS 搭配 Kubernetes 元件 |
 | 機器狀態 | 機器已完成 **Enlist → Commission**，狀態為 `Ready`，等待被部署 |
 
 
@@ -96,11 +96,11 @@ kubectl logs -n capi-maas-system deployment/capm-controller-manager
 
 ---
 
-## 建立第一個叢集
+## 建立第一個cluster
 
-以下範例建立一個 3 control plane 節點的 HA 叢集，使用 MAAS 作為 infrastructure provider。
+以下範例建立一個 3 control plane node的 HA cluster，使用 MAAS 作為 infrastructure provider。
 
-### 基礎叢集 YAML 範例
+### 基礎cluster YAML 範例
 
 ```yaml
 # Cluster
@@ -181,16 +181,16 @@ spec:
 
 ### 取得 Workload Cluster 的 kubeconfig
 
-等待叢集就緒後，取得 workload cluster 的 kubeconfig：
+等待cluster就緒後，取得 workload cluster 的 kubeconfig：
 
 ```bash
-# 等待叢集就緒（ControlPlaneReady = true）
+# 等待cluster就緒（ControlPlaneReady = true）
 kubectl get cluster my-maas-cluster
 
 # 取得 kubeconfig
 clusterctl get kubeconfig my-maas-cluster > my-maas-cluster.kubeconfig
 
-# 驗證節點
+# 驗證node
 kubectl --kubeconfig my-maas-cluster.kubeconfig get nodes
 ```
 
@@ -199,9 +199,9 @@ kubectl --kubeconfig my-maas-cluster.kubeconfig get nodes
 ## 安裝 CNI（必要步驟）
 
 
-<Callout type="warning" title="CNI 未安裝時叢集無法正常運作">
+<Callout type="warning" title="CNI 未安裝時cluster無法正常運作">
 
-CAPI 建立的叢集**預設沒有 CNI**，所有節點會處於 `NotReady` 狀態，Pod 無法跨節點通訊。必須在叢集建立後手動安裝 CNI 才能讓叢集正常運作。
+CAPI 建立的cluster**預設沒有 CNI**，所有node會處於 `NotReady` 狀態，Pod 無法跨node通訊。必須在cluster建立後手動安裝 CNI 才能讓cluster正常運作。
 
 </Callout>
 
@@ -217,9 +217,9 @@ kubectl --kubeconfig my-maas-cluster.kubeconfig apply \
 
 ---
 
-## 擴縮 Worker 節點
+## 擴縮 Worker node
 
-使用 `MachineDeployment` 管理 worker 節點群組：
+使用 `MachineDeployment` 管理 worker node群組：
 
 ```yaml
 apiVersion: cluster.x-k8s.io/v1beta1
@@ -250,7 +250,7 @@ spec:
         name: my-maas-cluster-worker-template
 ```
 
-套用後，使用 `kubectl scale` 調整節點數量：
+套用後，使用 `kubectl scale` 調整node數量：
 
 ```bash
 # 擴充到 5 台 worker
@@ -268,7 +268,7 @@ kubectl scale machinedeployment my-maas-cluster-workers --replicas=5
 | Machine 停在 `Allocated` 狀態 | MAAS deploy 失敗（image 不存在、網路問題）| 檢查 MAAS UI 中機器的 deploy log |
 | Machine 停在 `Deploying` 狀態超過 30 分鐘 | OS 安裝緩慢或 cloud-init 失敗 | SSH 進機器查看 `/var/log/cloud-init-output.log` |
 | MaasMachine `DNSAttached = False` | MAAS DNS 設定問題 | 確認 `dnsDomain` 在 MAAS 中有對應的 DNS zone |
-| Node 不加入叢集（NotReady）| CNI 未安裝或 cloud-init userdata 錯誤 | 查看 kubelet 日誌：`journalctl -u kubelet -f` |
+| Node 不加入cluster（NotReady）| CNI 未安裝或 cloud-init userdata 錯誤 | 查看 kubelet 日誌：`journalctl -u kubelet -f` |
 | 無可用機器 / allocate 失敗 | MAAS 中無符合條件的機器 | 確認 MAAS 中有 `Ready` 狀態的機器，且符合 `minCPU`、`minMemoryInMB`、`tags` 條件 |
 
 ---
@@ -290,8 +290,8 @@ kubectl describe maasmachine my-worker-0
 # 即時追蹤 controller 日誌
 kubectl logs -n capi-maas-system deployment/capm-controller-manager -f
 
-# 使用 clusterctl 顯示叢集整體狀態（含 control plane、machine deployment）
+# 使用 clusterctl 顯示cluster整體狀態（含 control plane、machine deployment）
 clusterctl describe cluster my-maas-cluster
 ```
 
-`clusterctl describe cluster` 會以樹狀結構顯示叢集中所有 CAPI 物件的狀態，是排查問題時最快速的全局視圖工具。
+`clusterctl describe cluster` 會以樹狀結構顯示cluster中所有 CAPI 物件的狀態，是排查問題時最快速的全局視圖工具。

@@ -486,7 +486,7 @@ The story should naturally introduce the core concepts of {project-name}:
 
 The protagonist should make at least one mistake or hit one unexpected obstacle. Real learning involves confusion.
 
-The story is in Traditional Chinese (zh-TW). Technical terms stay in English. Infrastructure terms such as `bare-metal`, `node`, `pod`, `cluster` are **never translated**.
+The story is in Traditional Chinese (zh-TW). All Kubernetes terms stay in English — refer to the Never-translate list in Documentation Quality Standards. Never write 節點/叢集/控制器/標籤/排程/映像/工作負載/閘道/滾動更新.
 ```
 
 ---
@@ -598,8 +598,26 @@ If grep returns no results → the symbol does not exist in this version. Do not
 ### Language
 - All documentation in **zh-TW** (Traditional Chinese)
 - Technical terms keep English originals (Controller, CRD, Webhook, Reconcile, etc.)
-- **Never translate infrastructure terms** — keep as-is: `bare-metal`, `node`, `pod`, `cluster`, `namespace`, etc.
 - Code comments remain in English
+
+#### ❌ Never-translate list — always keep in English, no exceptions
+
+| ❌ 錯誤（翻譯） | ✅ 正確（英文） |
+|--------------|--------------|
+| 節點 | node |
+| 叢集 | cluster |
+| 控制器 | controller |
+| 標籤 | label |
+| 滾動更新 | rolling update |
+| 映像 / 映像檔 | image |
+| 工作負載 | workload |
+| 閘道 | gateway |
+| 排程 | scheduling / schedule |
+| 裸金屬 | bare-metal |
+| 命名空間 | namespace |
+| 容器 | container |
+
+> 這些詞在 Kubernetes 生態系中都是專有名詞，翻譯後反而增加混淆。即使在比喻或類比段落中，仍應使用英文原詞。
 
 ### Content UX
 See [content-writing-guide.md](./content-writing-guide.md) for:

@@ -16,14 +16,14 @@ title: Cluster API — Addons 與 ClusterResourceSet
 
 <Callout type="tip" title="本文適用對象">
 
-- 🟢 **初學者**：了解為什麼需要 ClusterResourceSet，以及它如何解決「叢集建好後還要手動裝 CNI」的痛點
+- 🟢 **初學者**：了解為什麼需要 ClusterResourceSet，以及它如何解決「cluster建好後還要手動裝 CNI」的痛點
 - 🟡 **中階工程師**：重點關注 `Reconcile` vs `ReApplyOnChanges` 策略差異和 label selector 設計
 - 🔴 **資深工程師**：深入 server-side apply 的衝突處理與大型 addon 拆分策略
 
 </Callout>
 
 > 📦 **類比**：ClusterResourceSet 就像「新員工入職禮包自動發放系統」。
-> - 每個新叢集（新員工）帶上特定 label（部門標籤）時
+> - 每個新cluster（新員工）帶上特定 label（部門label）時
 > - 系統自動把對應的工具清單（ConfigMap/Secret）部署進去（發放設備和工具）
 > - 不需要 IT 人員手動一一安裝，入職當天一切就緒
 
@@ -32,7 +32,7 @@ title: Cluster API — Addons 與 ClusterResourceSet
 
 ClusterResourceSet（CRS）是 Cluster API 提供的 Addon 管理機制，核心功能是**自動將 ConfigMap 或 Secret 中定義的 Kubernetes 資源套用到符合條件的 workload cluster**。
 
-傳統上，新叢集建立完成後，工程師需要手動安裝 CNI 插件、StorageClass、監控 agent 等元件。CRS 解決了這個問題：只要叢集帶有特定 label，CAPI 控制器就會自動將對應的 addon 資源部署進去。
+傳統上，新cluster建立完成後，工程師需要手動安裝 CNI 插件、StorageClass、監控 agent 等元件。CRS 解決了這個問題：只要cluster帶有特定 label，CAPI controller就會自動將對應的 addon 資源部署進去。
 
 | 項目 | 說明 |
 |------|------|
@@ -48,7 +48,7 @@ ClusterResourceSet（CRS）是 Cluster API 提供的 Addon 管理機制，核心
 
 | 欄位 | 類型 | 必要 | 說明 |
 |------|------|------|------|
-| `spec.clusterSelector` | LabelSelector | ✅ | 選擇要套用資源的叢集 |
+| `spec.clusterSelector` | LabelSelector | ✅ | 選擇要套用資源的cluster |
 | `spec.resources` | []ResourceRef | ✅ | 要套用的 ConfigMap/Secret 列表 |
 | `spec.strategy` | string | ❌ | `ApplyOnce`（預設）或 `Reconcile` |
 
@@ -154,7 +154,7 @@ spec:
 | 步驟 | 操作 |
 |------|------|
 | 1 | 建立包含 Calico YAML 的 ConfigMap |
-| 2 | 建立 ClusterResourceSet，選擇器匹配 `cni: calico` 的叢集 |
+| 2 | 建立 ClusterResourceSet，選擇器匹配 `cni: calico` 的cluster |
 | 3 | 在 Cluster 物件加上 label `cni: calico` |
 | 4 | CAPI 自動將 Calico 套用到 workload cluster |
 
@@ -199,7 +199,7 @@ spec:
 
 ### 場景 3 — 與 ClusterClass 整合
 
-在使用 ClusterClass 建立叢集時，可以在 Cluster 物件的 `metadata.labels` 中預先設定好對應的 addon label。如此一來，只要叢集透過 ClusterClass 建立完成，CRS 控制器便會立即偵測到符合條件的叢集並自動套用 addon，實現**「建立叢集即自動安裝 addon」**的完整自動化流程，無需任何手動介入。
+在使用 ClusterClass 建立cluster時，可以在 Cluster 物件的 `metadata.labels` 中預先設定好對應的 addon label。如此一來，只要cluster透過 ClusterClass 建立完成，CRS controller便會立即偵測到符合條件的cluster並自動套用 addon，實現**「建立cluster即自動安裝 addon」**的完整自動化流程，無需任何手動介入。
 
 ---
 
@@ -210,7 +210,7 @@ spec:
 
 - ConfigMap/Secret 必須與 ClusterResourceSet 在**相同 namespace**
 - CRS 套用的資源會使用 `server-side apply`，請確保資源 YAML 格式正確且欄位定義完整
-- 若 workload cluster 的 API Server 不可用，CRS 控制器會持續重試，直到套用成功為止
+- 若 workload cluster 的 API Server 不可用，CRS controller會持續重試，直到套用成功為止
 
 </Callout>
 

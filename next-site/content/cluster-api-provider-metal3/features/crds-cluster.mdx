@@ -1,9 +1,9 @@
 ---
 layout: doc
-title: Metal3 Provider — 叢集層級 CRD
+title: Metal3 Provider — cluster層級 CRD
 ---
 
-# Metal3 Provider — 叢集層級 CRD
+# Metal3 Provider — cluster層級 CRD
 
 
 <Callout type="info" title="相關章節">
@@ -24,14 +24,14 @@ title: Metal3 Provider — 叢集層級 CRD
 
 ## 概覽
 
-Metal3 Provider 定義兩個叢集層級的 CRD，對應 CAPI 的 **InfraCluster 合約**，負責叢集層級的基礎設施抽象：
+Metal3 Provider 定義兩個cluster層級的 CRD，對應 CAPI 的 **InfraCluster 合約**，負責cluster層級的基礎設施抽象：
 
 | CRD | 用途 |
 |-----|------|
-| `Metal3Cluster` | 實作 CAPI InfraCluster 合約，描述叢集的基礎設施端點 |
+| `Metal3Cluster` | 實作 CAPI InfraCluster 合約，描述cluster的基礎設施端點 |
 | `Metal3ClusterTemplate` | Metal3Cluster 的不可變模板，用於 ClusterClass（Topology）模式 |
 
-與其他 Infrastructure Provider（如 CAPV、CAPA）相比，Metal3 的叢集層級邏輯非常精簡——Metal3 **不管理 Load Balancer**，`controlPlaneEndpoint` 必須由外部工具預先準備。
+與其他 Infrastructure Provider（如 CAPV、CAPA）相比，Metal3 的cluster層級邏輯非常精簡——Metal3 **不管理 Load Balancer**，`controlPlaneEndpoint` 必須由外部工具預先準備。
 
 ---
 
@@ -39,14 +39,14 @@ Metal3 Provider 定義兩個叢集層級的 CRD，對應 CAPI 的 **InfraCluster
 
 ### 概念說明
 
-`Metal3Cluster` 是 CAPM3 實作 CAPI InfraCluster 合約的核心 CRD。每個由 CAPI 管理的裸機叢集，都對應一個 `Metal3Cluster` 物件。
+`Metal3Cluster` 是 CAPM3 實作 CAPI InfraCluster 合約的核心 CRD。每個由 CAPI 管理的裸機cluster，都對應一個 `Metal3Cluster` 物件。
 
 <Callout type="info" title="概念類比：門牌號碼登記處">
 
 `Metal3Cluster` 就像一個**門牌號碼登記處**：
 
 - 你需要告訴系統「Control Plane API Server 在哪裡（IP + Port）」
-- 系統確認門牌號碼正確後，就說「好，叢集的基礎設施層就緒了（status.ready = true）」
+- 系統確認門牌號碼正確後，就說「好，cluster的基礎設施層就緒了（status.ready = true）」
 - Metal3Cluster 本身**不建立任何機器**，它只是一個座標記錄
 
 這與 AWS 或 Azure 的 provider 不同——那些 provider 需要在 Cluster 層面建立 VPC、Load Balancer 等。Metal3 的裸機環境假設這些基礎設施已經由使用者預先準備好。
@@ -55,7 +55,7 @@ Metal3 Provider 定義兩個叢集層級的 CRD，對應 CAPI 的 **InfraCluster
 
 <Callout type="info" title="重要設計決策">
 
-Metal3 **不負責建立或管理 Load Balancer**。`controlPlaneEndpoint`（Control Plane 的 VIP 位址）必須由外部工具（keepalived、MetalLB 等）提供，使用者需在建立叢集前先準備好 VIP。
+Metal3 **不負責建立或管理 Load Balancer**。`controlPlaneEndpoint`（Control Plane 的 VIP 位址）必須由外部工具（keepalived、MetalLB 等）提供，使用者需在建立cluster前先準備好 VIP。
 
 這與 CAPA（AWS Provider）或 CAPV（vSphere Provider）不同，後兩者會自動建立對應的負載均衡資源。
 
@@ -104,7 +104,7 @@ spec:
 
 ### 概念說明
 
-`Metal3ClusterTemplate` 是 `Metal3Cluster` 的**不可變模板**，主要用於 ClusterClass（Topology）模式。當使用 ClusterClass 時，叢集基礎設施模板透過 `Metal3ClusterTemplate` 定義，讓多個叢集共享同一份基礎設施規格。
+`Metal3ClusterTemplate` 是 `Metal3Cluster` 的**不可變模板**，主要用於 ClusterClass（Topology）模式。當使用 ClusterClass 時，cluster基礎設施模板透過 `Metal3ClusterTemplate` 定義，讓多個cluster共享同一份基礎設施規格。
 
 ### Spec 欄位
 
@@ -154,7 +154,7 @@ spec:
 當 `Cluster` 物件建立後，CAPI core controller 會：
 1. 找到 `infrastructureRef` 指向的 `Metal3Cluster`
 2. 等待 `Metal3Cluster.Status.Ready == true`
-3. 繼續推進叢集的 provisioning 流程
+3. 繼續推進cluster的 provisioning 流程
 
 ---
 
@@ -164,7 +164,7 @@ spec:
 
 1. **取得 Metal3Cluster 物件**
 2. **取得 CAPI Cluster**（透過 owner reference）
-3. **Pause 檢查**：若叢集已暫停，則跳過 reconcile
+3. **Pause 檢查**：若cluster已暫停，則跳過 reconcile
 4. 若有 `DeletionTimestamp` → **reconcileDelete**（移除 finalizer）
 5. 否則 → **reconcileNormal**：
    - 確認 `controlPlaneEndpoint` 已設定（若未設定則 requeue）
@@ -191,10 +191,10 @@ Metal3Cluster 的 reconcile 邏輯非常簡單，因為 Metal3 **不需要建立
 
 在裸機環境中，以下是幾種常見的 Control Plane VIP 設定方式：
 
-- **keepalived + kube-vip**：在 Control Plane 節點上運行 keepalived 或 kube-vip，使用 VRRP 實現 VIP failover。這是裸機環境最常見的選擇。
+- **keepalived + kube-vip**：在 Control Plane node上運行 keepalived 或 kube-vip，使用 VRRP 實現 VIP failover。這是裸機環境最常見的選擇。
 - **MetalLB**：若已有現有的 MetalLB 環境，可分配一個 LoadBalancer 類型的 VIP 給 API server 使用。
 - **硬體負載均衡器**：企業環境可使用 F5、Nginx Plus 等硬體或商業負載均衡解決方案。
-- **固定 IP（僅測試用）**：在測試環境中可直接使用第一台 CP 節點的 IP 作為端點，但此方式不具備高可用性，**不建議用於生產環境**。
+- **固定 IP（僅測試用）**：在測試環境中可直接使用第一台 CP node的 IP 作為端點，但此方式不具備高可用性，**不建議用於生產環境**。
 
 </Callout>
 
@@ -207,8 +207,8 @@ Metal3Cluster 的 reconcile 邏輯非常簡單，因為 Metal3 **不需要建立
 **誤解 1：「Metal3Cluster 會自動設定 controlPlaneEndpoint」**
 → 不對。`controlPlaneEndpoint`（VIP 或 Load Balancer 地址）必須由使用者或外部工具（keepalived、kube-vip、F5）預先建立，並手動填入 Metal3Cluster 的 spec 中。CAPM3 只讀取這個值，不會自動建立。
 
-**誤解 2：「Metal3Cluster status.ready = true 代表叢集已可用」**
-→ `status.ready = true` 只代表**叢集層基礎設施**就緒（controlPlaneEndpoint 已設定），不代表 Control Plane 節點已部署完成或 API Server 已可連線。節點就緒需等待 Metal3Machine 和 Machine 的 provisioning 完成。
+**誤解 2：「Metal3Cluster status.ready = true 代表cluster已可用」**
+→ `status.ready = true` 只代表**cluster層基礎設施**就緒（controlPlaneEndpoint 已設定），不代表 Control Plane node已部署完成或 API Server 已可連線。node就緒需等待 Metal3Machine 和 Machine 的 provisioning 完成。
 
 **誤解 3：「Metal3ClusterTemplate 和 Metal3Cluster 是不同的資源，需要分開管理」**
 → 概念上是兩個 CRD，但在 ClusterClass 場景下，你只需要管理 Metal3ClusterTemplate，每個由 ClusterClass 產生的 Cluster 會自動產生對應的 Metal3Cluster 實例。

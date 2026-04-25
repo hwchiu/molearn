@@ -30,10 +30,10 @@ MachineSet 是 Kubernetes **ReplicaSet** 的類比，負責維護一組 Machine 
 
 | 欄位 | 類型 | 說明 |
 |------|------|------|
-| `clusterName` | string | 所屬叢集名稱（不可變）|
+| `clusterName` | string | 所屬cluster名稱（不可變）|
 | `replicas` | int32 | 目標 Machine 數量 |
 | `selector` | LabelSelector | 用於辨識所管轄的 Machine |
-| `template.spec.clusterName` | string | 新建 Machine 的叢集名稱 |
+| `template.spec.clusterName` | string | 新建 Machine 的cluster名稱 |
 | `template.spec.bootstrap.configRef` | ObjectRef | Bootstrap provider 引用 |
 | `template.spec.infrastructureRef` | ObjectRef | Infrastructure provider 引用 |
 | `template.spec.version` | string | Kubernetes 版本（如 v1.28.0）|
@@ -86,7 +86,7 @@ spec:
 ```
 
 <Callout type="tip" title="新手提示：MachineSet 和 MachineDeployment 的選擇">
-大多數情況下應使用 MachineDeployment 而非直接使用 MachineSet。MachineDeployment 提供滾動更新能力 — 當你修改節點版本或硬體規格時，它會自動管理新舊 MachineSet 的切換，確保服務不中斷。只有在非常特殊的靜態節點場景（不需要版本升級）才考慮直接使用 MachineSet。
+大多數情況下應使用 MachineDeployment 而非直接使用 MachineSet。MachineDeployment 提供rolling update能力 — 當你修改node版本或硬體規格時，它會自動管理新舊 MachineSet 的切換，確保服務不中斷。只有在非常特殊的靜態node場景（不需要版本升級）才考慮直接使用 MachineSet。
 </Callout>
 
 ### deletePolicy 說明
@@ -96,7 +96,7 @@ spec:
 
 - **`Random`（預設）**：隨機選擇要刪除的 Machine，適合一般縮減場景。
 - **`Newest`**：優先刪除最新建立的 Machine，有利於快速回滾（保留較穩定的舊機器）。
-- **`Oldest`**：優先刪除最舊的 Machine，有利於輪替更新（逐步替換老舊節點）。
+- **`Oldest`**：優先刪除最舊的 Machine，有利於輪替更新（逐步替換老舊node）。
 
 </Callout>
 
@@ -105,13 +105,13 @@ spec:
 
 ## MachineDeployment
 
-MachineDeployment 是 Kubernetes **Deployment** 的類比，透過管理多個 MachineSet 來提供**滾動更新**能力。使用者只需更新 MachineDeployment 的 template，controller 便會自動建立新的 MachineSet 並逐步遷移 Machine，無需手動介入。
+MachineDeployment 是 Kubernetes **Deployment** 的類比，透過管理多個 MachineSet 來提供**rolling update**能力。使用者只需更新 MachineDeployment 的 template，controller 便會自動建立新的 MachineSet 並逐步遷移 Machine，無需手動介入。
 
 ### MachineDeployment Spec 欄位
 
 | 欄位 | 類型 | 說明 |
 |------|------|------|
-| `clusterName` | string | 所屬叢集名稱（不可變）|
+| `clusterName` | string | 所屬cluster名稱（不可變）|
 | `replicas` | int32 | 目標 Machine 數量 |
 | `selector` | LabelSelector | 用於辨識所管轄的 MachineSet |
 | `template` | MachineTemplateSpec | Machine 模板規格 |
@@ -181,7 +181,7 @@ spec:
 
 ### Step 1 — 更新觸發
 
-修改 `MachineDeployment.Spec.Template`（例如更改 `infrastructureRef` 指向新版本的 MachineTemplate，或更改 `version` 欄位）。Controller 偵測到 template hash 變更後，開始執行滾動更新流程。
+修改 `MachineDeployment.Spec.Template`（例如更改 `infrastructureRef` 指向新版本的 MachineTemplate，或更改 `version` 欄位）。Controller 偵測到 template hash 變更後，開始執行rolling update流程。
 
 ### Step 2 — 建立新 MachineSet
 
@@ -213,9 +213,9 @@ Controller 建立帶有**新 template hash label** 的新 MachineSet；舊 Machi
 
 | 比較項目 | MachineSet | MachineDeployment | MachinePool |
 |---------|-----------|-------------------|-------------|
-| 類比 K8s 物件 | ReplicaSet | Deployment | —（雲端節點組）|
+| 類比 K8s 物件 | ReplicaSet | Deployment | —（雲端node組）|
 | 管理機制 | 直接管理 Machine | 透過 MachineSet | 委託 InfraMachinePool |
-| 滾動更新 | ❌ 需手動 | ✅ 自動 | 依 InfraPool 實作 |
+| rolling update | ❌ 需手動 | ✅ 自動 | 依 InfraPool 實作 |
 | 使用場景 | 靜態 worker 組 | 生產 worker 組 | 雲端 Auto Scaling Group |
 | Feature Gate | — | — | MachinePool（Beta，預設開啟）|
 
@@ -243,8 +243,8 @@ MachineDeployment → MachineSet → Machine → Node
 ## 常見誤解
 
 <Callout type="warning" title="常見誤解澄清">
-1. **「修改 MachineDeployment 的 spec 欄位後，現有 Machine 會立即被替換」** — 不一定。只有「不可變欄位」（如 `infrastructure.ref`、`bootstrap.ref`）的變更才會觸發滾動更新。修改 `replicas` 只是擴縮容，不會替換現有 Machine。
-2. **「MachineSet 和 ReplicaSet 的行為完全相同」** — 有差異。MachineSet 在刪除機器時有 `deletePolicy`（Newest/Oldest/Random）設定，而 Kubernetes ReplicaSet 刪除 Pod 時只考慮排程分佈，概念不同。另外，MachineSet 還涉及跨可用區的 Failure Domain 分散邏輯。
+1. **「修改 MachineDeployment 的 spec 欄位後，現有 Machine 會立即被替換」** — 不一定。只有「不可變欄位」（如 `infrastructure.ref`、`bootstrap.ref`）的變更才會觸發rolling update。修改 `replicas` 只是擴縮容，不會替換現有 Machine。
+2. **「MachineSet 和 ReplicaSet 的行為完全相同」** — 有差異。MachineSet 在刪除機器時有 `deletePolicy`（Newest/Oldest/Random）設定，而 Kubernetes ReplicaSet 刪除 Pod 時只考慮scheduling分佈，概念不同。另外，MachineSet 還涉及跨可用區的 Failure Domain 分散邏輯。
 3. **「直接刪除 MachineDeployment 下的 Machine 會讓 MachineDeployment 自動縮容」** — 錯誤。MachineDeployment 在偵測到 Machine 數量不足時，會**建立新的 Machine** 以維持期望副本數，而非縮容。若想真正縮容，應減少 `spec.replicas`。
 </Callout>
 

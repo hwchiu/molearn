@@ -162,7 +162,7 @@ BMH 的狀態轉換完全由 **BMO** 負責管理，CAPM3 只能透過修改 BMH
 
 <Callout type="tip" title="Node Reuse 場景建議">
 
-在 **Node Reuse**（節點升級重用）場景中，建議將 `automatedCleaningMode` 設為 `disabled`。由於升級時會重用同一台裸機，省略 disk cleaning 可以顯著縮短升級所需時間，加快整個升級流程。
+在 **Node Reuse**（node升級重用）場景中，建議將 `automatedCleaningMode` 設為 `disabled`。由於升級時會重用同一台裸機，省略 disk cleaning 可以顯著縮短升級所需時間，加快整個升級流程。
 
 </Callout>
 
@@ -220,7 +220,7 @@ if len(availableHostsWithNodeReuse) != 0 {
 
 <Callout type="warning" title="Node Reuse 的「不回落」行為">
 
-若存在帶有 `nodeReuseLabelName` 的 BMH，但尚未進入 `ready`/`available`，CAPM3 **不會**回落選取一般 BMH，而是直接觸發 30 秒後重試。這確保升級場景下節點的穩定性，避免意外選到不同台機器。
+若存在帶有 `nodeReuseLabelName` 的 BMH，但尚未進入 `ready`/`available`，CAPM3 **不會**回落選取一般 BMH，而是直接觸發 30 秒後重試。這確保升級場景下node的穩定性，避免意外選到不同台機器。
 
 </Callout>
 
@@ -240,7 +240,7 @@ spec:
 
 流程：
 1. **Deprovisioning 時**：在 BMH 上貼 `nodeReuseLabelName` label（值為 KubeadmControlPlane 或 MachineDeployment 名稱）
-2. **新節點 Provisioning 時**：chooseHost 優先選取 label 值匹配當前機器所屬 CP/MD 的 BMH
+2. **新node Provisioning 時**：chooseHost 優先選取 label 值匹配當前機器所屬 CP/MD 的 BMH
 3. **Associate 成功後**：清除 `nodeReuseLabelName` label，BMH 離開「待重用」狀態
 
 ---

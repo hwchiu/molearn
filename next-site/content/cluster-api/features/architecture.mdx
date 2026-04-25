@@ -7,7 +7,7 @@ title: Cluster API — 架構概覽
 
 <Callout type="info" title="相關章節">
 
-- [核心控制器](/cluster-api/features/controller-core) — Cluster / Machine Reconcile 流程
+- [核心controller](/cluster-api/features/controller-core) — Cluster / Machine Reconcile 流程
 - [Provider 合約與 Runtime Hooks](/cluster-api/features/provider-contracts-runtime-hooks) — 合約規範細節
 - [ClusterClass 與 Topology](/cluster-api/features/clusterclass-topology) — Topology Controller 架構
 - [API 資源設計](/cluster-api/features/api-cluster-machine) — Cluster / Machine CRD 欄位詳解
@@ -90,10 +90,10 @@ CAPI 的功能依職責分散在六個 API Group 中：
 |-----------|------|
 | `cluster.x-k8s.io` | 核心：Cluster、Machine、MachineSet、MachineDeployment、ClusterClass、MachineHealthCheck |
 | `bootstrap.cluster.x-k8s.io` | Bootstrap：KubeadmConfig、KubeadmConfigTemplate，產生 cloud-init userdata |
-| `controlplane.cluster.x-k8s.io` | Control Plane：KubeadmControlPlane（KCP），管理 etcd 與 API server 節點 |
+| `controlplane.cluster.x-k8s.io` | Control Plane：KubeadmControlPlane（KCP），管理 etcd 與 API server node |
 | `addons.cluster.x-k8s.io` | Addons：ClusterResourceSet，自動安裝 CNI 等 Day 0 附加元件 |
 | `ipam.cluster.x-k8s.io`（Alpha）| IP 管理：IPAddressClaim / IPAddress，標準化靜態 IP 請求介面 |
-| `runtime.cluster.x-k8s.io`（Alpha）| Runtime SDK：ExtensionConfig，讓外部 webhook 介入叢集生命週期 hook |
+| `runtime.cluster.x-k8s.io`（Alpha）| Runtime SDK：ExtensionConfig，讓外部 webhook 介入cluster生命週期 hook |
 
 ---
 
@@ -101,9 +101,9 @@ CAPI 的功能依職責分散在六個 API Group 中：
 
 以下頁面涵蓋各主題的完整細節：
 
-- [核心控制器](/cluster-api/features/controller-core) — Cluster / Machine Reconcile Loop、狀態機、事件觸發機制
+- [核心controller](/cluster-api/features/controller-core) — Cluster / Machine Reconcile Loop、狀態機、事件觸發機制
 - [Provider 合約與 Runtime Hooks](/cluster-api/features/provider-contracts-runtime-hooks) — 四類合約的完整欄位規範與 Runtime SDK
 - [API 資源設計](/cluster-api/features/api-cluster-machine) — Cluster / Machine CRD 所有欄位的語意與設計決策
-- [ClusterClass 與 Topology](/cluster-api/features/clusterclass-topology) — 宣告式叢集模板與 patch engine
+- [ClusterClass 與 Topology](/cluster-api/features/clusterclass-topology) — 宣告式cluster模板與 patch engine
 - [Machine 生命週期](/cluster-api/features/machine-lifecycle) — 一台機器從 Pending 到 Running 的完整狀態轉換
 - [clusterctl](/cluster-api/features/clusterctl) — Provider 安裝、升級、move 操作詳解

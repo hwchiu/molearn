@@ -3,13 +3,13 @@
     "id": 1,
     "question": "Cluster API（CAPI）的核心設計理念是什麼？",
     "options": [
-      "以宣告式 API 統一管理 Kubernetes 叢集的生命週期",
+      "以宣告式 API 統一管理 Kubernetes cluster的生命週期",
       "提供命令列工具直接操作雲端 VM",
       "取代 kubectl 成為主要的 K8s 管理工具",
-      "專門用於管理 etcd 叢集備份"
+      "專門用於管理 etcd cluster備份"
     ],
     "answer": 0,
-    "explanation": "CAPI 採用 Kubernetes 原生的宣告式 API 設計，透過 CRD 和 Controller 模式統一管理不同 Infrastructure 上的 Kubernetes 叢集生命週期。"
+    "explanation": "CAPI 採用 Kubernetes 原生的宣告式 API 設計，透過 CRD 和 Controller 模式統一管理不同 Infrastructure 上的 Kubernetes cluster生命週期。"
   },
   {
     "id": 2,
@@ -33,7 +33,7 @@
       "New → Allocated → Deploying → Deployed → Released"
     ],
     "answer": 0,
-    "explanation": "CAPI Machine 的生命週期：Pending（等待 Bootstrap 資料）→ Provisioning（Infrastructure 建立中）→ Provisioned（基礎設施就緒）→ Running（Node 加入叢集並 Ready）→ Deleting（刪除中）。"
+    "explanation": "CAPI Machine 的生命週期：Pending（等待 Bootstrap 資料）→ Provisioning（Infrastructure 建立中）→ Provisioned（基礎設施就緒）→ Running（Node 加入cluster並 Ready）→ Deleting（刪除中）。"
   },
   {
     "id": 4,
@@ -57,7 +57,7 @@
       "Job 與 CronJob"
     ],
     "answer": 0,
-    "explanation": "MachineDeployment 管理多個 MachineSet，支援滾動更新（RollingUpdate），與 MachineSet 的關係完全類比 Kubernetes Deployment 與 ReplicaSet。"
+    "explanation": "MachineDeployment 管理多個 MachineSet，支援rolling update（RollingUpdate），與 MachineSet 的關係完全類比 Kubernetes Deployment 與 ReplicaSet。"
   },
   {
     "id": 6,
@@ -69,7 +69,7 @@
       "只在 KCP 版本升級時觸發"
     ],
     "answer": 0,
-    "explanation": "KCP 控制器監控 CP 機器上的憑證，當有效期剩餘少於 10% 或少於 1 年時，自動觸發輪換（透過 Machine 滾動更新實現）。"
+    "explanation": "KCP controller監控 CP 機器上的憑證，當有效期剩餘少於 10% 或少於 1 年時，自動觸發輪換（透過 Machine rolling update實現）。"
   },
   {
     "id": 7,
@@ -77,15 +77,15 @@
     "options": [
       "為每個 workload cluster 維護獨立的 K8s client 連線",
       "快取 management cluster 的 etcd 資料",
-      "儲存叢集的 backup snapshot",
-      "管理跨叢集的網路路由表"
+      "儲存cluster的 backup snapshot",
+      "管理跨cluster的網路路由表"
     ],
     "answer": 0,
     "explanation": "ClusterCache 為每個 workload cluster 建立並快取 Kubernetes client（透過 workload cluster 的 kubeconfig secret），讓 CAPI controller 可以存取 workload cluster 的資源（如 Node 狀態）。"
   },
   {
     "id": 8,
-    "question": "KubeadmControlPlane 滾動更新時，maxSurge 的預設值為何？",
+    "question": "KubeadmControlPlane rolling update時，maxSurge 的預設值為何？",
     "options": [
       "1（先新增一台再刪除）",
       "0（先刪除再新增）",
@@ -113,11 +113,11 @@
     "options": [
       "不健康機器數量超過 maxUnhealthy 閾值時，暫停所有修復動作",
       "超過 3 台機器不健康時，自動擴容",
-      "所有機器都不健康時，觸發叢集重建",
+      "所有機器都不健康時，觸發cluster重建",
       "不健康超過 10 分鐘時，通知管理員"
     ],
     "answer": 0,
-    "explanation": "Circuit Breaker：當不健康機器比例或數量超過 `maxUnhealthy`（預設 100%）時，MHC 停止觸發任何修復動作，防止錯誤判斷導致整個叢集的機器被刪除。"
+    "explanation": "Circuit Breaker：當不健康機器比例或數量超過 `maxUnhealthy`（預設 100%）時，MHC 停止觸發任何修復動作，防止錯誤判斷導致整個cluster的機器被刪除。"
   },
   {
     "id": 11,
@@ -148,7 +148,7 @@
     "question": "clusterctl move 指令的主要使用場景是什麼？",
     "options": [
       "將 CAPI 管理資源從 bootstrap cluster 搬移到永久 management cluster（pivot）",
-      "將 workload cluster 的工作負載搬移到另一個叢集",
+      "將 workload cluster 的workload搬移到另一個cluster",
       "備份 etcd 資料到遠端儲存",
       "升級 CAPI Provider 版本"
     ],
@@ -159,13 +159,13 @@
     "id": 14,
     "question": "ClusterClass 的 patches 機制用於什麼目的？",
     "options": [
-      "根據變數動態修改叢集模板中的欄位值",
+      "根據變數動態修改cluster模板中的欄位值",
       "套用 Kubernetes 安全性 admission webhook",
-      "備份叢集設定到 ConfigMap",
+      "備份cluster設定到 ConfigMap",
       "修補 CVE 安全漏洞"
     ],
     "answer": 0,
-    "explanation": "ClusterClass patches 機制讓使用者透過 variables 動態替換模板中的欄位（如 imageURL、machineType），達到「一個 ClusterClass，多種叢集設定」的目標。"
+    "explanation": "ClusterClass patches 機制讓使用者透過 variables 動態替換模板中的欄位（如 imageURL、machineType），達到「一個 ClusterClass，多種cluster設定」的目標。"
   },
   {
     "id": 15,

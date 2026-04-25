@@ -27,7 +27,7 @@ title: Metal3 Provider — Data Templates 與 IPAM
 
 ## 什麼是 Metal3 Data Templates
 
-裸機節點部署時，每台機器需要特定的設定——例如靜態 IP 位址、hostname、UUID 等。這些資訊無法預先硬編碼到映像檔中，必須在部署時動態注入。
+裸機node部署時，每台機器需要特定的設定——例如靜態 IP 位址、hostname、UUID 等。這些資訊無法預先硬編碼到image中，必須在部署時動態注入。
 
 ![Data Template 流程](/diagrams/metal3/data-template-flow.png)
 
@@ -247,7 +247,7 @@ Metal3Data 是每台機器的實際渲染結果：
 3. Metal3Data 渲染時，根據機器的 `index` 從 IPPool 取得唯一 IP
 4. 每台機器獲得固定、不重複的靜態 IP 位址
 
-此方式可確保叢集中每台裸機擁有可預期的靜態網路設定，便於 DNS 管理與安全策略設定。
+此方式可確保cluster中每台裸機擁有可預期的靜態網路設定，便於 DNS 管理與安全策略設定。
 
 </Callout>
 

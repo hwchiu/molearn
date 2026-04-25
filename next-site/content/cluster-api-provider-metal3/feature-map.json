@@ -8,9 +8,9 @@
     {"id": "bmh-lifecycle", "label": "BMH Lifecycle", "description": "Provisioning → Running → Deprovisioning 狀態機", "featureSlug": "bmh-lifecycle", "category": "lifecycle", "position": {"x": 200, "y": 350}},
     {"id": "datatemplate", "label": "Metal3DataTemplate", "description": "為每台機器注入網路 / cloud-init 資料", "featureSlug": "data-templates", "category": "infra", "position": {"x": 600, "y": 200}},
     {"id": "ipam", "label": "IPAM", "description": "IP 位址池分配管理", "featureSlug": "ipam", "category": "infra", "position": {"x": 600, "y": 350}},
-    {"id": "labelsync", "label": "Label Sync", "description": "BMH 標籤同步到 Node", "featureSlug": "labelsync", "category": "lifecycle", "position": {"x": 400, "y": 350}},
-    {"id": "remediation", "label": "Metal3Remediation", "description": "故障節點自動修復策略", "featureSlug": "remediation", "category": "lifecycle", "position": {"x": 0, "y": 350}},
-    {"id": "nodereuse", "label": "Node Reuse", "description": "升級時重用已存在節點，保留 PV 等資源", "featureSlug": "node-reuse", "category": "lifecycle", "position": {"x": 800, "y": 350}}
+    {"id": "labelsync", "label": "Label Sync", "description": "BMH label同步到 Node", "featureSlug": "labelsync", "category": "lifecycle", "position": {"x": 400, "y": 350}},
+    {"id": "remediation", "label": "Metal3Remediation", "description": "故障node自動修復策略", "featureSlug": "remediation", "category": "lifecycle", "position": {"x": 0, "y": 350}},
+    {"id": "nodereuse", "label": "Node Reuse", "description": "升級時重用已存在node，保留 PV 等資源", "featureSlug": "node-reuse", "category": "lifecycle", "position": {"x": 800, "y": 350}}
   ],
   "edges": [
     {"id": "e-m3m-bmh", "source": "metal3machine", "target": "bmh", "label": "consumerRef"},

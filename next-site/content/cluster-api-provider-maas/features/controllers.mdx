@@ -1,9 +1,9 @@
 ---
 layout: doc
-title: MAAS Provider — 控制器實作
+title: MAAS Provider — controller實作
 ---
 
-# MAAS Provider — 控制器實作
+# MAAS Provider — controller實作
 
 
 <Callout type="info" title="相關章節">
@@ -15,12 +15,12 @@ title: MAAS Provider — 控制器實作
 </Callout>
 
 
-## 控制器架構模式
+## controller架構模式
 
-MAAS Provider 的兩個控制器（`MaasClusterReconciler` 與 `MaasMachineReconciler`）均遵循標準 CAPI reconciler pattern，流程如下：
+MAAS Provider 的兩個controller（`MaasClusterReconciler` 與 `MaasMachineReconciler`）均遵循標準 CAPI reconciler pattern，流程如下：
 
 1. **取得物件**：從 API Server 取得目標 CR，若不存在則結束
-2. **Pause 檢查**：若叢集或機器被暫停（paused），跳過本次 reconcile
+2. **Pause 檢查**：若cluster或機器被暫停（paused），跳過本次 reconcile
 3. **設定 Finalizer**：確保刪除流程可被攔截，進行清理
 4. **判斷 reconcile 類型**：依 `DeletionTimestamp` 是否存在，決定執行正常 reconcile 或 delete reconcile
 5. **執行對應邏輯**：呼叫 MAAS API、設定狀態、更新 conditions
@@ -66,7 +66,7 @@ MAAS Provider 的兩個控制器（`MaasClusterReconciler` 與 `MaasMachineRecon
 | 項目 | 說明 |
 |------|------|
 | Finalizer 名稱 | `maascluster.infrastructure.cluster.x-k8s.io` |
-| 目的 | 確保叢集被刪除前，所有 MaasMachine 已完成清理 |
+| 目的 | 確保cluster被刪除前，所有 MaasMachine 已完成清理 |
 | 移除時機 | `reconcileDelete` 確認無剩餘 MaasMachine 後移除 |
 
 ---
@@ -171,9 +171,9 @@ Patch workload cluster 中對應 Node 的 Spec.ProviderID
 
 <Callout type="info" title="Pause 機制">
 
-當 `Cluster.Spec.Paused` 設定為 `true`，或叢集/機器被加上 `cluster.x-k8s.io/paused` annotation 時，所有相關 controller 都會跳過本次 reconcile，直到 pause 被移除為止。
+當 `Cluster.Spec.Paused` 設定為 `true`，或cluster/機器被加上 `cluster.x-k8s.io/paused` annotation 時，所有相關 controller 都會跳過本次 reconcile，直到 pause 被移除為止。
 
-這是 CAPI 的標準機制，常用於叢集維護、升級準備、或問題排查期間，防止 controller 在此期間對資源進行非預期的修改。
+這是 CAPI 的標準機制，常用於cluster維護、升級準備、或問題排查期間，防止 controller 在此期間對資源進行非預期的修改。
 
 </Callout>
 
@@ -193,7 +193,7 @@ Patch workload cluster 中對應 Node 的 Spec.ProviderID
 
 ## RBAC 權限設計
 
-控制器的 RBAC 權限透過 `//+kubebuilder:rbac` annotation 定義，由 `controller-gen` 自動產生 ClusterRole manifest。
+controller的 RBAC 權限透過 `//+kubebuilder:rbac` annotation 定義，由 `controller-gen` 自動產生 ClusterRole manifest。
 
 | 資源 | 動作 | 說明 |
 |------|------|------|

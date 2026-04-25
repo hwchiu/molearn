@@ -15,18 +15,18 @@ title: Cluster API — Bootstrap KubeadmConfig
 </Callout>
 
 <Callout type="tip" title="本文適用對象">
-- 🟢 **初學者**：理解 Bootstrap Data 是什麼 — 節點啟動時需要的「開機設定包」，告訴節點如何加入叢集
-- 🟡 **中階工程師**：重點比較 InitConfiguration（第一台 CP）與 JoinConfiguration（後續節點）的差異
+- 🟢 **初學者**：理解 Bootstrap Data 是什麼 — node啟動時需要的「開機設定包」，告訴node如何加入cluster
+- 🟡 **中階工程師**：重點比較 InitConfiguration（第一台 CP）與 JoinConfiguration（後續node）的差異
 - 🔴 **資深工程師**：深入研究 Ignition 格式支援與替代 Bootstrap Provider 的整合方式
 </Callout>
 
-> 📱 **類比**：Bootstrap Data 就像新手機的「開箱設定精靈」— 手機出廠時是白板，第一次開機時精靈會引導你設定語言、網路、帳號（對應 cloud-init 執行 kubeadm init/join）。KubeadmConfig 就是這份設定精靈的「腳本」，Infrastructure Provider 在建立機器時將這份腳本注入機器，確保節點啟動後自動完成所有 Kubernetes 初始化步驟。
+> 📱 **類比**：Bootstrap Data 就像新手機的「開箱設定精靈」— 手機出廠時是白板，第一次開機時精靈會引導你設定語言、網路、帳號（對應 cloud-init 執行 kubeadm init/join）。KubeadmConfig 就是這份設定精靈的「腳本」，Infrastructure Provider 在建立機器時將這份腳本注入機器，確保node啟動後自動完成所有 Kubernetes 初始化步驟。
 
 ## Bootstrap Provider 概念
 
-在 Cluster API（CAPI）架構中，**Bootstrap Provider** 負責生成節點初始化所需的 cloud-init 或 ignition 資料。CAPI 核心本身不知道如何初始化節點內部環境；由 Bootstrap Provider 決定要執行哪些命令、安裝哪些套件、寫入哪些設定檔。
+在 Cluster API（CAPI）架構中，**Bootstrap Provider** 負責生成node初始化所需的 cloud-init 或 ignition 資料。CAPI 核心本身不知道如何初始化node內部環境；由 Bootstrap Provider 決定要執行哪些命令、安裝哪些套件、寫入哪些設定檔。
 
-官方標準的 Bootstrap Provider 是 **kubeadm Bootstrap Provider（CABPK，Cluster API Bootstrap Provider Kubeadm）**，使用 `kubeadm` 完成節點的 Kubernetes 初始化流程。
+官方標準的 Bootstrap Provider 是 **kubeadm Bootstrap Provider（CABPK，Cluster API Bootstrap Provider Kubeadm）**，使用 `kubeadm` 完成node的 Kubernetes 初始化流程。
 
 Bootstrap Provider 的最終輸出是一個 **Kubernetes Secret**，內含 cloud-init 格式的 `userData`。Secret 名稱格式為 `<machine-name>-bootstrap-data`，由 Machine Controller 讀取後傳遞給 Infrastructure Provider，在建立實體機器或虛擬機器時注入為啟動時的 user-data。
 
@@ -43,9 +43,9 @@ Bootstrap Provider 的最終輸出是一個 **Kubernetes Secret**，內含 cloud
 | 欄位 | 類型 | 說明 |
 |------|------|------|
 | `initConfiguration` | InitConfiguration | kubeadm init 設定（Control Plane 第一台使用）|
-| `clusterConfiguration` | ClusterConfiguration | K8s 叢集全域設定（Control Plane 使用）|
+| `clusterConfiguration` | ClusterConfiguration | K8s cluster全域設定（Control Plane 使用）|
 | `joinConfiguration` | JoinConfiguration | kubeadm join 設定（Worker 和後續 CP 使用）|
-| `files` | []File | 寫入節點的檔案 |
+| `files` | []File | 寫入node的檔案 |
 | `preKubeadmCommands` | []string | kubeadm 前執行的命令 |
 | `postKubeadmCommands` | []string | kubeadm 後執行的命令 |
 | `users` | []User | 建立的系統使用者（含 SSH key）|
@@ -102,7 +102,7 @@ spec:
 
 ## Files 欄位詳細說明
 
-`files` 欄位允許在節點啟動時建立任意檔案，常用於注入憑證、設定檔或腳本：
+`files` 欄位允許在node啟動時建立任意檔案，常用於注入憑證、設定檔或腳本：
 
 ```yaml
 files:
@@ -138,7 +138,7 @@ files:
 
 ## Users 欄位 — SSH 金鑰注入
 
-透過 `users` 欄位可在節點建立時注入系統使用者及 SSH public key，讓運維人員能夠直接登入節點：
+透過 `users` 欄位可在node建立時注入系統使用者及 SSH public key，讓運維人員能夠直接登入node：
 
 ```yaml
 users:
@@ -176,11 +176,11 @@ ntp:
 <Callout type="warning" title="裸機環境特別注意">
 
 在裸機環境中，NTP 設定尤為重要。時鐘偏差（clock skew）會導致：
-- **etcd 叢集不穩定**：etcd 採用 Raft 一致性算法，對時間敏感
+- **etcd cluster不穩定**：etcd 採用 Raft 一致性算法，對時間敏感
 - **憑證驗證失敗**：TLS 憑證的有效期間驗證依賴系統時鐘
 - **Kubernetes Token 過期**：bootstrap token 有時效限制
 
-請確保所有節點在加入叢集前已正確同步時間。
+請確保所有node在加入cluster前已正確同步時間。
 
 </Callout>
 
@@ -197,21 +197,21 @@ CABPK Controller 負責監聽 KubeadmConfig 物件，並依序完成以下步驟
 - CABPK Controller watch 所有 KubeadmConfig 物件，偵測到新建或未就緒的物件後開始處理
 
 <Callout type="tip" title="新手提示：Bootstrap Data 是什麼格式？">
-Bootstrap Data 本質上是一段「開機腳本」，格式通常是 **cloud-init**（cloud-config 格式）。當 Infrastructure Provider 建立一台新 VM 或裸機時，會把這段腳本作為 `user-data` 注入機器。機器第一次開機時，cloud-init 程式會自動執行這段腳本，安裝 containerd、kubelet，並執行 `kubeadm init` 或 `kubeadm join` 將節點加入 Kubernetes 叢集。整個過程完全自動，無需人工介入。
+Bootstrap Data 本質上是一段「開機腳本」，格式通常是 **cloud-init**（cloud-config 格式）。當 Infrastructure Provider 建立一台新 VM 或裸機時，會把這段腳本作為 `user-data` 注入機器。機器第一次開機時，cloud-init 程式會自動執行這段腳本，安裝 containerd、kubelet，並執行 `kubeadm init` 或 `kubeadm join` 將node加入 Kubernetes cluster。整個過程完全自動，無需人工介入。
 </Callout>
 
 ### Step 2 — 等待必要資訊就緒
 
 - 等待 `Cluster.Status.InfrastructureReady = true`
 - 等待 KubeadmConfig 對應的 Cluster 資源完整建立
-- 若目標節點為 Control Plane，額外等待 certificates secret（含 CA、etcd CA 等）就緒
+- 若目標node為 Control Plane，額外等待 certificates secret（含 CA、etcd CA 等）就緒
 
 ### Step 3 — 生成 cloud-init 資料
 
-根據節點類型產生不同的初始化指令：
+根據node類型產生不同的初始化指令：
 
-- **Control Plane init（第一台 CP）**：包含 `kubeadm init` 命令、叢集憑證、以及 ClusterConfiguration
-- **Worker / CP join（後續節點）**：包含 `kubeadm join` 命令和有時效的 bootstrap token
+- **Control Plane init（第一台 CP）**：包含 `kubeadm init` 命令、cluster憑證、以及 ClusterConfiguration
+- **Worker / CP join（後續node）**：包含 `kubeadm join` 命令和有時效的 bootstrap token
 
 Controller 將所有 `files`、`preKubeadmCommands`、`postKubeadmCommands`、`users`、`ntp` 等設定組合成完整的 cloud-init user-data。
 
@@ -245,7 +245,7 @@ spec:
 
 - `files` 欄位的語法與 cloud-init 略有不同，部分子欄位（如 `encoding`）的處理方式有差異
 - Ignition 的 `users` 和 `ntp` 設定也會轉換為對應的 Ignition 規格
-- 在 Metal3 環境中，BMH（BareMetalHost）支援透過 live-ISO 或 virtual media 方式注入 Ignition 設定，適合無狀態、不可變的裸機節點管理場景
+- 在 Metal3 環境中，BMH（BareMetalHost）支援透過 live-ISO 或 virtual media 方式注入 Ignition 設定，適合無狀態、不可變的裸機node管理場景
 
 > 💡 **思考一下**：Bootstrap Data 只能被使用一次（一次性 Secret）。如果機器開機失敗需要重試，CAPI 是如何處理的？為什麼不直接讓機器重新讀取同一份 Secret？
 
@@ -256,7 +256,7 @@ spec:
 <Callout type="warning" title="常見誤解澄清">
 1. **「Bootstrap Data 就是 kubeadm 的設定檔」** — 不完全正確。Bootstrap Data 是一個完整的「開機初始化腳本」，通常以 cloud-init 格式呈現，其中**包含** kubeadm 設定（`kubeadm-config.yaml`），但還包含安裝 containerd、kubelet、設定 NTP、建立使用者等許多其他步驟，遠比單純的 kubeadm 設定豐富。
 2. **「KubeadmConfig 和 KubeadmConfigTemplate 功能完全相同」** — 有差別。`KubeadmConfig` 是一次性物件（1 對 1 對應一台 Machine），`KubeadmConfigTemplate` 是可重用的範本（1 對多），由 MachineSet 或 MachineDeployment 管理，每次建立新 Machine 時都會從 Template 複製出一個新的 KubeadmConfig。
-3. **「Bootstrap Provider 可以省略」** — 不正確。每台 Machine 的節點初始化都需要 Bootstrap Data。若不使用 CABPK，也必須提供其他 Bootstrap Provider（或自定義機制），否則節點永遠無法加入叢集。
+3. **「Bootstrap Provider 可以省略」** — 不正確。每台 Machine 的node初始化都需要 Bootstrap Data。若不使用 CABPK，也必須提供其他 Bootstrap Provider（或自定義機制），否則node永遠無法加入cluster。
 </Callout>
 
 ---

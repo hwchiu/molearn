@@ -11,7 +11,7 @@ title: Metal3 Provider — 機器層級 CRD
 - [專案總覽](/cluster-api-provider-metal3/)
 - [架構與設計](/cluster-api-provider-metal3/features/architecture)
 - [BareMetalHost 生命週期](/cluster-api-provider-metal3/features/bmh-lifecycle)
-- [叢集層級 CRD](/cluster-api-provider-metal3/features/crds-cluster)
+- [cluster層級 CRD](/cluster-api-provider-metal3/features/crds-cluster)
 
 </Callout>
 
@@ -56,7 +56,7 @@ Metal3 Provider 定義兩個機器層級的 CRD，對應 CAPI 的 **InfraMachine
 - **訂位流程（chooseHost）**：餐廳服務員根據訂位要求找到合適的桌子
 - **入座確認（status.providerID 設定）**：客人坐下後，訂位單就與桌子綁定了
 
-`hostSelector` 就是訂位單上的「特殊需求」欄位：「我只要 GPU 節點」或「只要機架 A 的機器」。
+`hostSelector` 就是訂位單上的「特殊需求」欄位：「我只要 GPU node」或「只要機架 A 的機器」。
 
 </Callout>
 
@@ -153,7 +153,7 @@ spec:
 - `KubeadmControlPlane.spec.machineTemplate.infrastructureRef`
 - `ClusterClass` 中的 machineInfrastructure 引用
 
-建立後不可修改（immutable）。若要更新節點設定（例如更換 OS image），需建立一個新的 MachineTemplate，再更新 MachineDeployment 或 KubeadmControlPlane 的引用，觸發滾動更新。
+建立後不可修改（immutable）。若要更新node設定（例如更換 OS image），需建立一個新的 MachineTemplate，再更新 MachineDeployment 或 KubeadmControlPlane 的引用，觸發rolling update。
 
 ### YAML 範例
 
@@ -182,7 +182,7 @@ spec:
 
 <Callout type="info" title="nodeReuse 行為說明">
 
-`nodeReuse` 欄位控制叢集升級時的 BMH 重用策略：
+`nodeReuse` 欄位控制cluster升級時的 BMH 重用策略：
 
 - **`nodeReuse: false`**（預設）：升級時建立新機器，不考慮舊機器所使用的 BMH，舊 BMH 釋放後回到可用池
 - **`nodeReuse: true`**：升級時優先重用舊機器的 BMH，減少 BMH 資源消耗，適合 BMH 數量有限的環境
@@ -229,7 +229,7 @@ Metal3Machine 透過 `status.selectedHostRef` 記錄已選取的 BMH 名稱。BM
 
 <Callout type="info" title="安全注意事項">
 
-在生產環境中，若將 `automatedCleaningMode` 設為 `disabled`，舊節點的磁碟資料（包含 kubelet 憑證、容器資料等）不會被清除。請確保在受信任的內部網路環境中才使用此模式，或搭配其他安全措施（如全磁碟加密）。
+在生產環境中，若將 `automatedCleaningMode` 設為 `disabled`，舊node的磁碟資料（包含 kubelet 憑證、容器資料等）不會被清除。請確保在受信任的內部網路環境中才使用此模式，或搭配其他安全措施（如全磁碟加密）。
 
 </Callout>
 

@@ -25,13 +25,13 @@ title: Cluster API — Topology Controller 詳解
 
 ## Topology Controller 概覽
 
-`TopologyReconciler` 是 Cluster API 中負責 **ClusterClass 功能**的核心控制器，由 Feature Gate `ClusterTopology`（Beta，預設開啟）控制。
+`TopologyReconciler` 是 Cluster API 中負責 **ClusterClass 功能**的核心controller，由 Feature Gate `ClusterTopology`（Beta，預設開啟）控制。
 
 其主要職責是將 `Cluster.Spec.Topology` 中的**宣告式設定**，轉換為實際的 CAPI 資源，包括：
 
-- **InfraCluster**：底層基礎設施叢集物件
+- **InfraCluster**：底層基礎設施cluster物件
 - **KubeadmControlPlane（KCP）**：控制平面
-- **MachineDeployment**：工作節點群組
+- **MachineDeployment**：工作node群組
 - 各種對應的 **Template** 資源
 
 除了資源建立，TopologyReconciler 還負責：
@@ -44,7 +44,7 @@ title: Cluster API — Topology Controller 詳解
 
 ### Step 1 — 讀取 ClusterClass
 
-控制器從 `Cluster.Spec.Topology.Class` 取得 ClusterClass 名稱，並讀取其完整定義，包含：
+controller從 `Cluster.Spec.Topology.Class` 取得 ClusterClass 名稱，並讀取其完整定義，包含：
 
 - `spec.infrastructure`：InfraCluster Template 的參照
 - `spec.controlPlane`：KCP Template 的參照（含 machine infrastructure template）
@@ -54,7 +54,7 @@ title: Cluster API — Topology Controller 詳解
 
 ### Step 2 — 處理 Variables
 
-控制器讀取 `Cluster.Spec.Topology.Variables`，並執行以下操作：
+controller讀取 `Cluster.Spec.Topology.Variables`，並執行以下操作：
 
 1. 將使用者提供的變數與 ClusterClass `spec.variables` 的預設值**合併**
 2. **驗證**所有標記為 `required: true` 的變數都有提供值
@@ -64,7 +64,7 @@ title: Cluster API — Topology Controller 詳解
 
 ### Step 3 — Apply Patches
 
-Patch 是 ClusterTopology 最強大的功能之一，控制器會依序執行：
+Patch 是 ClusterTopology 最強大的功能之一，controller會依序執行：
 
 1. **套用 ClusterClass 中定義的 patches**（按順序）
 2. 每個 patch 的 `selector` 決定要修改哪些 template
@@ -75,12 +75,12 @@ Patch 是 ClusterTopology 最強大的功能之一，控制器會依序執行：
    - 各 `MachineDeploymentTemplate`（已填入所有變數值）
 
 <Callout type="tip" title="新手提示：Patches 如何把參數「注入」到 Template？">
-想像 ClusterClass 的 Template 就像有預留空格的合約範本，`patches` 就是「填空規則」。你在 `spec.topology.variables` 填入的值（例如 `imageURL: "https://example.com/ubuntu.img"`），Topology Controller 會按照 patches 定義的路徑（例如 `/spec/template/spec/image/url`），把這個值精確填入對應 Template 的那個欄位。整個過程在 Controller 記憶體中完成，不會直接修改 ClusterClass 或 Template 物件，而是產生一個「具體化版本」再套用到叢集。
+想像 ClusterClass 的 Template 就像有預留空格的合約範本，`patches` 就是「填空規則」。你在 `spec.topology.variables` 填入的值（例如 `imageURL: "https://example.com/ubuntu.img"`），Topology Controller 會按照 patches 定義的路徑（例如 `/spec/template/spec/image/url`），把這個值精確填入對應 Template 的那個欄位。整個過程在 Controller 記憶體中完成，不會直接修改 ClusterClass 或 Template 物件，而是產生一個「具體化版本」再套用到cluster。
 </Callout>
 
 ### Step 4 — 建立或更新資源
 
-控制器對比**目前存在的資源**與**期望狀態**：
+controller對比**目前存在的資源**與**期望狀態**：
 
 | 情況 | 操作 |
 |------|------|
@@ -88,17 +88,17 @@ Patch 是 ClusterTopology 最強大的功能之一，控制器會依序執行：
 | 資源存在但設定過時 | 更新資源設定 |
 | 資源存在且為最新 | 不做任何變動 |
 
-對於不可變動的欄位（如某些 InfraCluster 欄位），控制器會建立**新的 template 物件**並更新參照，而非直接修改原物件。
+對於不可變動的欄位（如某些 InfraCluster 欄位），controller會建立**新的 template 物件**並更新參照，而非直接修改原物件。
 
 ### Step 5 — 更新 Cluster Status
 
-Reconcile 結束後，控制器更新 `Cluster.Status.Topology`，反映目前的版本和 variable 狀態，供其他控制器或使用者查看。
+Reconcile 結束後，controller更新 `Cluster.Status.Topology`，反映目前的版本和 variable 狀態，供其他controller或使用者查看。
 
 ---
 
 ## ClusterClass 結構說明
 
-ClusterClass 是一個叢集藍圖，定義了建立叢集所需的所有 template 和規則。以下是完整範例：
+ClusterClass 是一個cluster藍圖，定義了建立cluster所需的所有 template 和規則。以下是完整範例：
 
 ```yaml
 apiVersion: cluster.x-k8s.io/v1beta1
@@ -142,7 +142,7 @@ spec:
       schema:
         openAPIV3Schema:
           type: string
-          description: "Control Plane 節點使用的 OS image URL"
+          description: "Control Plane node使用的 OS image URL"
     - name: workerReplicas
       required: false
       schema:
@@ -177,7 +177,7 @@ spec:
 
 ## Cluster with Topology 範例
 
-使用 ClusterClass 建立叢集時，Cluster 物件透過 `spec.topology` 區塊引用 ClusterClass：
+使用 ClusterClass 建立cluster時，Cluster 物件透過 `spec.topology` 區塊引用 ClusterClass：
 
 ```yaml
 apiVersion: cluster.x-k8s.io/v1beta1
@@ -231,7 +231,7 @@ ClusterTopology 大幅簡化了版本升級流程：
 
 <Callout type="tip" title="使用 ClusterTopology 升級的優勢">
 
-使用 ClusterTopology 的好處是只需修改一個欄位（`spec.topology.version`），所有 Control Plane 和 Worker 節點會自動按正確順序升級。無需手動協調多個資源的更新順序，大幅降低操作風險。
+使用 ClusterTopology 的好處是只需修改一個欄位（`spec.topology.version`），所有 Control Plane 和 Worker node會自動按正確順序升級。無需手動協調多個資源的更新順序，大幅降低操作風險。
 
 </Callout>
 
@@ -317,32 +317,32 @@ Patch 可以透過兩種方式引用 variable 值：
 
 | Hook 名稱 | 觸發時機 |
 |-----------|---------|
-| `BeforeClusterCreate` | 建立叢集資源前 |
-| `BeforeClusterUpgrade` | 升級叢集版本前 |
+| `BeforeClusterCreate` | 建立cluster資源前 |
+| `BeforeClusterUpgrade` | 升級cluster版本前 |
 | `AfterControlPlaneInitialized` | Control Plane 初始化完成後 |
 | `AfterClusterUpgrade` | 升級完成後 |
-| `BeforeClusterDelete` | 刪除叢集資源前 |
+| `BeforeClusterDelete` | 刪除cluster資源前 |
 
 **Topology Controller 在適當時機呼叫這些 hooks**，等待外部系統確認後才繼續執行。
 
 **常見用途：**
 - **Custom admission logic**：在建立或升級前進行額外驗證
 - **External dependency management**：等待外部系統就緒（如 DNS、憑證）
-- **Audit logging**：記錄叢集生命週期事件到外部系統
+- **Audit logging**：記錄cluster生命週期事件到外部系統
 
 若要啟用，需設定 Feature Gate `--feature-gates=RuntimeSDK=true` 並部署對應的 Runtime Extension webhook。
 
 </Callout>
 
-> 💡 **思考一下**：Topology Controller 在 Apply Patches 時，需要把 ClusterClass 的 Template 「具體化」為實際資源。如果兩個叢集使用同一個 ClusterClass 但設定了不同的 variables，Topology Controller 如何確保它們各自產生獨立的 Template 實例，而不會互相干擾？
+> 💡 **思考一下**：Topology Controller 在 Apply Patches 時，需要把 ClusterClass 的 Template 「具體化」為實際資源。如果兩個cluster使用同一個 ClusterClass 但設定了不同的 variables，Topology Controller 如何確保它們各自產生獨立的 Template 實例，而不會互相干擾？
 
 ---
 
 ## 常見誤解
 
 <Callout type="warning" title="常見誤解澄清">
-1. **「Topology Controller 修改了 ClusterClass 的 Template 物件」** — 錯誤。Topology Controller 會為每個叢集建立獨立的「owned Template 複本」（透過 ownerReference 標記），並對這份複本套用 patches，而不是直接修改 ClusterClass 中的原始 Template。因此多個叢集共用同一個 ClusterClass 時，各自的 Template 是完全獨立的複本。
-2. **「版本升級時 Topology Controller 會直接修改所有 Machine 的版本」** — 不正確。Topology Controller 只更新 KubeadmControlPlane 和 MachineDeployment 的 `version` 欄位，實際的節點替換滾動升級由 KCP Controller 和 MachineSetReconciler 各自執行，Topology Controller 不直接接觸 Machine 物件。
+1. **「Topology Controller 修改了 ClusterClass 的 Template 物件」** — 錯誤。Topology Controller 會為每個cluster建立獨立的「owned Template 複本」（透過 ownerReference 標記），並對這份複本套用 patches，而不是直接修改 ClusterClass 中的原始 Template。因此多個cluster共用同一個 ClusterClass 時，各自的 Template 是完全獨立的複本。
+2. **「版本升級時 Topology Controller 會直接修改所有 Machine 的版本」** — 不正確。Topology Controller 只更新 KubeadmControlPlane 和 MachineDeployment 的 `version` 欄位，實際的node替換滾動升級由 KCP Controller 和 MachineSetReconciler 各自執行，Topology Controller 不直接接觸 Machine 物件。
 3. **「Runtime Extension Hooks 是必要的設定」** — 非必要。Runtime Extension（RuntimeSDK）是進階功能，需要額外部署 webhook 服務並啟用 Feature Gate。大多數使用案例不需要 hooks，只有在需要整合外部系統（如 CMDB、審核系統）時才考慮使用。
 </Callout>
 

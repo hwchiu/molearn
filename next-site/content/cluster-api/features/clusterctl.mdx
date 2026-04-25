@@ -20,15 +20,15 @@ title: Cluster API — clusterctl 操作指南
 - 🔴 **資深工程師**：深入研究離線（air-gapped）安裝方式與自定義 Provider URL 設定
 </Callout>
 
-> 🎛️ **類比**：clusterctl 是 CAPI 的「維運駕駛艙」— 就像飛機駕駛艙中有各種儀表板和控制桿，`kubectl` 負責操控工作叢集內部的應用程式，而 `clusterctl` 則是操控叢集本身的生命週期。安裝 Provider、建立叢集、搬移管理權、升級版本，這些「叢集級別的操作」都透過 clusterctl 這個駕駛艙來執行，讓維運人員有清晰的控制界面。
+> 🎛️ **類比**：clusterctl 是 CAPI 的「維運駕駛艙」— 就像飛機駕駛艙中有各種儀表板和控制桿，`kubectl` 負責操控工作cluster內部的應用程式，而 `clusterctl` 則是操控cluster本身的生命週期。安裝 Provider、建立cluster、搬移管理權、升級版本，這些「cluster級別的操作」都透過 clusterctl 這個駕駛艙來執行，讓維運人員有清晰的控制界面。
 
 ## clusterctl 是什麼
 
 `clusterctl` 是 Cluster API（CAPI）的官方 CLI 工具，負責管理整個 CAPI 生態系的核心操作：
 
 - **Provider 管理**：安裝、升級、移除 Infrastructure / Bootstrap / ControlPlane Provider
-- **工作叢集生命週期**：建立、升級、刪除、搬移 workload cluster
-- **叢集診斷**：提供叢集狀態樹狀視圖與除錯功能
+- **工作cluster生命週期**：建立、升級、刪除、搬移 workload cluster
+- **cluster診斷**：提供cluster狀態樹狀視圖與除錯功能
 
 ### 安裝方式
 
@@ -92,12 +92,12 @@ providers:
 
 ---
 
-## clusterctl generate cluster — 產生叢集 YAML
+## clusterctl generate cluster — 產生cluster YAML
 
-`clusterctl generate cluster` 根據 Provider 提供的模板產生叢集所需的 YAML 資源。
+`clusterctl generate cluster` 根據 Provider 提供的模板產生cluster所需的 YAML 資源。
 
 ```bash
-# 產生 Metal3 叢集 YAML
+# 產生 Metal3 cluster YAML
 clusterctl generate cluster my-cluster \
   --infrastructure metal3 \
   --kubernetes-version v1.28.0 \
@@ -141,15 +141,15 @@ clusterctl generate cluster my-cluster \
 ---
 
 <Callout type="tip" title="新手提示：clusterctl vs kubectl 的使用場景">
-`kubectl` 操作的是 Kubernetes 資源物件（Pod、Service、Deployment），`clusterctl` 操作的是 CAPI 的管理層面（Provider 安裝、叢集搬移、Provider 升級）。平時運維 workload cluster 的應用程式用 `kubectl`；安裝或升級 CAPI 本身、搬移管理叢集等「叢集基礎設施管理」操作才使用 `clusterctl`。
+`kubectl` 操作的是 Kubernetes 資源物件（Pod、Service、Deployment），`clusterctl` 操作的是 CAPI 的管理層面（Provider 安裝、cluster搬移、Provider 升級）。平時運維 workload cluster 的應用程式用 `kubectl`；安裝或升級 CAPI 本身、搬移管理cluster等「cluster基礎設施管理」操作才使用 `clusterctl`。
 </Callout>
 
-## clusterctl describe cluster — 查看叢集狀態
+## clusterctl describe cluster — 查看cluster狀態
 
-`clusterctl describe cluster` 以樹狀結構呈現叢集內所有 CAPI 資源的狀態，是診斷問題的第一步。
+`clusterctl describe cluster` 以樹狀結構呈現cluster內所有 CAPI 資源的狀態，是診斷問題的第一步。
 
 ```bash
-# 查看叢集狀態
+# 查看cluster狀態
 clusterctl describe cluster my-cluster -n metal3
 
 # 輸出範例：
@@ -179,7 +179,7 @@ clusterctl describe cluster my-cluster \
 |------|------|
 | `--show-conditions all` | 顯示所有 Condition（包含 True 狀態） |
 | `--grouping false` | 不分組顯示 Machine，逐一列出 |
-| `--all-namespaces` | 列出所有 namespace 中的叢集 |
+| `--all-namespaces` | 列出所有 namespace 中的cluster |
 
 ---
 
@@ -237,9 +237,9 @@ clusterctl upgrade apply \
 
 ---
 
-## clusterctl move — 搬移叢集
+## clusterctl move — 搬移cluster
 
-`clusterctl move` 用於將 management cluster 中的 CAPI 資源搬移至另一個叢集，常見於 pivot 流程。
+`clusterctl move` 用於將 management cluster 中的 CAPI 資源搬移至另一個cluster，常見於 pivot 流程。
 
 ```bash
 # 將資源從 bootstrap cluster 搬到 management cluster（pivot）
@@ -247,7 +247,7 @@ clusterctl move \
   --to-kubeconfig=management-cluster.kubeconfig \
   --namespace metal3
 
-# 搬移特定叢集
+# 搬移特定cluster
 clusterctl move \
   --to-kubeconfig=new-management.kubeconfig \
   --namespace metal3 \
@@ -259,13 +259,13 @@ clusterctl move \
 | 場景 | 說明 |
 |------|------|
 | Bootstrap → 永久 management cluster | 初始部署完成後的 pivot 操作 |
-| Management cluster 遷移 | 將管理權轉移至新叢集 |
+| Management cluster 遷移 | 將管理權轉移至新cluster |
 | 災難復原 | 從備份重建 management cluster 後還原管理資源 |
 
 
 <Callout type="info" title="move 操作前置條件">
 
-move 操作前，確保目標叢集已安裝相同版本的 Provider（`clusterctl init`），且 workload cluster 正常運行。move 只搬移管理資源，不影響 workload cluster 本身的運行。
+move 操作前，確保目標cluster已安裝相同版本的 Provider（`clusterctl init`），且 workload cluster 正常運行。move 只搬移管理資源，不影響 workload cluster 本身的運行。
 
 </Callout>
 
@@ -280,7 +280,7 @@ move 操作前，確保目標叢集已安裝相同版本的 Provider（`clusterc
 clusterctl describe provider -n capi-system
 ```
 
-**列出所有叢集（跨 namespace）：**
+**列出所有cluster（跨 namespace）：**
 
 ```bash
 clusterctl describe cluster --all-namespaces
@@ -294,7 +294,7 @@ clusterctl generate cluster my-cluster \
   --list-variables
 ```
 
-> 💡 **思考一下**：`clusterctl move` 在搬移叢集管理權時，為什麼需要「先 Pause 來源叢集、複製資源到目標叢集、再 Resume」這樣的三段式操作？如果省略 Pause 步驟直接複製資源，可能發生什麼問題？
+> 💡 **思考一下**：`clusterctl move` 在搬移cluster管理權時，為什麼需要「先 Pause 來源cluster、複製資源到目標cluster、再 Resume」這樣的三段式操作？如果省略 Pause 步驟直接複製資源，可能發生什麼問題？
 
 ---
 
@@ -302,8 +302,8 @@ clusterctl generate cluster my-cluster \
 
 <Callout type="warning" title="常見誤解澄清">
 1. **「clusterctl init 只需要執行一次」** — 不完全正確。每次新增 Provider 或升級 Provider 版本都需要再次執行（`clusterctl upgrade apply` 或重新 `clusterctl init`）。此外，在 air-gapped 環境中還需要額外設定 custom image repository。
-2. **「clusterctl generate cluster 會直接建立叢集」** — 錯誤。`clusterctl generate cluster` 只是**產生 YAML manifest**，並輸出到 stdout。你還需要把這份 YAML 透過 `kubectl apply` 套用到 management cluster，才會真正觸發叢集建立流程。
-3. **「clusterctl move 可以在任何時候執行」** — 不正確。`clusterctl move` 有前置條件：目標 management cluster 必須已安裝相同的 CAPI Provider，且版本相容。另外，如果叢集處於升級進行中狀態時搬移，可能造成 reconcile 狀態不一致。
+2. **「clusterctl generate cluster 會直接建立cluster」** — 錯誤。`clusterctl generate cluster` 只是**產生 YAML manifest**，並輸出到 stdout。你還需要把這份 YAML 透過 `kubectl apply` 套用到 management cluster，才會真正觸發cluster建立流程。
+3. **「clusterctl move 可以在任何時候執行」** — 不正確。`clusterctl move` 有前置條件：目標 management cluster 必須已安裝相同的 CAPI Provider，且版本相容。另外，如果cluster處於升級進行中狀態時搬移，可能造成 reconcile 狀態不一致。
 </Callout>
 
 ---
@@ -311,5 +311,5 @@ clusterctl generate cluster my-cluster \
 ## 延伸閱讀
 
 - [CAPI 架構概覽](/cluster-api/features/architecture) — CAPI Provider 的種類與設計
-- [ClusterClass 與 Topology](/cluster-api/features/clusterclass-topology) — 使用 `clusterctl generate cluster --topology` 產生 Topology 叢集
+- [ClusterClass 與 Topology](/cluster-api/features/clusterclass-topology) — 使用 `clusterctl generate cluster --topology` 產生 Topology cluster
 - [Controller Core 詳解](/cluster-api/features/controller-core) — management cluster 中各 Controller 的運作方式

@@ -17,11 +17,11 @@
     "options": [
       "定義 Control Plane 的 DNS FQDN 域名（如 k8s.example.com）",
       "設定 MAAS API endpoint 的網域",
-      "指定 worker 節點的 DNS 搜尋域",
+      "指定 worker node的 DNS 搜尋域",
       "設定 coreDNS 的上游伺服器"
     ],
     "answer": 0,
-    "explanation": "dnsDomain 用於組成 Control Plane 的 FQDN，格式為 &lt;cluster-name&gt;.&lt;dnsDomain&gt;。MAAS Provider 會在 MAAS 中為 CP 節點建立對應的 DNS A record。"
+    "explanation": "dnsDomain 用於組成 Control Plane 的 FQDN，格式為 &lt;cluster-name&gt;.&lt;dnsDomain&gt;。MAAS Provider 會在 MAAS 中為 CP node建立對應的 DNS A record。"
   },
   {
     "id": 3,
@@ -45,7 +45,7 @@
       "需要 MAAS 開啟 experimental 功能旗標"
     ],
     "answer": 0,
-    "explanation": "deployInMemory 模式讓 OS 在 RAM 中運行，需要 MAAS 版本 >= 3.5.10 以及目標機器至少 16GB RAM。此模式適合 CI/CD 或需要快速節點上線的場景。"
+    "explanation": "deployInMemory 模式讓 OS 在 RAM 中運行，需要 MAAS 版本 >= 3.5.10 以及目標機器至少 16GB RAM。此模式適合 CI/CD 或需要快速node上線的場景。"
   },
   {
     "id": 5,
@@ -65,7 +65,7 @@
     "options": [
       "在 Allocate 之前，檢查 Machine.Spec.Bootstrap.DataSecretName",
       "在 Deploy 之後，等待 cloud-init 完成",
-      "在設定 ProviderID 之前，等待 Node 加入叢集",
+      "在設定 ProviderID 之前，等待 Node 加入cluster",
       "在 DNS 登記之後，等待 CP endpoint 就緒"
     ],
     "answer": 0,
@@ -93,19 +93,19 @@
       "CommissionMachine，重新 commission 機器"
     ],
     "answer": 0,
-    "explanation": "刪除時呼叫 ReleaseMachine API，MAAS 會進行 disk erasing（DiskErasing 狀態）後將機器釋放回資源池（New 狀態），讓機器可被再次分配給其他叢集。"
+    "explanation": "刪除時呼叫 ReleaseMachine API，MAAS 會進行 disk erasing（DiskErasing 狀態）後將機器釋放回資源池（New 狀態），讓機器可被再次分配給其他cluster。"
   },
   {
     "id": 9,
-    "question": "Q9. 只有哪種類型的節點會在 MAAS DNS 中登記 A record？",
+    "question": "Q9. 只有哪種類型的node會在 MAAS DNS 中登記 A record？",
     "options": [
-      "Control Plane 節點",
-      "Worker 節點",
-      "所有節點",
-      "帶有特定 tag 的節點"
+      "Control Plane node",
+      "Worker node",
+      "所有node",
+      "帶有特定 tag 的node"
     ],
     "answer": 0,
-    "explanation": "MAAS Provider 只為 Control Plane 節點登記 DNS A record，FQDN 為 &lt;cluster-name&gt;.&lt;dnsDomain&gt;。Worker 節點不登記 DNS，因為它們不需要被外部直接存取。"
+    "explanation": "MAAS Provider 只為 Control Plane node登記 DNS A record，FQDN 為 &lt;cluster-name&gt;.&lt;dnsDomain&gt;。Worker node不登記 DNS，因為它們不需要被外部直接存取。"
   },
   {
     "id": 10,
@@ -126,10 +126,10 @@
       "確認所有相關的 MaasMachine 物件都已被刪除後",
       "立即移除，無需等待",
       "等待 DNS FQDN 被刪除後",
-      "等待 MAAS 叢集資源被清理後"
+      "等待 MAAS cluster資源被清理後"
     ],
     "answer": 0,
-    "explanation": "MaasClusterReconciler 在 reconcileDelete 時會等待所有相關的 MaasMachine 物件都已刪除（確認無任何 MaasMachine 的 OwnerRef 指向此 Cluster），才移除 finalizer。這確保機器資源在叢集資源之前被清理完畢。"
+    "explanation": "MaasClusterReconciler 在 reconcileDelete 時會等待所有相關的 MaasMachine 物件都已刪除（確認無任何 MaasMachine 的 OwnerRef 指向此 Cluster），才移除 finalizer。這確保機器資源在cluster資源之前被清理完畢。"
   },
   {
     "id": 12,
@@ -149,7 +149,7 @@
     "options": [
       "固定 Pod CIDR 為 192.168.0.0/16，無法透過 MaasCluster spec 自訂",
       "不支援 IPv6 雙棧網路",
-      "每個叢集最多只能有一個 failure domain",
+      "每個cluster最多只能有一個 failure domain",
       "不支援 NodePort 類型的 Service"
     ],
     "answer": 0,
