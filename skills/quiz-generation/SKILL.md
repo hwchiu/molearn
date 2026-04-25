@@ -1,13 +1,13 @@
 ---
 name: quiz-generation
-description: Use when generating interactive team quiz questions from existing project documentation. Produces VitePress-compatible QuizQuestion component blocks (zh-TW, 4-choice, with explanation). Supports automatic topic decomposition based on project complexity.
+description: Use when generating interactive team quiz questions from existing project documentation. Produces quiz.json format for the React QuizQuestion component (zh-TW, 4-choice, with explanation). Supports automatic topic decomposition based on project complexity. Model-agnostic — works with any AI tool.
 ---
 
 # Quiz Generation Skill
 
 ## 概述
 
-從現有的專案文件（`docs-site/{project}/`）產生互動式測驗題目，輸出為 VitePress `QuizQuestion` 元件格式，供工程師自我評測。
+從現有的專案文件（`next-site/content/{project}/features/`）產生互動式測驗題目，輸出為 `content/{project}/quiz.json` 格式，供工程師自我評測。
 
 **核心原則：**
 - 題目必須基於文件內容，**禁止杜撰**
@@ -15,20 +15,14 @@ description: Use when generating interactive team quiz questions from existing p
 - 每題必須有清楚的正確選項與錯誤誘答（distractors）
 - 中文繁體（zh-TW），術語保留英文原名
 - 題目難度要有層次：概念理解 → 細節掌握 → 情境應用
-- 若 quiz 頁或 index 頁需要示意圖，請沿用 repo 的靜態 SVG/PNG 圖表流程，不要新增 Mermaid
 
 ## 整體流程
 
 ```
-┌─────────────────────────────────────────────────────┐
-│ Phase A: 主題分析（自動分解，不使用固定模板）           │
-├─────────────────────────────────────────────────────┤
-│ Phase B: 平行出題（每個主題一個 agent）                 │
-├─────────────────────────────────────────────────────┤
-│ Phase C: 組裝與 VitePress 語法驗證                     │
-├─────────────────────────────────────────────────────┤
-│ Phase D: build 驗證 + commit                          │
-└─────────────────────────────────────────────────────┘
+Phase A: 主題分析（自動分解，不使用固定模板）
+Phase B: 平行出題（每個主題一輪 AI 對話）
+Phase C: 組裝為 quiz.json
+Phase D: 整合驗證（npm run build）
 ```
 
 ---
@@ -47,17 +41,16 @@ ls {project}/
 git submodule update --init {project}
 ```
 
-**記錄此路徑供 Phase B 的所有 agent 使用**，讓 agent 能在出題前驗證函數/類型名稱。
+**記錄此路徑，在 Phase B 出題時用於驗證函數/類型名稱。**
 
 ### 演算法：動態主題分解
 
-**不使用固定分類**，而是根據專案的重要度與特性自動決定測驗分區。
+**不使用固定分類**，根據專案的重要度與特性自動決定測驗分區。
 
 #### Step 1: 讀取文件結構
 
 ```bash
-ls docs-site/{project}/
-cat docs-site/{project}/index.md
+ls next-site/content/{project}/features/
 ```
 
 列出所有文件頁面，了解該專案文件的廣度。
@@ -68,8 +61,8 @@ cat docs-site/{project}/index.md
 
 | 信號 | 說明 | 計算方式 |
 |------|------|---------|
-| **頁面數量** | 文件頁面總數 | `ls docs-site/{project}/**/*.md \| wc -l` |
-| **內容深度** | 每頁平均行數 | `wc -l docs-site/{project}/**/*.md` |
+| **頁面數量** | 文件頁面總數 | `ls next-site/content/{project}/features/*.mdx \| wc -l` |
+| **內容深度** | 每頁平均行數 | `wc -l next-site/content/{project}/features/*.mdx` |
 | **CRD/API 覆蓋率** | 是否有 CRD/API 專屬頁面 | 頁面存在 → +2 |
 | **元件數量** | 核心元件個數 | 元件頁面數 |
 | **整合複雜度** | 外部整合頁面數 | 整合頁面數 |
@@ -80,9 +73,9 @@ cat docs-site/{project}/index.md
 
 | 文件頁面數 | 建議主題數 | 說明 |
 |-----------|-----------|------|
-| 1–4 頁    | 2–3 個    | 輕量專案（如 NMO）|
-| 5–9 頁    | 3–5 個    | 中型專案（如 CDI、Forklift）|
-| 10+ 頁   | 5–8 個    | 大型專案（如 KubeVirt）|
+| 1–4 頁    | 2–3 個    | 輕量專案 |
+| 5–9 頁    | 3–5 個    | 中型專案 |
+| 10+ 頁   | 5–8 個    | 大型專案 |
 
 #### Step 4: 命名主題分區
 
@@ -91,7 +84,7 @@ cat docs-site/{project}/index.md
 - 每個分區對應文件中的一個**邏輯群組**，而非逐頁對應
 - 確保分區間不重疊，各自有清晰的知識邊界
 
-**大型專案（KubeVirt 等）常見分區模式：**
+**大型專案常見分區模式：**
 ```
 🏗️ 基礎架構      ← 架構、設計原則、部署模型
 ⚙️ 核心元件      ← 各 daemon/controller 的職責
@@ -102,7 +95,7 @@ cat docs-site/{project}/index.md
 📖 實用指南      ← 操作流程、最佳實踐
 ```
 
-**中小型專案示例（NMO）：**
+**中小型專案示例：**
 ```
 ⚙️ 核心架構與元件
 🔄 操作流程與 CRD
@@ -115,33 +108,23 @@ cat docs-site/{project}/index.md
 - 標準：每個分區 **30 題**（完整評測）
 - 深度：每個分區 **40 題**（全面訓練）
 
-**每個分區的來源文件對應：**
-在 Phase B 中給每個 agent 明確指定要讀的文件頁面。
-
 ---
 
-## Phase B: 平行出題
+## Phase B: 出題
 
-### 啟動方式
+每個主題分區發送一輪獨立的 AI 對話，可以並行運行（每個分區一個對話視窗），也可以循序執行。
 
-每個主題分區啟動一個獨立的 `general-purpose` agent，平行執行：
+### 給每個分區的 Prompt 模板
 
-```
-Topic A → Agent 1 (30 questions)
-Topic B → Agent 2 (30 questions)  ← 同時執行
-Topic C → Agent 3 (30 questions)
-...
-```
-
-### 給每個 Agent 的 Prompt 模板
+**Send this prompt to your AI for each topic section:**
 
 ```
 你是一位專業的 Kubernetes 教育工作者，請為「{分區名稱}」主題出 {N} 道選擇題。
 
 ## 來源文件（必須閱讀）
 以下是你出題時必須參考的文件，請完整閱讀後再出題：
-- docs-site/{project}/{page1}.md
-- docs-site/{project}/{page2}.md
+- next-site/content/{project}/features/{page1}.mdx
+- next-site/content/{project}/features/{page2}.mdx
 {其他相關頁面}
 
 ## 原始碼路徑（函數/類型名稱驗證用）
@@ -173,250 +156,230 @@ Topic C → Agent 3 (30 questions)
 
 ## 輸出格式
 
-每道題按以下格式輸出，**不要加任何其他說明文字**：
+每道題按以下 JSON 格式輸出。**最終輸出必須是一個合法的 JSON 陣列，不要有任何其他文字。**
 
-```
-<QuizQuestion
-  question="{題號}. {題目}"
-  :options='[
-    "{選項A}",
-    "{選項B}",
-    "{選項C}",
-    "{選項D}",
-  ]'
-  :answer="{0-indexed 正確選項}"
-  explanation="{解釋}"
-/>
-```
-
-## 語法規則（違反會導致 build 失敗）
-- `:options='[...]'` 外層單引號、內層字串雙引號
-- options 內禁止 HTML entities（`&quot;`、`&apos;` 等），要表示雙引號用 `\\"` 
-- `explanation=` 內的雙引號用 `&quot;`
-- `:answer` 是 0-indexed（第一個選項為 0）
-- `/>` 必須獨立成一行
-```
-
----
-
-## Phase C: 組裝與驗證
-
-### C1: 建立 quiz.md 框架
-
-```markdown
----
-layout: doc
-title: {專案} — 互動式測驗
----
-
-# {專案} 知識測驗
-
-::: info 測驗說明
-共 {N} 題，涵蓋 {X} 個主題領域。點選選項後按「確認答案」查看結果。
-:::
-
-<script setup>
-import QuizQuestion from '../.vitepress/theme/components/QuizQuestion.vue'
-</script>
-
-## {分區1 emoji 標題}
-
-{分區1 的 30 題}
-
----
-
-## {分區2 emoji 標題}
-
-{分區2 的 30 題}
-
----
-
-{... 其他分區}
+```json
+[
+  {
+    "section": "{分區名稱（含 emoji）}",
+    "question": "1. {題目文字}",
+    "options": [
+      "{選項A}",
+      "{選項B}",
+      "{選項C}",
+      "{選項D}"
+    ],
+    "answer": 0,
+    "explanation": "{解釋為什麼此選項正確，其他選項為何錯誤}"
+  },
+  {
+    "section": "{分區名稱}",
+    "question": "2. {題目文字}",
+    ...
+  }
+]
 ```
 
-### C2: 組裝 Agent 輸出
+**JSON 規則：**
+- `answer` 是 0-indexed（第一個選項為 0，第四個為 3）
+- 所有字串值內的雙引號用 `\"` 跳脫
+- 不要在陣列最後一個元素後加逗號
+- 題號從 1 開始，每個分區獨立計算
+```
 
-用 Python 腳本組裝各 agent 的輸出（避免手動複製錯誤）：
+---
+
+## Phase C: 組裝為 quiz.json
+
+### C1: 合併各分區的 JSON 輸出
+
+每個分區的 AI 輸出一個 JSON 陣列。將所有陣列合併為一個：
 
 ```python
+import json
+import re
+
+# 各分區的 AI 輸出（貼到各個字串變數）
 sections = [
-    ("## 🏗️ 基礎架構", "/tmp/quiz_arch.txt"),
-    ("## ⚙️ 核心元件", "/tmp/quiz_comp.txt"),
-    # ...
+    """[  # 貼入分區1的 JSON 輸出
+      {...},
+      {...}
+    ]""",
+    """[  # 貼入分區2的 JSON 輸出
+      {...},
+      {...}
+    ]""",
+    # ... 其他分區
 ]
 
-with open('docs-site/{project}/quiz.md', 'w') as out:
-    out.write(header)
-    for title, path in sections:
-        out.write(f'\n{title}\n\n')
-        content = open(path).read()
-        # 清除可能的 agent completion 訊息（污染來源）
-        content = re.sub(r'^Agent completed.*$', '', content, flags=re.MULTILINE)
-        content = re.sub(r'^Now I have.*$', '', content, flags=re.MULTILINE)
-        out.write(content.strip())
-        out.write('\n\n---\n')
+all_questions = []
+for section_json in sections:
+    # 清除可能的 AI metadata 殘留（如 "Here are the questions:" 等說明文字）
+    # 找到 JSON 陣列的起始位置
+    start = section_json.find('[')
+    end = section_json.rfind(']') + 1
+    if start == -1 or end == 0:
+        print("WARNING: Could not find JSON array in section output")
+        continue
+    clean_json = section_json[start:end]
+    questions = json.loads(clean_json)
+    all_questions.extend(questions)
+
+# 寫入 quiz.json
+output_path = 'next-site/content/{project}/quiz.json'
+with open(output_path, 'w', encoding='utf-8') as f:
+    json.dump(all_questions, f, ensure_ascii=False, indent=2)
+
+print(f"Written {len(all_questions)} questions to {output_path}")
 ```
 
-**重要：** Agent 輸出可能包含「Agent completed」等 metadata 行，**必須過濾掉**，否則 VitePress build 會失敗。
-
-### C3: 語法驗證
-
-在執行 build 之前，先用 Node.js 驗證所有 `:options` 表達式：
+### C2: 驗證 JSON 格式
 
 ```python
-import subprocess, re
+import json
 
-content = open('docs-site/{project}/quiz.md').read()
-lines = content.split('\n')
+with open('next-site/content/{project}/quiz.json', 'r') as f:
+    questions = json.load(f)
 
-in_options = False
-opt_lines = []
-opt_start = 0
 issues = []
-
-for i, line in enumerate(lines, 1):
-    if ":options='" in line:
-        in_options = True
-        opt_start = i
-        opt_lines = [line[line.index(":options='") + len(":options='"):]]
-    elif in_options:
-        opt_lines.append(line)
-        if line.strip().endswith("]'"):
-            opts_str = '\n'.join(opt_lines).rstrip("'")
-            r = subprocess.run(['node', '-e', f'var x = {opts_str}'],
-                               capture_output=True, text=True)
-            if r.returncode != 0:
-                issues.append((opt_start, opts_str[:80], r.stderr[:100]))
-            in_options = False
+for i, q in enumerate(questions):
+    if 'section' not in q:
+        issues.append(f"Question {i}: missing 'section'")
+    if 'question' not in q:
+        issues.append(f"Question {i}: missing 'question'")
+    if 'options' not in q or len(q['options']) != 4:
+        issues.append(f"Question {i}: 'options' must have exactly 4 items")
+    if 'answer' not in q or not isinstance(q['answer'], int) or not (0 <= q['answer'] <= 3):
+        issues.append(f"Question {i}: 'answer' must be integer 0-3")
+    if 'explanation' not in q:
+        issues.append(f"Question {i}: missing 'explanation'")
 
 if issues:
-    for start, preview, err in issues:
-        print(f"Line {start}: {err}")
+    for issue in issues:
+        print(f"ERROR: {issue}")
 else:
-    print("All :options valid ✓")
+    print(f"✓ All {len(questions)} questions valid")
+    # Count by section
+    from collections import Counter
+    sections = Counter(q['section'] for q in questions)
+    for section, count in sections.items():
+        print(f"  {section}: {count} questions")
 ```
-
-**常見問題與修法：**
-
-| 問題 | 症狀 | 修法 |
-|------|------|------|
-| `&quot;` 在 options 內 | `Unexpected token` | 改為 `\\"` |
-| `&apos;` 在 options 內 | `Unexpected token` | 改為 `\\'` |
-| Agent metadata 殘留 | 解析失敗或題目缺失 | 用 regex 過濾 |
-| ` ``` ` code fence 包住 section | 整段被當成 code block | 移除多餘的 ``` |
-| `{{ }}` 在文字中 | Vue template 錯誤 | 改為 `&#123;&#123;` |
 
 ---
 
-## Phase D: Build 驗證
+## Phase D: 整合驗證
+
+### D1: 驗證 quiz page 能讀取資料
 
 ```bash
-npm run build
+cd next-site && npm run dev
+# Open http://localhost:3000/{project}/quiz
+# Verify: all sections show up
+# Verify: clicking an option shows explanation
+# Verify: correct answer is highlighted green, wrong answer red
 ```
 
-### 如果 build 失敗
-
-**策略：binary search by section**
-
-```python
-import subprocess, shutil
-
-content = open('docs-site/{project}/quiz.md').read()
-lines = content.split('\n')
-quiz_path = 'docs-site/{project}/quiz.md'
-
-# 找到各 section 分隔符位置（--- 行）
-section_ends = [i for i, l in enumerate(lines) if l.strip() == '---' and i > 10]
-
-for end in section_ends:
-    test = '\n'.join(lines[:end])
-    open(quiz_path, 'w').write(test)
-    r = subprocess.run(['npm', 'run', 'build'], capture_output=True, text=True)
-    ok = 'build error' not in r.stdout + r.stderr
-    print(f"Up to line {end}: {'OK' if ok else 'FAIL'}")
-    if not ok:
-        break
-
-shutil.copy('/tmp/quiz_original.md', quiz_path)
-```
-
-找到失敗的 section 後，在該 section 內再 binary search 到具體問題題號。
-
-**VitePress 錯誤位置解讀：**
-- `quiz.md (1520:13): Error parsing JavaScript expression: Unexpected token (3:30)`
-  - `1520:13`：quiz.md 的第 1520 行
-  - `(3:30)`：`:options` 值的第 3 行、第 30 個字元
-  - 去看對應行的第 3 個 option，第 30 個字元附近
-
----
-
-## Sidebar 更新
-
-在 `docs-site/.vitepress/config.js` 的對應 sidebar array 加入 quiz 連結：
-
-```javascript
-{
-  text: '📝 測驗',
-  items: [
-    { text: '互動式知識測驗', link: '/{project}/quiz' },
-  ]
-}
-```
-
----
-
-## 快速參考：QuizQuestion 格式
-
-```vue
-<QuizQuestion
-  question="1. 題目文字（數字加點）"
-  :options='[
-    "選項 A",
-    "選項 B（正確）",
-    "選項 C",
-    "選項 D",
-  ]'
-  :answer="1"
-  explanation="解釋為什麼 B 正確，以及其他選項為何錯誤。術語保留英文。"
-/>
-```
-
-**必須遵守：**
-- 外層 `'` 單引號，內層字串 `"` 雙引號
-- options 內表示 `"` → 用 `\\"` 
-- question/explanation 內表示 `"` → 用 `&quot;`
-- `:answer` 是 0-indexed
-- `/>` 獨立成一行，不與任何其他字元同行
-- 每個 section 以 `---` 分隔
-- 題號從 1 開始重新計算（每個分區獨立）
-
----
-
-## 完整範例：產生 KubeVirt 測驗流程
+### D2: Build 驗證
 
 ```bash
-# 1. 讀取文件結構
-ls docs-site/kubevirt/
+cd next-site && npm run build
+```
 
-# 2. 執行 Phase A: 主題分析
-# → 判斷為大型專案（12+ 頁面）
-# → 建立 7 個主題分區，每區 30 題
+Build 失敗通常不是 quiz.json 的問題（JSON 格式錯誤會在 D1 發現），而是其他頁面的問題。
 
-# 3. Phase B: 平行啟動 7 個 agent
-# → 各自讀取對應文件頁面，輸出到 /tmp/quiz_*.txt
+### D3: Commit
 
-# 4. Phase C: 組裝
-python3 assemble_quiz.py
-python3 validate_options.py
-
-# 5. Phase D: Build
-npm run build
-
-# 6. 如果失敗，binary search 定位問題，修復後重試
-
-# 7. Commit
-git add docs-site/kubevirt/quiz.md
-git commit -m "feat(kubevirt): add 210-question interactive quiz (7 sections × 30 questions)
+```bash
+git add next-site/content/{project}/quiz.json
+git commit -m "feat({project}): add {N}-question interactive quiz ({M} sections × ~{K} questions)
 
 Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>"
 ```
+
+---
+
+## quiz.json 格式完整規範
+
+```json
+[
+  {
+    "section": "🏗️ 核心架構",
+    "question": "1. ClusterController 在協調 Cluster CR 時，建立 Infrastructure 物件的目的是什麼？",
+    "options": [
+      "在雲端或實體環境建立對應的基礎設施（VPC、機器等）",
+      "產生 kubeconfig 讓工作節點加入叢集",
+      "設定 Kubernetes API Server 的 TLS 憑證",
+      "啟動 etcd 叢集並等待其就緒"
+    ],
+    "answer": 0,
+    "explanation": "Infrastructure 物件（如 AWSCluster、MaasCluster）由對應的 Infrastructure Provider 實作，負責在底層環境建立實際的計算資源。kubeconfig 是由 ControlPlane 物件負責產生，TLS 和 etcd 管理也由 ControlPlane Provider 負責。"
+  },
+  {
+    "section": "🏗️ 核心架構",
+    "question": "2. ...",
+    "options": ["...", "...", "...", "..."],
+    "answer": 1,
+    "explanation": "..."
+  }
+]
+```
+
+**必須遵守：**
+- `answer` 是 0-indexed（0 = 選項A, 1 = 選項B, 2 = 選項C, 3 = 選項D）
+- `section` 每個分區內的所有題目使用完全相同的字串（含 emoji）
+- `question` 包含題號（從 1 開始，每個 section 重新計數）
+- `explanation` 說明為何此選項正確，且指出其他選項錯誤的原因
+- 所有字串值使用合法的 JSON 跳脫（雙引號用 `\"`）
+
+---
+
+## 完整範例：產生 Cluster API 測驗流程
+
+```bash
+# 1. 讀取文件結構
+ls next-site/content/cluster-api/features/
+# → architecture.mdx, machine-lifecycle.mdx, controllers.mdx, bootstrap.mdx
+
+# 2. Phase A: 主題分析
+# 4 頁 → 建立 3 個主題分區，每區 20 題（小型專案）
+# 分區：🏗️ 核心架構, ⚙️ 機器生命週期, 🔧 控制器與 Bootstrap
+
+# 3. Phase B: 出題（3 個 AI 對話，可並行）
+# 對話1 → 🏗️ 核心架構（讀 architecture.mdx）→ 輸出 JSON
+# 對話2 → ⚙️ 機器生命週期（讀 machine-lifecycle.mdx）→ 輸出 JSON
+# 對話3 → 🔧 控制器與 Bootstrap（讀 controllers.mdx + bootstrap.mdx）→ 輸出 JSON
+
+# 4. Phase C: 組裝
+python3 assemble_quiz.py
+python3 validate_quiz.py
+
+# 5. Phase D: 驗證
+cd next-site && npm run dev
+# 確認 http://localhost:3000/cluster-api/quiz 正常顯示
+npm run build
+
+# 6. Commit
+git add next-site/content/cluster-api/quiz.json
+git commit -m "feat(cluster-api): add 60-question interactive quiz (3 sections × 20 questions)
+
+Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>"
+```
+
+---
+
+## QuizQuestion React 元件使用方式（參考）
+
+The `QuizQuestion` component is defined in `next-site/components/QuizQuestion.tsx` and is used in the quiz page route at `app/[project]/quiz/page.tsx`. It reads from quiz.json and does NOT need to be used directly in MDX files.
+
+Props interface:
+```typescript
+interface Props {
+  question: string     // Full question text including number prefix
+  options: string[]    // Exactly 4 options
+  answer: number       // 0-indexed correct answer index
+  explanation: string  // Shown after user selects an answer
+}
+```
+
+The quiz page groups questions by their `section` field and renders each group under a heading. See `skills/site-bootstrap/SKILL.md` for the full route source code.

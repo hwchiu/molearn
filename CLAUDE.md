@@ -2,10 +2,17 @@
 
 ## 什麼是這個專案
 
-這是一個 **多專案 Kubernetes 技術文件網站**，使用 VitePress 建置，內容以繁體中文（zh-TW）撰寫，專注於從原始碼深度分析各種 Kubernetes 周邊專案，並附帶互動式測驗讓工程師自我評測。
+這是一個 **多專案 Kubernetes 技術文件網站**，使用 **Next.js 14 App Router + MDX** 建置，內容以繁體中文（zh-TW）撰寫，專注於從原始碼深度分析各種 Kubernetes 周邊專案，並附帶互動式測驗讓工程師自我評測。
 
 **目前涵蓋專案：**
-KubeVirt、CDI（Containerized Data Importer）、Forklift、Node Maintenance Operator、Multus CNI、NetBox、Monitoring（Prometheus/Alertmanager）
+Cluster API（CAPI）、Cluster API Provider MAAS（CAPM）、Cluster API Provider Metal3（CAPM3）
+
+**設計哲學：**
+- GitHub 深色主題，工程師直接上手不需適應
+- 靜態輸出（`output: 'export'`），部署到 GitHub Pages 零設定
+- 框架程式碼與文件內容完全分離
+
+---
 
 ## 技能模組（Skills）
 
@@ -13,94 +20,89 @@ KubeVirt、CDI（Containerized Data Importer）、Forklift、Node Maintenance Op
 
 | Skill | 用途 |
 |-------|------|
-| `skills/analyzing-source-code/` | 加入新專案的完整分析流程（含 Structure Planner）|
+| `skills/site-bootstrap/` | **從零建立完整網站框架**（含所有元件程式碼、設計系統）|
+| `skills/analyzing-source-code/` | 加入新專案的完整分析流程（model-agnostic）|
 | `skills/quiz-generation/` | 從現有文件產生互動式測驗題目 |
 | `skills/fireworks-tech-graph/` | 產生文件用靜態 SVG/PNG 技術圖表 |
 
 **遇到任何任務，先閱讀對應 skill 的 `SKILL.md`，再開始執行。**
 
+另見 `BOOTSTRAP.md`（根目錄）：給 AI 看的快速上手說明，明確告知「只需要動哪些檔案」。
+
+---
+
 ## 關鍵技術慣例
 
-### VitePress 建置
+### 建置指令
 ```bash
-npm run build        # 建置（= vitepress build docs-site）
-npm run dev          # 開發伺服器
+cd next-site
+npm run dev          # 開發伺服器（localhost:3000）
+npm run build        # 靜態輸出到 next-site/out/
 ```
-- 建置失敗時先檢查 dead link 和 Vue template 語法錯誤
-- 所有 `.md` 中的 `{{ }}` 必須寫成 `&#123;&#123;` / `&#125;&#125;`（VitePress 會把 `{{ }}` 當成 Vue template）
+- 建置失敗先查 TypeScript 型別錯誤，其次查 MDX frontmatter 格式
+- 路由型式：`/[project]/features/[slug]`，slug 由 content 目錄檔名決定
+
+### 目錄結構
+
+```
+molearn/
+├── CLAUDE.md                  ← 你在這裡
+├── BOOTSTRAP.md               ← AI 快速上手（只需碰這 2 個地方）
+├── next-site/
+│   ├── app/                   ← Next.js App Router（框架，勿動）
+│   ├── components/            ← React 元件（框架，勿動）
+│   ├── lib/
+│   │   └── projects.ts        ← ★ 新增專案改這裡
+│   ├── content/
+│   │   └── {project}/
+│   │       ├── features/      ← ★ 文件 .mdx 放這裡
+│   │       └── quiz.json      ← ★ 測驗題目放這裡
+│   └── public/diagrams/       ← 靜態圖表（PNG/SVG）
+├── {project}/                 ← git submodule（原始碼）
+├── scripts/
+│   └── diagram-generators/    ← 圖表 generator（Python）
+├── skills/                    ← AI workflow skills
+└── versions.json              ← 各專案已分析的 commit 版本
+```
 
 ### 文件格式規範
-每個 `.md` 頁面：
+
+每個 `.mdx` 頁面 frontmatter：
 ```yaml
 ---
-layout: doc
 title: {專案} — {主題}
+description: 一句話說明這頁的核心概念
 ---
 ```
-- 使用 `::: info 相關章節` 區塊放置跨頁連結
-- 所有文件內容使用**繁體中文**
-- **不要新增 Mermaid**
-- 所有圖表預設改用 `skills/fireworks-tech-graph/` 產生 **靜態 SVG/PNG**
-- 圖檔放在 `docs-site/public/diagrams/{project}/`
-- 文件內以 `![圖說](/diagrams/{project}/{name}.png)` 引用
-- 若需要產圖腳本，統一放在 `scripts/diagram-generators/`，不要再放 repo root
 
-### Vue 元件 — QuizQuestion
-```vue
-<QuizQuestion
-  question="1. 題目文字"
-  :options='[
-    "選項 A",
-    "選項 B",
-    "選項 C",
-    "選項 D",
-  ]'
-  :answer="0"
-  explanation="解釋文字..."
-/>
+- 所有文件內容使用**繁體中文**，術語保留英文原名
+- **不要使用 Mermaid**，改用 `skills/fireworks-tech-graph/` 產生靜態 PNG
+- 圖檔放在 `next-site/public/diagrams/{project}/`，文件內以 `![說明](/diagrams/{project}/name.png)` 引用
+- 圖表 generator 腳本放在 `scripts/diagram-generators/`
+
+### QuizQuestion 元件
+
+測驗題目以 JSON 格式存放，**不是**直接寫在 MDX 裡：
+
+```json
+// content/{project}/quiz.json
+[
+  {
+    "question": "1. 題目文字",
+    "options": ["選項 A", "選項 B", "選項 C", "選項 D"],
+    "answer": 0,
+    "explanation": "解釋文字..."
+  }
+]
 ```
 
-**嚴格限制（違反會導致 build 失敗）：**
-- `:options='[...]'` 外層用單引號、內層字串用雙引號
-- `:options` 內**禁止** HTML entities（`&quot;`、`&apos;` 等）— 內層要表示雙引號用 `\\"` 
-- `question=` 和 `explanation=` 內的雙引號用 `&quot;`
-- `:answer` 是 **0-indexed**（第一個選項為 0）
-- `/>` 必須獨立成一行
+quiz 頁面（`content/{project}/quiz.mdx`）從 JSON 讀取並渲染 `<QuizQuestion>` 元件。
 
-### Sidebar 設定
-新增頁面後，必須更新 `docs-site/.vitepress/config.js` 的對應 sidebar array。
+### 新增專案 Sidebar
 
-### Vue 元件匯入（quiz 頁面 header）
-```vue
-<script setup>
-import QuizQuestion from '../.vitepress/theme/components/QuizQuestion.vue'
-</script>
-```
+在 `lib/projects.ts` 的 `PROJECTS` 陣列新增專案設定後，sidebar 會自動從 `content/{project}/features/` 目錄生成，**不需手動設定** sidebar 項目。
 
-## 目錄結構
-
-```
-kubevirt-learning-site/
-├── CLAUDE.md              ← 你在這裡
-├── docs-site/
-│   ├── .vitepress/
-│   │   ├── config.js      ← Sidebar + VitePress 設定
-│   │   └── theme/
-│   │       └── components/
-│   │           └── QuizQuestion.vue
-│   ├── {project}/
-│   │   ├── index.md       ← 專案首頁 + 文件導覽表
-│   │   ├── quiz.md        ← 互動式測驗（QuizQuestion 元件）
-│   │   └── {topic}/       ← 各主題子目錄
-│   │       └── *.md
-│   └── index.md           ← 網站首頁
-├── {project}/             ← git submodule（原始碼）
-├── scripts/               ← 版本追蹤、差異分析、圖表產生腳本
-│   └── diagram-generators/← 靜態圖表 generator（Python）
-├── skills/                ← Claude Code workflow skills
-├── versions.json          ← 各專案已分析的 commit 版本記錄
-└── Makefile               ← 常用指令（submodule 更新、版本比對等）
-```
+---
 
 ## 常用操作
 
@@ -111,19 +113,21 @@ kubevirt-learning-site/
 → 使用 `skills/quiz-generation/SKILL.md` 的流程
 
 ### 重繪或新增圖表
-→ 使用 `skills/fireworks-tech-graph/SKILL.md`，輸出靜態 SVG/PNG，不使用 Mermaid
+→ 使用 `skills/fireworks-tech-graph/SKILL.md`，輸出靜態 PNG，不使用 Mermaid
 
 ### 更新現有專案文件
 ```bash
-make check-updates           # 查看哪些專案有新版本
-make check-update-project PROJECT=kubevirt  # 單一專案差異分析
+make check-updates                          # 查看哪些專案有新版本
+make check-update-project PROJECT=cluster-api  # 單一專案差異分析
 ```
 
 ### 建置驗證
 ```bash
-npm run build
-# 如果失敗，看錯誤行號，去 quiz.md 或相關 .md 找語法問題
+cd next-site && npm run build
+# 失敗時先看 TypeScript 型別錯誤，再查 MDX frontmatter
 ```
+
+---
 
 ## Git 提交規範
 
