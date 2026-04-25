@@ -2,6 +2,7 @@ import Link from 'next/link'
 import { getProject, PROJECT_IDS } from '@/lib/projects'
 import { notFound } from 'next/navigation'
 import { ExternalLink, Map, BookOpen, HelpCircle, Lightbulb, ArrowRight } from 'lucide-react'
+import { ProjectStory } from '@/components/ProjectStory'
 
 export function generateStaticParams() {
   return PROJECT_IDS.map(id => ({ project: id }))
@@ -77,6 +78,9 @@ export default function ProjectPage({ params }: { params: { project: string } })
         </h2>
         <p className="text-sm text-[#8b949e] leading-relaxed">{project.problemStatement}</p>
       </div>
+
+      {/* Story */}
+      <ProjectStory story={project.story} />
 
       {/* Navigation Cards */}
       <div className="grid grid-cols-1 md:grid-cols-3 gap-4 mb-8">

@@ -31,7 +31,7 @@ export function TableOfContents({ headings }: { headings: Heading[] }) {
   if (headings.length === 0) return null
 
   return (
-    <aside className="hidden xl:block w-48 flex-shrink-0">
+    <aside className="hidden xl:block w-64 flex-shrink-0">
       <div className="sticky top-[3.5rem] max-h-[calc(100vh-3.5rem)] overflow-y-auto py-6 px-3">
         <p className="text-xs font-semibold uppercase tracking-wider text-[#8b949e] mb-3 px-2">
           本頁目錄

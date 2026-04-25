@@ -38,42 +38,44 @@ export default async function FeaturePage({ params }: { params: { project: strin
 
   return (
     <div className="flex min-w-0">
-      {/* Main content */}
-      <article className="flex-1 min-w-0 px-8 py-10 max-w-[860px]">
-        {data.title && (
-          <div className="mb-8">
-            {data.category && (
-              <span className="text-xs font-semibold uppercase tracking-wider text-[#2f81f7] mb-2 block">
-                {data.category}
-              </span>
-            )}
-            <h1 className="text-3xl font-bold text-white mb-3">{data.title}</h1>
-            {data.description && (
-              <p className="text-lg text-[#8b949e]">{data.description}</p>
-            )}
+      {/* Main content — flex-1 fills all available space; max-w applied to inner content so ToC is flush right */}
+      <article className="flex-1 min-w-0 px-8 py-10">
+        <div>
+          {data.title && (
+            <div className="mb-8">
+              {data.category && (
+                <span className="text-xs font-semibold uppercase tracking-wider text-[#2f81f7] mb-2 block">
+                  {data.category}
+                </span>
+              )}
+              <h1 className="text-3xl font-bold text-white mb-3">{data.title}</h1>
+              {data.description && (
+                <p className="text-lg text-[#8b949e]">{data.description}</p>
+              )}
+            </div>
+          )}
+          <div className="prose-content">
+            <MDXRemote
+              source={content}
+              components={MDX_COMPONENTS as any}
+              options={{ mdxOptions: { remarkPlugins: [remarkGfm], rehypePlugins: [rehypeSlug] } }}
+            />
           </div>
-        )}
-        <div className="prose-content">
-          <MDXRemote
-            source={content}
-            components={MDX_COMPONENTS as any}
-            options={{ mdxOptions: { remarkPlugins: [remarkGfm], rehypePlugins: [rehypeSlug] } }}
-          />
-        </div>
 
-        <div className="mt-12 pt-6 border-t border-[#30363d] flex items-center justify-between">
-          {prevSlug ? (
-            <Link href={`/${project.id}/features/${prevSlug}`}
-              className="flex items-center gap-2 text-sm text-[#8b949e] hover:text-white transition-colors">
-              <ChevronLeft size={16} /> 上一篇
-            </Link>
-          ) : <div />}
-          {nextSlug ? (
-            <Link href={`/${project.id}/features/${nextSlug}`}
-              className="flex items-center gap-2 text-sm text-[#8b949e] hover:text-white transition-colors">
-              下一篇 <ChevronRight size={16} />
-            </Link>
-          ) : <div />}
+          <div className="mt-12 pt-6 border-t border-[#30363d] flex items-center justify-between">
+            {prevSlug ? (
+              <Link href={`/${project.id}/features/${prevSlug}`}
+                className="flex items-center gap-2 text-sm text-[#8b949e] hover:text-white transition-colors">
+                <ChevronLeft size={16} /> 上一篇
+              </Link>
+            ) : <div />}
+            {nextSlug ? (
+              <Link href={`/${project.id}/features/${nextSlug}`}
+                className="flex items-center gap-2 text-sm text-[#8b949e] hover:text-white transition-colors">
+                下一篇 <ChevronRight size={16} />
+              </Link>
+            ) : <div />}
+          </div>
         </div>
       </article>
 

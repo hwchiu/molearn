@@ -10,10 +10,10 @@ title: Cluster API — Cluster 與 Machine 核心資源
 
 <Callout type="info" title="相關章節">
 
-- [架構設計](/cluster-api/architecture) — Provider 模型與整體架構
-- [MachineSet 與 MachineDeployment](/cluster-api/api-machineset-machinedeployment) — Worker 節點管理
-- [KubeadmControlPlane](/cluster-api/api-kubeadm-controlplane) — Control Plane 管理
-- [Machine 生命週期](/cluster-api/machine-lifecycle) — Machine 完整生命週期與刪除流程
+- [架構設計](/cluster-api/features/architecture) — Provider 模型與整體架構
+- [MachineSet 與 MachineDeployment](/cluster-api/features/api-machineset-machinedeployment) — Worker 節點管理
+- [KubeadmControlPlane](/cluster-api/features/api-kubeadm-controlplane) — Control Plane 管理
+- [Machine 生命週期](/cluster-api/features/machine-lifecycle) — Machine 完整生命週期與刪除流程
 
 </Callout>
 
@@ -211,7 +211,7 @@ Machine 刪除涉及多個步驟，以確保節點安全退出叢集：
 
 <Callout type="info" title="詳細刪除流程">
 
-完整的 Machine 刪除流程（包含 hook 機制、PDB 處理、逾時邏輯）請參閱：[Machine 生命週期](/cluster-api/machine-lifecycle)
+完整的 Machine 刪除流程（包含 hook 機制、PDB 處理、逾時邏輯）請參閱：[Machine 生命週期](/cluster-api/features/machine-lifecycle)
 
 </Callout>
 

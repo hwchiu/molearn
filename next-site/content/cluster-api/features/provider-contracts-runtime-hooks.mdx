@@ -8,15 +8,15 @@ title: Cluster API — Provider 合約與 Runtime Hooks
 
 <Callout type="info" title="相關章節">
 
-- [架構概覽](/cluster-api/architecture)
-- [Core Controller](/cluster-api/controller-core)
-- [ClusterClass 與 Topology](/cluster-api/clusterclass-topology)
+- [架構概覽](/cluster-api/features/architecture)
+- [Core Controller](/cluster-api/features/controller-core)
+- [ClusterClass 與 Topology](/cluster-api/features/clusterclass-topology)
 
 </Callout>
 
 <Callout type="tip" title="本文適用對象">
 
-- 🟢 **初學者**：先閱讀 [架構概覽](/cluster-api/architecture) 了解 Provider 的概念，再來理解 Provider 合約如何讓不同 Provider 彼此可替換
+- 🟢 **初學者**：先閱讀 [架構概覽](/cluster-api/features/architecture) 了解 Provider 的概念，再來理解 Provider 合約如何讓不同 Provider 彼此可替換
 - 🟡 **中階工程師**：重點了解 InfrastructureCluster、InfrastructureMachine 和 Bootstrap 的合約欄位
 - 🔴 **資深工程師**：深入 Runtime Extension hooks 的 webhook 設計與生命週期整合點
 
@@ -285,6 +285,6 @@ CAPI 透過 admission webhook 強制執行部分欄位的不可變性，防止�
 
 ## 延伸閱讀
 
-- [架構概覽](/cluster-api/architecture) — Provider 模型在 CAPI 架構中的設計理念
-- [Core Controller](/cluster-api/controller-core) — CAPI core 如何讀取 Provider 回報的合約欄位
-- [Machine 生命週期](/cluster-api/machine-lifecycle) — Provider 合約如何推動 Machine 在各 Phase 之間轉換
+- [架構概覽](/cluster-api/features/architecture) — Provider 模型在 CAPI 架構中的設計理念
+- [Core Controller](/cluster-api/features/controller-core) — CAPI core 如何讀取 Provider 回報的合約欄位
+- [Machine 生命週期](/cluster-api/features/machine-lifecycle) — Provider 合約如何推動 Machine 在各 Phase 之間轉換

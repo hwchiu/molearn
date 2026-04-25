@@ -4,12 +4,13 @@ export interface Heading {
   level: number
 }
 
-// Mimics github-slugger behavior (same as rehype-slug)
+// Mimics github-slugger behavior (same as rehype-slug) — Unicode-aware to handle CJK
 function slugify(text: string): string {
   return text
     .toLowerCase()
     .trim()
-    .replace(/[^\w\s-]/g, '')
+    // Keep Unicode letters (including CJK), numbers, spaces, hyphens — remove everything else
+    .replace(/[^\p{L}\p{N}\s-]/gu, '')
     .replace(/[\s_]+/g, '-')
     .replace(/-+/g, '-')
     .replace(/^-+|-+$/g, '')

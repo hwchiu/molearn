@@ -8,9 +8,9 @@ title: Metal3 Provider — IPAM 整合
 
 <Callout type="info" title="相關章節">
 
-- [Data Templates 與 IPAM](/cluster-api-provider-metal3/data-templates) — Metal3DataTemplate 模板系統詳解
-- [機器層級 CRD](/cluster-api-provider-metal3/crds-machine) — Metal3Machine、Metal3MachineTemplate 結構
-- [叢集層級 CRD](/cluster-api-provider-metal3/crds-cluster) — Metal3Cluster 與叢集資源
+- [Data Templates 與 IPAM](/cluster-api-provider-metal3/features/data-templates) — Metal3DataTemplate 模板系統詳解
+- [機器層級 CRD](/cluster-api-provider-metal3/features/crds-machine) — Metal3Machine、Metal3MachineTemplate 結構
+- [叢集層級 CRD](/cluster-api-provider-metal3/features/crds-cluster) — Metal3Cluster 與叢集資源
 
 </Callout>
 
@@ -281,7 +281,7 @@ Metal3DataReconciler 讀取此 `IPAddress` 物件，將 `address`、`prefix`、`
 
 ## 延伸閱讀
 
-- [Data Templates 與 IPAM](./data-templates.md) — Metal3DataTemplate 中的 IPPool 引用方式
-- [Node Reuse](./node-reuse.md) — 搭配 preAllocations 確保 IP 不變
-- [機器層級 CRD](./crds-machine.md) — Metal3Machine 中的 dataTemplate 設定
+- [Data Templates 與 IPAM](/cluster-api-provider-metal3/features/data-templates) — Metal3DataTemplate 中的 IPPool 引用方式
+- [Node Reuse](/cluster-api-provider-metal3/features/node-reuse) — 搭配 preAllocations 確保 IP 不變
+- [機器層級 CRD](/cluster-api-provider-metal3/features/crds-machine) — Metal3Machine 中的 dataTemplate 設定
 - [metal3-io/ip-address-manager](https://github.com/metal3-io/ip-address-manager) — Metal3 IPAM 工具原始碼

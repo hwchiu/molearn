@@ -5,245 +5,60 @@ title: MAAS Provider — 架構設計
 
 # MAAS Provider — 架構設計
 
-本頁說明 Cluster API Provider MAAS（CAPM）的元件組成、控制器設計、CRD 定義與啟動配置，並深入解析原始碼中的 Scope 模式、Watch 設定、Condition 機制與錯誤處理策略。
-
+本頁提供 Cluster API Provider MAAS（CAPM）的高層架構概覽，說明核心元件職責、標準流程與重要注意事項。
 
 <Callout type="info" title="相關章節">
 
-- [Machine 生命週期](/cluster-api-provider-maas/machine-lifecycle)
-- [Controllers 深度解析](/cluster-api-provider-maas/controllers)
-- [API 型別定義](/cluster-api-provider-maas/api-types)
+- [Machine 生命週期](/cluster-api-provider-maas/features/machine-lifecycle)
+- [Controllers 深度解析](/cluster-api-provider-maas/features/controllers)
+- [API 型別定義](/cluster-api-provider-maas/features/api-types)
 - [測驗](/cluster-api-provider-maas/quiz)
 
 </Callout>
-
 
 ## 🌐 整體觀念：MAAS Provider 解決什麼問題？
 
 ![MAAS 互動架構](/diagrams/maas/interaction-architecture.png)
 
-MAAS Provider 以標準 CAPI Infrastructure Provider 模式運作。MAAS（Metal as a Service）是 Canonical 開發的裸機雲端管理平台，能夠像管理雲端虛擬機一樣管理實體伺服器。CAPM（Cluster API Provider MAAS）的職責是當 CAPI 說「給我一台機器」時，透過 MAAS API 自動分配、部署 OS、設定網路，最終回傳一台可以加入 Kubernetes 叢集的實體節點。
-
-核心元件：
-
-- **CAPI core**（Cluster API manager）：在 management cluster 中運行，負責協調 Cluster、Machine 等 CAPI 物件
-- **MaasClusterReconciler**：叢集層級控制器，管理 DNS 與 controlPlaneEndpoint
-- **MaasMachineReconciler**：機器層級控制器，負責 MAAS 機器的完整生命週期
-- **spectrocloud/maas-client-go SDK**：封裝 MAAS REST API，Provider 透過此 SDK 與 MAAS 端點溝通
-- **三個 CRD**：`MaasCluster`、`MaasMachine`、`MaasMachineTemplate`
+MAAS Provider 以標準 CAPI Infrastructure Provider 模式運作。MAAS（Metal as a Service）是 Canonical 開發的裸機雲端管理平台，能夠像管理雲端虛擬機一樣管理實體伺服器。CAPM 的職責是當 CAPI 說「給我一台機器」時，透過 MAAS API 自動分配、部署 OS、設定網路，最終回傳一台可以加入 Kubernetes 叢集的實體節點。
 
 ![架構元件圖](/diagrams/maas/architecture-components.png)
 
-## 🔄 核心流程：你想在 MAAS 上建一個 3 節點的 Kubernetes 叢集，接下來發生了什麼？
+## 🔄 核心流程
 
-> 💡 **場景**：平台工程師執行 `kubectl apply` 建立一個 Cluster 物件，要求 1 個 Control Plane + 2 個 Worker 節點，使用 MAAS 上的裸機資源。MAAS Provider 接下來做了什麼？
+平台工程師執行 `kubectl apply` 建立 Cluster 物件後，MAAS Provider 的流程如下：
 
-**Step 1 — MaasClusterReconciler：建立 DNS 記錄，設定叢集入口**
+1. **MaasClusterReconciler** 呼叫 MAAS DNS API，建立 FQDN（`<cluster-name>.<dnsDomain>`），設定 `MaasCluster.Spec.ControlPlaneEndpoint`
+2. **MaasMachineReconciler（CP）** 呼叫 MAAS allocate API 選取機器，再呼叫 deploy API 部署 OS + 注入 cloud-init userdata，等待機器上線
+3. **MaasClusterReconciler** 偵測到 API Server 上線後，設定 `MaasCluster.Status.Ready = true`
+4. **MaasMachineReconciler（Workers）** 為每台 Worker 重複 allocate → deploy 流程，設定 `Node.Spec.ProviderID` 與 `MaasMachine.Status.Ready = true`
+5. 刪除叢集時，呼叫 MAAS release API 歸還機器，清除 DNS 記錄
 
-`MaasClusterReconciler` 偵測到新的 `MaasCluster` 物件，立刻呼叫 MAAS DNS API，建立 FQDN：`<cluster-name>.<dnsDomain>`（例如 `prod-cluster.maas.example.com`），作為 API Server 的對外位址。
+## 🧩 元件總覽
 
-DNS 建立完成後，設定 `MaasCluster.Spec.ControlPlaneEndpoint`，讓 CAPI core 知道如何連接 kube-apiserver。此時叢集的網路入口已就緒，但機器還沒開始建立。
+| CRD / Controller | 用途 |
+|-----------------|------|
+| `MaasCluster` | 叢集層級：DNS domain、controlPlaneEndpoint、failure domains |
+| `MaasMachine` | 機器層級：分配條件（CPU/記憶體/資源池）、OS image、部署參數 |
+| `MaasMachineTemplate` | 不可變模板，供 MachineDeployment 批次建立機器 |
+| `MaasClusterReconciler` | 管理 DNS FQDN、監控 API Server 可用性、設定叢集 Ready 狀態 |
+| `MaasMachineReconciler` | Allocate → Deploy → ProviderID → Ready 完整機器生命週期 |
+| `spectrocloud/maas-client-go` | 封裝 MAAS REST API 的 Go SDK |
 
-**Step 2 — MaasMachineReconciler（Control Plane）：分配機器並部署 OS**
-
-CAPI 建立第一個 Control Plane `Machine`，`MaasMachineReconciler` 開始運作：
-
-1. **Allocate**：呼叫 MAAS allocate API，依照 `MaasMachine.spec` 指定的條件（最低 CPU、記憶體、資源池）從 MAAS 的可用機器池取得一台機器
-2. **Deploy**：呼叫 MAAS deploy API，部署指定的 OS image，同時注入 cloud-init userdata（CAPI 的 bootstrap secret），讓機器開機後自動加入 Kubernetes 叢集
-3. **等待上線**：MAAS 控制 IPMI/BMC 開機，安裝 OS，執行 cloud-init，CAPI 的 KubeadmControlPlane 等待這台機器上線
-
-**Step 3 — MaasClusterReconciler：偵測 API Server 上線**
-
-`MaasClusterReconciler` 在背景啟動一個 goroutine，每秒透過 `ClusterCacheTracker` 對 workload cluster 的 Node list 發出查詢。一旦成功（API Server 已上線），送出 `GenericEvent`，觸發 reconcile，設定 `MaasCluster.Status.Ready = true`。
-
-**Step 4 — MaasMachineReconciler（Workers）：同步建立 2 台 Worker**
-
-CAPI 建立 MachineDeployment，生成 2 個 Worker `Machine`。`MaasMachineReconciler` 為每台 Worker 重複 Step 2 的流程（Allocate → Deploy → 等待 Node 上線）。
-
-每台 Worker 上線後：
-- 設定 `Node.Spec.ProviderID`：`maas:///<zone>/<systemID>`
-- 設定 `MaasMachine.Status.Ready = true`
-
-整個叢集建立完成！
-
-**刪除時的退場：**
-
-刪除 Cluster 時，`MaasMachineReconciler` 呼叫 MAAS release API，將每台機器歸還資源池；`MaasClusterReconciler` 最後清除 DNS 記錄。
-
----
-
-## 🧩 元件詳解
-
-### 兩大 Controller 職責
-
-**MaasClusterReconciler** — 叢集層級
-
-- 管理 DNS FQDN（格式：`<cluster-name>.<dnsDomain>`）
-- 設定 `controlPlaneEndpoint`，讓 CAPI core 知道如何連接 kube-apiserver
-- 持續監控 APIServer 可用性，就緒後設定 `MaasCluster.Status.Ready = true`
-- 刪除時清除 DNS 記錄與相關資源
-
-**MaasMachineReconciler** — 機器層級
-
-- 呼叫 MAAS allocate API，依照條件取得機器
-- 呼叫 MAAS deploy API，部署 OS image + 注入 cloud-init userdata
-- 透過 `ClusterCacheTracker` 取得 workload cluster client，設定 `Node.Spec.ProviderID`
-- 刪除時呼叫 MAAS release API，歸還機器至資源池
-
-### 三個 CRD
-
-| CRD | 用途 | 對應 CAPI 物件 |
-|-----|------|----------------|
-| `MaasCluster` | 叢集層級：DNS domain、CP endpoint、failure domains | `Cluster.spec.infrastructureRef` |
-| `MaasMachine` | 機器層級：分配條件、image、部署參數 | `Machine.spec.infrastructureRef` |
-| `MaasMachineTemplate` | 不可變模板，用於 MachineDeployment 批次建立機器 | `MachineDeployment` 的模板來源 |
-
-### Scope 物件設計
-
-Scope 模式是 CAPI Provider 的標準設計——每次 reconcile 開始時建立一個 scope 物件，將所需的所有上下文打包在一起：
-
-**ClusterScope**（`pkg/maas/scope/cluster.go`）
-
-```go
-type ClusterScope struct {
-    logr.Logger
-    client      client.Client
-    patchHelper *patch.Helper
-
-    Cluster             *clusterv1.Cluster
-    MaasCluster         *infrav1beta1.MaasCluster
-    tracker             *remote.ClusterCacheTracker
-    clusterEventChannel chan event.GenericEvent
-}
-```
-
-`Close()` 在每次 reconcile 結束時（透過 `defer`）被呼叫，使用 `patch.Helper` 將 `MaasCluster` 狀態寫回 API server，並透過 `conditions.SetSummary` 聚合 `DNSReadyCondition` 與 `APIServerAvailableCondition`。
-
-**MachineScope** 在 ClusterScope 基礎上新增機器層級資訊，提供豐富的操作方法：
-
-| 方法 | 功能 |
-|------|------|
-| `GetInstanceID()` | 解析 ProviderID（`maas:///<zone>/<id>`）取得 system ID |
-| `SetProviderID(systemID, az)` | 寫入格式化的 `maas:///<zone>/<systemID>` |
-| `GetRawBootstrapData()` | 從 Bootstrap Secret 讀取 cloud-init 資料 |
-| `SetNodeProviderID()` | 透過 tracker 取得 workload cluster client，patch Node 的 ProviderID |
-| `MachineIsRunning()` | 檢查狀態是否在 Deploying、Deployed 集合內 |
-
-### 原始碼目錄結構
-
-```
-cluster-api-provider-maas/
-├── main.go                         # Manager 初始化、controller 與 webhook 註冊
-├── api/v1beta1/                    # CRD 型別定義、condition 常數、webhook
-├── controllers/
-│   ├── maascluster_controller.go   # MaasClusterReconciler
-│   └── maasmachine_controller.go   # MaasMachineReconciler
-├── pkg/maas/
-│   ├── scope/                      # ClusterScope、MachineScope、NewMaasClient
-│   ├── machine/                    # DeployMachine / ReleaseMachine / GetMachine
-│   └── dns/                        # ReconcileDNS / UpdateDNSAttachments
-└── pkg/util/                       # GetMAASMachinesInCluster、ProviderID 解析工具
-```
-
-### Watch 設定
-
-**MaasClusterReconciler**：監控 `MaasCluster`、CP 層級的 `MaasMachine`（`controlPlaneMachineToCluster` mapper 只處理帶有 `cluster.x-k8s.io/control-plane` label 的 MaasMachine）、CAPI `Cluster` 變更；另有 `GenericEventChannel` 作為 APIServer 上線後的觸發管道。
-
-**MaasMachineReconciler**：監控 `MaasMachine`、CAPI `Machine`（`MachineToInfrastructureMapFunc`）、`MaasCluster`（`MaasClusterToMaasMachines`）、CAPI `Cluster`。
-
-### Condition 設計
-
-| Controller | Condition Type | 說明 |
-|-----------|---------------|------|
-| MaasCluster | `LoadBalancerReady` (`DNSReadyCondition`) | DNS 記錄是否已成功建立 |
-| MaasCluster | `APIServerAvailable` | workload cluster API server 是否可連線 |
-| MaasMachine | `MachineDeployed` | 機器是否已完成部署 |
-| MaasMachine | `DNSAttached` | 僅 CP：機器 IP 是否已加入 DNS 記錄 |
-
-### Error Handling 與 Requeue 策略
-
-| 回傳值 | 場景 |
-|--------|------|
-| `ctrl.Result&#123;&#125;, nil` | 成功完成，等待下一次 Watch 事件 |
-| `ctrl.Result&#123;RequeueAfter: X&#125;, nil` | 需要定時重試（等待機器部署、API server 上線） |
-| `ctrl.Result&#123;&#125;, err` | 遇到需立即重試的錯誤（指數退避） |
-
-具體的 RequeueAfter 值：
-
-```go
-return reconcile.Result{RequeueAfter: 10 * time.Second}, nil  // 等待 MaasMachine 刪除
-return reconcile.Result{RequeueAfter: 15 * time.Second}, nil  // DNS 名稱尚未建立
-return ctrl.Result{RequeueAfter: 1 * time.Minute}, nil        // 機器已部署但電源關閉
-return ctrl.Result{RequeueAfter: 5 * time.Minute}, nil        // API server / 機器尚未 operational
-```
-
-DNS attachment 使用哨兵錯誤（`ErrRequeueDNS`）避免被記錄為 error metric：
-
-```go
-var ErrRequeueDNS = errors.New("need to requeue DNS")
-if errors.Is(err, ErrRequeueDNS) {
-    return ctrl.Result{}, nil  // 不帶 error 回傳
-}
-```
-
----
-
-## ⚠️ 常見陷阱與注意事項
-
-### Provider 啟動參數
-
-| 參數 | 預設值 | 說明 |
-|------|--------|------|
-| `--machine-concurrency` | `2` | MaasMachine 並發 reconcile 數量 |
-| `--sync-period` | `120m` | 定期 resync 的間隔時間 |
-| `--leader-elect` | `false` | 啟用 leader election 以支援 HA 部署 |
-| `--namespace` | `""` | 限制 watch 的 namespace，空字串代表所有 namespace |
-
-<Callout type="tip" title="生產環境建議">
-
-正式環境部署時，建議啟用 `--leader-elect` 並部署多副本，以確保 Provider 的高可用性。
-
-</Callout>
-
-### 環境變數與認證
-
-<Callout type="warning" title="認證方式">
-
-MAAS Provider **不使用 kubeconfig** 認證 MAAS 端點，而是透過以下兩個環境變數進行認證。這兩個變數必須在 Provider 的 Pod 環境中存在，通常透過 Kubernetes Secret 掛載。
-
-</Callout>
-
-| 環境變數 | 必填 | 說明 |
-|----------|------|------|
-| `MAAS_ENDPOINT` | ✅ | MAAS API endpoint URL，例：`http://maas.example.com/MAAS` |
-| `MAAS_API_KEY` | ✅ | MAAS API 金鑰，格式：`consumer_key:token_key:token_secret` |
-
-```bash
-maas apikey --username <username>
-```
-
-### 已知限制
+## ⚠️ 常見陷阱
 
 <Callout type="warning" title="使用前須知">
 
-1. **固定 Pod CIDR**：Pod 網路使用 `192.168.0.0/16`，目前無法透過 `MaasCluster` spec 自訂，若與現有網路衝突需另行處理
-2. **不支援原生升級**：Kubernetes 版本升級需透過 rolling MachineDeployment 進行——刪除舊機器並建立新機器，無法原地升級
-3. **In-Memory 前提**：需要 MAAS 版本 ≥ 3.5.10，且目標機器至少具備 16GB RAM 以支援 in-memory 部署模式
-4. **單一 MAAS 端點**：一個 Provider 部署實例僅對應一個 MAAS 端點，若需管理多個 MAAS 環境，需部署多個 Provider 實例
-
-**常見排障提示：**
-
-- 機器長時間停留在 Deploying 狀態 → 檢查 MAAS UI 確認 deploy job 狀態，查看 cloud-init log
-- `MaasCluster.Status.Ready` 遲遲不變為 `true` → 確認 DNS 記錄已建立（`DNSReadyCondition`），且 API Server 可從 management cluster 連線
-- MaasMachine 出現 `MachineTerminatedReason` → 機器進入 MAAS 的 Ready/New/Releasing 等預期外狀態，需人工在 MAAS UI 確認機器狀態
+- **固定 Pod CIDR**：Pod 網路使用 `192.168.0.0/16`，目前無法透過 `MaasCluster` spec 自訂
+- **不支援原地升級**：Kubernetes 版本升級需透過 rolling MachineDeployment（刪舊建新）
+- **MAAS 版本需求**：需 MAAS ≥ 3.5.10，目標機器至少 16GB RAM
+- **單一端點限制**：一個 Provider 實例僅對應一個 MAAS 端點
+- MAAS 認證透過環境變數 `MAAS_ENDPOINT` 與 `MAAS_API_KEY` 設定（非 kubeconfig）
 
 </Callout>
 
----
+## 深入學習
 
-## 延伸閱讀
-
-- [Machine 生命週期](/cluster-api-provider-maas/machine-lifecycle)
-- [Controllers 深度解析](/cluster-api-provider-maas/controllers)
-- [API 型別定義](/cluster-api-provider-maas/api-types)
-- [測驗](/cluster-api-provider-maas/quiz)
+- [Machine 生命週期](/cluster-api-provider-maas/features/machine-lifecycle) — Allocate → Deploy → Node Ready 完整狀態機
+- [Controllers 深度解析](/cluster-api-provider-maas/features/controllers) — Reconcile 邏輯、Scope 模式、Watch 設定、Condition 機制
+- [API 型別定義](/cluster-api-provider-maas/features/api-types) — MaasMachine / MaasCluster CRD 所有欄位語意
