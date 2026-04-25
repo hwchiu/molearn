@@ -6,6 +6,18 @@ export const MDX_COMPONENTS = {
   CodeAnchor,
   Callout,
   QuizQuestion,
+  img: ({ src, alt, ...props }: any) => {
+    const base = process.env.NEXT_PUBLIC_BASE_PATH || ''
+    const resolvedSrc = src?.startsWith('/') ? `${base}${src}` : src
+    return (
+      <img
+        src={resolvedSrc}
+        alt={alt}
+        className="max-w-full rounded-lg my-6 border border-[#30363d]"
+        {...props}
+      />
+    )
+  },
   h1: (props: any) => <h1 className="text-3xl font-bold text-white mt-8 mb-4" {...props} />,
   h2: (props: any) => <h2 className="text-2xl font-bold text-white mt-8 mb-3 border-b border-[#30363d] pb-2" {...props} />,
   h3: (props: any) => <h3 className="text-xl font-semibold text-white mt-6 mb-2" {...props} />,
