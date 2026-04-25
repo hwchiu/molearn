@@ -23,11 +23,124 @@ title: Cluster API — Machine 生命週期
 
 > 🔄 **類比**：Machine 的生命週期就像一位「外派員工的工作旅程」— 從收到派遣通知（Pending）、準備出發（Provisioning）、抵達目的地上班（Running），到最後任務結束的離職程序（Deleting）。離職程序特別嚴謹：要先完成交接（Pre-drain Hook）、結束手上工作（Drain）、歸還設備（Volume Detach）、最後告知相關系統（Pre-terminate Hook）才能正式離職，確保不影響團隊運作。
 
-## Machine 生命週期概覽
+## 🌐 整體觀念：一台 Machine 的誕生與消滅
 
-CAPI Machine 代表叢集中的一台機器（VM、裸機或雲端節點）。從建立到刪除，Machine 會歷經多個 Phase，每個 Phase 代表機器在整個 provisioning 流程中的不同狀態。
+在 CAPI 的世界裡，一台「機器」不是立即出現的——它要先通過一系列準備工作，才能成為 Kubernetes 叢集中正式的節點。更重要的是，它的「消失」同樣不是一刀斬斷，而是一段精心設計的告別流程。
 
-MachineReconciler 持續監控 Machine 物件，根據 Bootstrap Provider 和 Infrastructure Provider 的回報狀態推進 Machine 的 Phase。
+為什麼需要這麼複雜的流程？因為生產環境中的節點往往承載著有狀態的工作負載：資料庫、訊息佇列、有 PersistentVolume 的應用程式。如果節點突然消失，資料可能損毀，服務可能中斷。CAPI 的 Machine 生命週期設計，就是為了確保「每一台機器的上線和下線都對服務零影響」。
+
+## 🔄 核心流程：一台 Machine 從誕生到消滅的故事
+
+![Machine 生命週期](/diagrams/cluster-api/machine-lifecycle.png)
+
+> 💡 **場景**：你的叢集需要一台新的 Worker 節點。讓我們跟著這台機器，從它的 YAML 物件被建立的那一刻，一路追蹤到它最後從叢集中消失。
+
+### 誕生之旅：Pending → Provisioning → Provisioned → Running
+
+**第一站：Pending — 等待「入職文件」**
+
+Machine 物件一建立就進入 `Pending` 狀態。此時機器還沒有任何實體存在，MachineReconciler 正在等待 Bootstrap Provider（如 KubeadmConfig）準備好「入職文件」——也就是 cloud-init userdata，裡面包含了讓節點加入叢集所需的所有初始化指令。
+
+Bootstrap Provider Controller 根據叢集設定（kubeadm token、CA 憑證等）生成 cloud-init user-data，存入一個 Secret，再將 Secret 名稱寫入 `BootstrapConfig.Status.DataSecretName`。
+
+**第二站：Provisioning — 實體機器正在建立**
+
+Bootstrap 資料就緒後，Machine 進入 `Provisioning` 狀態，輪到 Infrastructure Provider 上場了。無論是 MAAS 上的裸機、Metal3 管理的 BareMetalHost，還是雲端的 VM，Infrastructure Provider 都在這個階段完成以下工作：
+
+- 讀取 userdata，開始 provisioning（VM 建立、裸機 OS 安裝等）
+- 機器啟動後，cloud-init / ignition 執行 `kubeadm join`，嘗試加入叢集
+- Provisioning 完成後，回寫 `InfrastructureMachine.Status.ProviderID`
+
+**第三站：Provisioned → Running — 節點加入叢集**
+
+Infrastructure Provider 完成後，MachineReconciler 透過 ClusterCache 連線到 workload cluster，依 ProviderID 比對 Node 物件，等待對應 Node 出現且進入 `Ready` 狀態。找到後設定 `Machine.Status.NodeRef`，Machine 正式進入 `Running` 狀態——它現在是叢集中一個完整的節點了。
+
+---
+
+### 告別之旅：Deleting — 8 步驟的優雅退場
+
+某一天，這台 Machine 需要被移除（縮容、版本升級、MachineHealthCheck 修復或手動刪除）。Kubernetes 設定 `DeletionTimestamp`，MachineReconciler 開始執行精心設計的 8 步驟告別流程。
+
+**Step 1 — Pre-Drain Hook（告別前的最後準備）**
+
+如果有外部系統（備份工具、監控系統）需要在 drain 前做準備，可以在 Machine 上設定 annotation：
+
+```
+pre-drain.delete.hook.machine.cluster.x-k8s.io/<hook-name>
+```
+
+MachineReconciler 看到這個 annotation 就暫停等待。外部系統完成後移除 annotation，流程才繼續。
+
+```bash
+# 外部系統完成備份後，移除 annotation 以解除阻塞
+kubectl annotate machine my-machine \
+  pre-drain.delete.hook.machine.cluster.x-k8s.io/backup-
+```
+
+**Step 2 — Cordon（宣告「不接新案」）**
+
+對 workload cluster 中的對應 Node 執行 Cordon（等同 `kubectl cordon`），標記為 `Unschedulable = true`。從此刻起，不再有新的 Pod 排程到這台節點。
+
+**Step 3 — Drain（優雅地把工作交出去）**
+
+對節點執行 drain，把所有 Pod 驅逐到其他節點，整個過程遵守 PodDisruptionBudget（PDB）規則。DaemonSet Pods 和 Mirror Pods 會跳過（它們有自己的清理機制）。
+
+```yaml
+spec:
+  nodeDrainTimeout: 10m  # 預設：無超時，等待 PDB 允許驅逐
+```
+
+<Callout type="warning" title="PDB 阻擋 Drain">
+
+若 Pod 設定了 PDB 且 `disruptionsAllowed = 0`，drain 會被完全阻塞。
+
+- 確保 PDB 的 `maxUnavailable` 設定合理，避免無限阻塞刪除流程
+- 強烈建議設定 `nodeDrainTimeout`，避免升級或縮減操作永久卡住
+- 若超過 `nodeDrainTimeout`，MachineReconciler 會強制繼續進行後續步驟
+
+</Callout>
+
+**Step 4 — Volume Detach（歸還「共用資料」）**
+
+等待所有 CSI volumes 從節點卸除，防止兩個節點同時掛載同一塊 volume（split-brain 問題）。對資料庫等有狀態應用尤其重要。超時設定為 `Machine.Spec.NodeVolumeDetachTimeout`。
+
+**Step 5 — Pre-Terminate Hook（最後通知）**
+
+類似 Pre-Drain Hook，這個 hook 在 drain 完成、volumes 卸除後觸發，適合通知 CMDB、更新 load balancer、執行最終備份等操作。
+
+```
+pre-terminate.delete.hook.machine.cluster.x-k8s.io/<hook-name>
+```
+
+**Step 6 — 刪除 InfrastructureMachine（真正的「告別」）**
+
+MachineReconciler 刪除 InfrastructureMachine 物件，觸發 Infrastructure Provider 執行底層清理：
+
+- **AWS CAPA**：終止 EC2 Instance
+- **Metal3 CAPM3**：BMH 進入 deprovisioning 流程
+- **MAAS CAPMAAS**：釋放 MAAS Machine，重新進入 Ready 狀態
+
+**Step 7 — 刪除 BootstrapConfig**
+
+清理 KubeadmConfig 和 bootstrap Secret，確保 kubeadm token、憑證等敏感資料不殘留。
+
+**Step 8 — 移除 Finalizer**
+
+MachineReconciler 移除最後一個 finalizer：
+
+```
+machine.cluster.x-k8s.io
+```
+
+Kubernetes API Server 將 Machine 物件從 etcd 中正式刪除。這台 Machine 完成了它的使命。
+
+<Callout type="tip" title="新手提示：為什麼刪除要這麼多步驟？">
+Machine 的 8 步驟刪除流程每一步都有意義：Cordon 確保不再有新工作分配到此節點；Drain 讓現有工作優雅地遷移到其他節點（遵守 PDB）；Volume Detach 保護有狀態應用的資料；最後才真正刪除機器。這些步驟合在一起，確保服務在節點被移除時不會有任何中斷或資料遺失。
+</Callout>
+
+---
+
+## 🧩 元件詳解
 
 ### Machine Phase 狀態機
 
@@ -42,48 +155,6 @@ MachineReconciler 持續監控 Machine 物件，根據 Bootstrap Provider 和 In
 | `Failed` | 發生不可恢復的錯誤 | 需人工介入 |
 | `Unknown` | 狀態不明（通常是 controller 無法連線）| — |
 
----
-
-## 建立流程詳解
-
-### Phase 1 — Pending（等待 Bootstrap）
-
-Machine 物件建立後立即進入 `Pending` 狀態。此階段 MachineReconciler 的主要工作是等待 Bootstrap Provider 就緒：
-
-- MachineReconciler 監看 `bootstrap.configRef` 所指向的 Bootstrap Provider（例如 KubeadmConfig）
-- Bootstrap Provider Controller 根據叢集設定（kubeadm token、CA 憑證等）生成 cloud-init user-data，並存入一個 Secret
-- Bootstrap Provider 將 Secret 名稱寫入 `BootstrapConfig.Status.DataSecretName`
-- MachineReconciler 偵測到 dataSecretName 後，設定 `Machine.Status.BootstrapReady = true`，推進至下一個 Phase
-
-### Phase 2 — Provisioning（等待 Infrastructure）
-
-Bootstrap 資料就緒後，Machine 進入 `Provisioning` 狀態，由 Infrastructure Provider 負責建立實際的機器：
-
-- MachineReconciler 從 Bootstrap Secret 取得 user-data，將 `dataSecretName` 傳遞給 InfrastructureMachine
-- Infrastructure Provider（如 CAPMAAS、CAPM3）讀取 user-data，開始 provisioning（VM 建立、BMH deprovisioning 流程等）
-- 機器啟動後，cloud-init / ignition 執行 `kubeadm init` 或 `kubeadm join`，將節點加入叢集
-- Provisioning 完成後，Infrastructure Provider 在 InfrastructureMachine 上設定 `Status.ProviderID`
-
-### Phase 3 — Provisioned（等待 Node 加入）
-
-Infrastructure Provider 完成機器建立並回報 `InfrastructureMachine.Status.Ready = true` 後，Machine 進入 `Provisioned` 狀態：
-
-- MachineReconciler 透過 ClusterCache 連線到 workload cluster 的 API Server
-- 依據 ProviderID（`Machine.Spec.ProviderID`）比對 workload cluster 中各 `Node.Spec.ProviderID`
-- 等待對應 Node 出現且進入 `Ready` 狀態
-
-### Phase 4 — Running（正常運行）
-
-MachineReconciler 找到對應的 Node 並確認其 Ready 後：
-
-- 設定 `Machine.Status.NodeRef` 指向 workload cluster 中的對應 Node 物件
-- 設定 `Machine.Status.Phase = Running`
-- Machine 進入穩定運行狀態，MachineReconciler 持續監控其健康狀況
-
----
-
-## 刪除流程詳解
-
 ### 觸發刪除的情境
 
 Machine 可能因下列原因進入刪除流程：
@@ -93,138 +164,9 @@ Machine 可能因下列原因進入刪除流程：
 - **KCP Rolling Update**：KubeadmControlPlane 升級時會依序建立新 CP Machine、刪除舊 CP Machine
 - **MachineHealthCheck Remediation**：節點健康檢查失敗，CAPI 預設策略會刪除問題 Machine 並由 MachineSet 重建
 
-一旦 Machine 被刪除（`kubectl delete`），Kubernetes 設定 `DeletionTimestamp`，MachineReconciler 開始執行以下八個步驟的刪除流程。
+### Machine Conditions 詳解
 
----
-
-### Step 1 — Pre-Drain Hook
-
-MachineReconciler 首先檢查 Machine 是否帶有 pre-drain lifecycle hook annotation：
-
-```
-pre-drain.delete.hook.machine.cluster.x-k8s.io/<hook-name>
-```
-
-若存在此 annotation，MachineReconciler 會暫停刪除流程，等待外部系統（備份工具、監控系統等）完成所需操作後主動移除此 annotation。
-
-```bash
-# 外部系統完成備份後，移除 annotation 以解除阻塞
-kubectl annotate machine my-machine \
-  pre-drain.delete.hook.machine.cluster.x-k8s.io/backup-
-```
-
-此機制為無限等待，需確保外部系統能正確移除 annotation，否則 Machine 將永遠無法刪除。
-
----
-
-### Step 2 — Cordon（封鎖節點）
-
-MachineReconciler 透過 ClusterCache 對 workload cluster 中對應的 Node 執行 cordon：
-
-- 等同於 `kubectl cordon <node-name>`
-- Node 被標記為 `Unschedulable = true`
-- 新的 Pod 不再排程到此節點，確保後續 drain 的影響範圍可控
-
----
-
-<Callout type="tip" title="新手提示：為什麼刪除要這麼多步驟？">
-Machine 的刪除流程（8 個步驟）看起來很複雜，但每一步都有其必要性：Cordon 確保不再有新工作分配到這台節點；Drain 讓現有工作優雅地遷移到其他節點（遵守 PDB）；Volume Detach 保護有狀態應用的資料；最後才真正刪除機器。這些步驟合在一起，確保服務在節點被移除時不會有任何中斷或資料遺失。
-</Callout>
-
-### Step 3 — Drain（驅逐 Pods）
-
-對節點上的 Pod 執行 drain：
-
-- 依照 PodDisruptionBudget（PDB）規則安全地驅逐所有 Pod
-- **跳過的 Pod 類型：**
-  - DaemonSet Pods — 由 DaemonSet 管理，會在節點刪除後自動清理
-  - Mirror Pods — Static Pod 的鏡像，不可驅逐
-
-超時設定可在 Machine 或 MachineDeployment 層級配置：
-
-```yaml
-spec:
-  nodeDrainTimeout: 10m  # 預設：無超時，等待 PDB 允許驅逐
-```
-
-
-<Callout type="warning" title="PDB 阻擋 Drain">
-
-若 Pod 設定了 PDB 且 `disruptionsAllowed = 0`，drain 會被完全阻塞。
-
-- 確保 PDB 的 `maxUnavailable` 設定合理，避免無限阻塞刪除流程
-- 強烈建議設定 `nodeDrainTimeout`，避免升級或縮減操作永久卡住
-- 若超過 `nodeDrainTimeout`，MachineReconciler 會強制繼續進行後續步驟
-
-</Callout>
-
-
----
-
-### Step 4 — 等待 Volume Detach
-
-確保所有 CSI volumes 已從節點卸除：
-
-- 防止「split-brain」問題（兩個節點同時掛載同一塊 volume）
-- 確保資料完整性，特別對有狀態應用（資料庫等）至關重要
-- 超時設定：`Machine.Spec.NodeVolumeDetachTimeout`
-- 若超過 timeout，MachineReconciler 繼續進行下一步（不強制等待）
-
----
-
-### Step 5 — Pre-Terminate Hook
-
-類似 pre-drain hook，MachineReconciler 檢查是否存在 pre-terminate annotation：
-
-```
-pre-terminate.delete.hook.machine.cluster.x-k8s.io/<hook-name>
-```
-
-此 hook 在 drain 完成、volumes 卸除後觸發，適合用於：
-
-- 通知外部系統（如 CMDB、監控系統）節點即將刪除
-- 等待 load balancer 完成流量切換
-- 執行節點刪除前的最後備份
-
-外部系統完成後移除此 annotation，MachineReconciler 才會繼續。
-
----
-
-### Step 6 — 刪除 InfrastructureMachine
-
-MachineReconciler 刪除 InfrastructureMachine 物件，觸發 Infrastructure Provider 開始實際刪除機器：
-
-- **AWS CAPA**：終止 EC2 Instance
-- **Metal3 CAPM3**：BMH 進入 deprovisioning 流程
-- **MAAS CAPMAAS**：釋放 MAAS Machine，重新進入 Ready 狀態
-
-MachineReconciler 等待 InfrastructureMachine 物件完全從 API Server 消失後才進行下一步。
-
----
-
-### Step 7 — 刪除 BootstrapConfig
-
-- 刪除 KubeadmConfig 或其他 Bootstrap Provider 物件
-- 清理存放 cloud-init user-data 的 bootstrap Secret
-- 確保 bootstrap credentials（kubeadm token、憑證等）不殘留
-
----
-
-### Step 8 — 移除 Finalizer
-
-最後一步，MachineReconciler 移除 Machine 的 finalizer：
-
-```
-machine.cluster.x-k8s.io
-```
-
-Finalizer 移除後，Kubernetes API Server 將 Machine 物件從 etcd 中正式刪除，整個刪除流程完成。
-
----
-
-## Machine Conditions 詳解
-
-Machine 的 `Status.Conditions` 提供細粒度的健康狀態資訊，可透過 `kubectl get machine -o yaml` 或 `clusterctl describe cluster` 查看。
+Machine 的 `Status.Conditions` 提供比 Phase 更細粒度的健康狀態，可透過 `kubectl get machine -o yaml` 或 `clusterctl describe cluster` 查看。
 
 | Condition | True 條件 | 說明 |
 |-----------|----------|------|
@@ -237,13 +179,11 @@ Machine 的 `Status.Conditions` 提供細粒度的健康狀態資訊，可透過
 | `EtcdPodHealthy` | etcd pod 健康 | （CP only, local etcd）etcd Pod 運作正常 |
 | `EtcdMemberHealthy` | etcd member 狀態健康 | （CP only, local etcd）etcd 成員健康 |
 
-Control Plane Machine 的 Conditions 比 Worker Machine 多，因為 KCP Controller 會額外監控各個 CP 元件（kube-apiserver、etcd 等）的健康狀況。
+Control Plane Machine 的 Conditions 比 Worker Machine 多，因為 KCP Controller 會額外監控各個 CP 元件的健康狀況。
 
----
+### ProviderID：Machine 與 Node 的身份橋樑
 
-## ProviderID 的重要性
-
-ProviderID 是 Machine 在 Infrastructure Provider 中的**唯一識別符**，是連接 CAPI Machine 物件與 workload cluster K8s Node 的關鍵橋樑。
+ProviderID 是 Machine 在 Infrastructure Provider 中的**唯一識別符**，也是連接 CAPI Machine 物件與 workload cluster K8s Node 的關鍵橋樑。
 
 CAPI 透過以下方式建立對應關係：
 
@@ -263,10 +203,7 @@ CAPI 透過以下方式建立對應關係：
 
 **ProviderID 一旦設定即不可變更。** 若因特殊原因需要更改，必須重建整個 Machine 物件。
 
----
-
-## 多版本升級考量
-
+### 多版本升級考量
 
 <Callout type="warning" title="版本升級注意事項">
 
@@ -281,17 +218,17 @@ CAPI 建議嚴格遵守以下升級原則，違反可能導致叢集不穩定：
 
 </Callout>
 
-> 💡 **思考一下**：Machine 的 `ProviderID` 設計成「一旦設定即不可變更」。這個不可變性保護的是什麼？如果 ProviderID 可以被修改，對 Controller 的 reconcile 邏輯和節點身份識別會造成什麼問題？
-
 ---
 
-## 常見誤解
+## ⚠️ 常見陷阱與注意事項
 
 <Callout type="warning" title="常見誤解澄清">
 1. **「Machine Phase 是 CAPI 完整管理叢集生命週期的唯一指標」** — 不完全正確。Machine Phase（Pending/Provisioning/Running/Deleting/Failed）是粗粒度的狀態描述，詳細的中間狀態需要查看 Machine 的 `status.conditions`（如 `BootstrapReady`、`InfrastructureReady`）才能了解目前卡在哪個環節。
-2. **「Drain 完成後節點資料就已安全」** — 需要額外確認。Drain 只確保 Pod 已遷移（驅逐），但若有使用 PersistentVolume，還需等待 `VolumeAttachments` 完全 detach（Machine 刪除流程的 Step 5）才能確保磁碟資料安全，否則新節點掛載同一份磁碟時可能發生衝突。
+2. **「Drain 完成後節點資料就已安全」** — 需要額外確認。Drain 只確保 Pod 已遷移（驅逐），但若有使用 PersistentVolume，還需等待 `VolumeAttachments` 完全 detach（刪除流程的 Step 4）才能確保磁碟資料安全，否則新節點掛載同一份磁碟時可能發生衝突。
 3. **「設定了 pre-drain hook 就能無限延遲節點刪除」** — 不正確。CAPI 的 hook 機制有超時保護（`nodeDrainTimeout`），超過設定時間後 Controller 會強制繼續刪除流程，不會因為 hook 未回應而永久卡住。
 </Callout>
+
+> 💡 **思考一下**：Machine 的 `ProviderID` 設計成「一旦設定即不可變更」。這個不可變性保護的是什麼？如果 ProviderID 可以被修改，對 Controller 的 reconcile 邏輯和節點身份識別會造成什麼問題？
 
 ---
 
