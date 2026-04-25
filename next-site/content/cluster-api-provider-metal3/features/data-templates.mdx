@@ -15,12 +15,32 @@ title: Metal3 Provider — Data Templates 與 IPAM
 
 </Callout>
 
+<Callout type="tip" title="本文適用對象">
+
+- 🟢 **初學者**：理解「為什麼需要 3 個物件（Template → Claim → Data）」是本頁核心
+- 🟡 **中階工程師**：關注 Jinja2 模板語法與 IPPool 整合方式
+- 🔴 **資深工程師**：了解 Metal3DataReconciler 的渲染邏輯與 Secret 管理
+
+</Callout>
 
 ---
 
 ## 什麼是 Metal3 Data Templates
 
 裸機節點部署時，每台機器需要特定的設定——例如靜態 IP 位址、hostname、UUID 等。這些資訊無法預先硬編碼到映像檔中，必須在部署時動態注入。
+
+<Callout type="info" title="概念類比：Word 文件模板">
+
+把 `Metal3DataTemplate` 想像成一份 **Word 文件模板**：
+
+- **Metal3DataTemplate**（模板）：空白的文件框架，有「主機名稱：___」、「IP 位址：___」等填空
+- **Metal3DataClaim**（申請單）：「我要一份填好的文件」的請求
+- **Metal3Data**（填好的文件）：針對特定機器填入實際資料後的完整文件
+- **Secrets**（列印出來的文件）：最終產生的 metadata Secret 和 networkdata Secret，交給 BMH 使用
+
+每台機器都有自己的「填好的文件」（Metal3Data），但所有機器共享同一份「模板」（Metal3DataTemplate）。
+
+</Callout>
 
 CAPM3 透過三個相互關聯的 CRD 實現這個需求：
 
@@ -240,3 +260,31 @@ Metal3Data 是每台機器的實際渲染結果：
 - 適合測試環境、概念驗證（PoC），或生產環境中已有成熟 DHCP 基礎設施的情況
 
 </Callout>
+
+---
+
+## 常見誤解與注意事項
+
+<Callout type="warning" title="常見誤解">
+
+**誤解 1：「Metal3DataTemplate 和一般的 ConfigMap 差不多」**
+→ Metal3DataTemplate 包含 Jinja2 模板語法，支援動態變數（IP 分配、索引計算、MAC 地址）。它比 ConfigMap 複雜得多，且與 IPPool 深度整合。
+
+**誤解 2：「Metal3Data 物件可以手動修改來更新機器的網路設定」**
+→ Metal3Data 是由 controller 自動渲染並管理的，手動修改可能被 controller 覆蓋。若需要更改設定，應修改 Metal3DataTemplate 並重新觸發 provisioning。
+
+**誤解 3：「不使用 IPAM 就不需要 Metal3DataTemplate」**
+→ Metal3DataTemplate 也負責 metadata（hostname、extra labels）和 networkdata（網路介面設定）的渲染。即使不使用 IPAM，若需要自定義 hostname 或網路設定，仍然需要 Metal3DataTemplate。
+
+**誤解 4：「Metal3DataClaim 被刪除後 Metal3Data 也會立即消失」**
+→ 不對。Metal3Data 有獨立的生命週期管理。在 BMH deprovision 之前，對應的 Metal3Data 和 Secrets 會保留。只有當 Metal3Machine 被刪除、deprovisioning 完成後，整個資源鏈才會被清理。
+
+</Callout>
+
+---
+
+## 延伸閱讀
+
+- [IPAM 整合](./ipam.md) — Metal3DataTemplate 中的 IPPool 引用與 IP 分配
+- [機器層級 CRD](./crds-machine.md) — Metal3Machine 的 dataTemplate 欄位
+- [架構概覽](./architecture.md) — Metal3DataReconciler 的渲染流程

@@ -14,6 +14,13 @@ title: Metal3 Provider — 叢集層級 CRD
 
 </Callout>
 
+<Callout type="tip" title="本文適用對象">
+
+- 🟢 **初學者**：理解「Metal3Cluster 為什麼這麼簡單」是本頁核心，看「門牌號碼」類比
+- 🟡 **中階工程師**：關注 controlPlaneEndpoint 的設定時機與 pass-through 設計
+- 🔴 **資深工程師**：了解 Metal3ClusterTemplate 與 ClusterClass 的整合方式
+
+</Callout>
 
 ## 概覽
 
@@ -34,6 +41,17 @@ Metal3 Provider 定義兩個叢集層級的 CRD，對應 CAPI 的 **InfraCluster
 
 `Metal3Cluster` 是 CAPM3 實作 CAPI InfraCluster 合約的核心 CRD。每個由 CAPI 管理的裸機叢集，都對應一個 `Metal3Cluster` 物件。
 
+<Callout type="info" title="概念類比：門牌號碼登記處">
+
+`Metal3Cluster` 就像一個**門牌號碼登記處**：
+
+- 你需要告訴系統「Control Plane API Server 在哪裡（IP + Port）」
+- 系統確認門牌號碼正確後，就說「好，叢集的基礎設施層就緒了（status.ready = true）」
+- Metal3Cluster 本身**不建立任何機器**，它只是一個座標記錄
+
+這與 AWS 或 Azure 的 provider 不同——那些 provider 需要在 Cluster 層面建立 VPC、Load Balancer 等。Metal3 的裸機環境假設這些基礎設施已經由使用者預先準備好。
+
+</Callout>
 
 <Callout type="info" title="重要設計決策">
 
@@ -179,3 +197,28 @@ Metal3Cluster 的 reconcile 邏輯非常簡單，因為 Metal3 **不需要建立
 - **固定 IP（僅測試用）**：在測試環境中可直接使用第一台 CP 節點的 IP 作為端點，但此方式不具備高可用性，**不建議用於生產環境**。
 
 </Callout>
+
+---
+
+## 常見誤解與注意事項
+
+<Callout type="warning" title="常見誤解">
+
+**誤解 1：「Metal3Cluster 會自動設定 controlPlaneEndpoint」**
+→ 不對。`controlPlaneEndpoint`（VIP 或 Load Balancer 地址）必須由使用者或外部工具（keepalived、kube-vip、F5）預先建立，並手動填入 Metal3Cluster 的 spec 中。CAPM3 只讀取這個值，不會自動建立。
+
+**誤解 2：「Metal3Cluster status.ready = true 代表叢集已可用」**
+→ `status.ready = true` 只代表**叢集層基礎設施**就緒（controlPlaneEndpoint 已設定），不代表 Control Plane 節點已部署完成或 API Server 已可連線。節點就緒需等待 Metal3Machine 和 Machine 的 provisioning 完成。
+
+**誤解 3：「Metal3ClusterTemplate 和 Metal3Cluster 是不同的資源，需要分開管理」**
+→ 概念上是兩個 CRD，但在 ClusterClass 場景下，你只需要管理 Metal3ClusterTemplate，每個由 ClusterClass 產生的 Cluster 會自動產生對應的 Metal3Cluster 實例。
+
+</Callout>
+
+---
+
+## 延伸閱讀
+
+- [架構概覽](./architecture.md) — Metal3ClusterReconciler 的 pass-through 設計
+- [機器層級 CRD](./crds-machine.md) — Metal3Machine 與 BMH 的互動
+- [進階功能](./advanced-features.md) — Metal3ClusterTemplate 與 ClusterClass 整合

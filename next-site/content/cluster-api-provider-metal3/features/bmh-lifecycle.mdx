@@ -13,6 +13,13 @@ title: Metal3 Provider — BareMetalHost 生命週期
 
 </Callout>
 
+<Callout type="tip" title="本文適用對象">
+
+- 🟢 **初學者**：理解「BMH 為什麼有這麼多狀態」是本頁核心，重點看「病床」類比
+- 🟡 **中階工程師**：關注 CAPM3 與 BMO 在每個狀態的具體操作
+- 🔴 **資深工程師**：深入追蹤 source code 中的 provision/deprovision 流程
+
+</Callout>
 
 ---
 
@@ -23,6 +30,21 @@ title: Metal3 Provider — BareMetalHost 生命週期
 - **BMO（Bare Metal Operator）** 負責管理 BMH，透過 Ironic 執行實際的硬體操作（PXE 開機、IPMI 電源控制、Redfish API 呼叫等）
 - **CAPM3** 透過修改 BMH 的 `spec` 欄位來「請求」BMO 執行特定動作，自身不直接操作硬體
 - **BMH 的狀態**（`status.provisioning.state`）反映裸機的實際狀態，由 BMO 負責維護與更新
+
+<Callout type="info" title="概念類比：醫院病床管理系統">
+
+把 BMH 想像成醫院的一張病床：
+
+- **Available（可用）**：病床空著，清潔完畢，等待下一位病人入住
+- **Provisioning（進行中）**：病人（OS）正在入住，護士正在準備床單（userdata/networkdata）
+- **Provisioned（已佔用）**：病人已在床上，機器正常服務中
+- **Deprovisioning（退院中）**：病人出院，護士正在清潔病床（磁碟清除）
+- **Inspecting（檢查中）**：健檢中，確認病床可用（hardware inventory）
+- **Error（故障）**：病床壞了，需要維修（需要人工介入）
+
+BMH 的狀態機確保每台實體機器在任何時刻的狀態都是明確且可追蹤的。
+
+</Callout>
 
 ![BMH 生命週期狀態圖](/diagrams/metal3/bmh-lifecycle.png)
 
@@ -738,3 +760,31 @@ if _, ok := labels[nodeReuseLabelName]; ok {
     delete(host.Labels, nodeReuseLabelName)
 }
 ```
+
+---
+
+## 常見誤解與注意事項
+
+<Callout type="warning" title="常見誤解">
+
+**誤解 1：「BMH 從 Provisioned 直接到 Available 需要很久」**
+→ Deprovisioning → Cleaning 確實需要時間（磁碟清除 10-15 分鐘），但可透過 `automatedCleaningMode: disabled` 跳過 cleaning，搭配 Node Reuse 功能縮短整體時間。
+
+**誤解 2：「BMH status.errorMessage 只有在 Error 狀態才會出現」**
+→ 不對。某些子狀態（如 provisioning 中的 PXE 失敗）也會在 `status.errorMessage` 中留下記錄，但 BMH 可能還沒進入 Error 狀態。定期監控 errorMessage 是重要的運維習慣。
+
+**誤解 3：「刪除 Metal3Machine 物件後 BMH 會立即回到 Available」**
+→ 不對。刪除 Metal3Machine 觸發 deprovisioning 流程，BMH 需要完成 deprovisioning → cleaning 後才回到 Available。如果 cleaning 卡住，BMH 可能長時間停留在 deprovisioning 狀態。
+
+**誤解 4：「CAPM3 和 BMO 同時修改 BMH 會衝突」**
+→ CAPM3 設定 BMH 的 spec（如 image、consumerRef），BMO 更新 BMH 的 status。兩者操作不同欄位，透過 Kubernetes API Server 的樂觀鎖（resourceVersion）避免衝突。
+
+</Callout>
+
+---
+
+## 延伸閱讀
+
+- [架構概覽](./architecture.md) — CAPM3 與 BMO 的職責分工
+- [Node Reuse](./node-reuse.md) — 跳過 deprovisioning 縮短升級時間
+- [Remediation 機制](./remediation.md) — BMH Error 狀態的自動修復

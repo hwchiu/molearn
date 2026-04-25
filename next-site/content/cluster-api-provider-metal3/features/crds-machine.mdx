@@ -15,6 +15,13 @@ title: Metal3 Provider — 機器層級 CRD
 
 </Callout>
 
+<Callout type="tip" title="本文適用對象">
+
+- 🟢 **初學者**：理解「Metal3Machine 和 BareMetalHost 的關係」是本頁核心
+- 🟡 **中階工程師**：關注 hostSelector 設定與 dataTemplate 整合
+- 🔴 **資深工程師**：了解 Metal3MachineTemplate 的 immutable 設計與 cloneFrom 機制
+
+</Callout>
 
 ## 概覽
 
@@ -39,6 +46,19 @@ Metal3 Provider 定義兩個機器層級的 CRD，對應 CAPI 的 **InfraMachine
 2. **設定 BMH 參數** — 將 image / userdata / metadata / networkdata 寫入 BMH spec
 3. **等待 BMO 完成 provisioning** — 監控 BMH 進入 `provisioned` 狀態
 4. **設定 ProviderID** — 標記 Metal3Machine 就緒，觸發 CAPI Machine 進入 Running
+
+<Callout type="info" title="概念類比：餐廳訂位與入座">
+
+`Metal3Machine` 就像一張**餐廳訂位單**：
+
+- **訂位單（Metal3Machine）**：說明「我要一桌 4 人座，靠窗，要有插座」（image、networkdata 要求）
+- **實際桌子（BareMetalHost）**：符合條件的實體裸機
+- **訂位流程（chooseHost）**：餐廳服務員根據訂位要求找到合適的桌子
+- **入座確認（status.providerID 設定）**：客人坐下後，訂位單就與桌子綁定了
+
+`hostSelector` 就是訂位單上的「特殊需求」欄位：「我只要 GPU 節點」或「只要機架 A 的機器」。
+
+</Callout>
 
 ### Spec 欄位
 
@@ -212,3 +232,32 @@ Metal3Machine 透過 `status.selectedHostRef` 記錄已選取的 BMH 名稱。BM
 在生產環境中，若將 `automatedCleaningMode` 設為 `disabled`，舊節點的磁碟資料（包含 kubelet 憑證、容器資料等）不會被清除。請確保在受信任的內部網路環境中才使用此模式，或搭配其他安全措施（如全磁碟加密）。
 
 </Callout>
+
+---
+
+## 常見誤解與注意事項
+
+<Callout type="warning" title="常見誤解">
+
+**誤解 1：「Metal3Machine 和 BareMetalHost 是一對一永久綁定的」**
+→ 在單次 provisioning 週期內是一對一的，但刪除 Metal3Machine 後，BMH 可以被新的 Metal3Machine 重新使用（Node Reuse 功能）。
+
+**誤解 2：「修改 Metal3MachineTemplate 會立即更新現有機器」**
+→ 不對。Metal3MachineTemplate 是 immutable 的（一旦被機器引用就不能修改 spec）。Rolling upgrade 透過建立新 Template 並更新 MachineDeployment 的方式實現，舊機器不受影響。
+
+**誤解 3：「hostSelector 可以用來選擇特定 IP 的 BMH」**
+→ `hostSelector` 基於 BMH 的 labels，不是基於 IP 或名稱。若要基於 IP 選擇 BMH，需要在 BMH 建立時設定包含 IP 資訊的 label。
+
+**誤解 4：「Metal3Machine 的 image 欄位可以在 provisioning 後修改」**
+→ `image` 欄位是 provisioning 時使用的，修改它不會觸發機器重建。若要更換 OS image，需要走完整的 deprovisioning → 修改模板 → 重新 provision 流程。
+
+</Callout>
+
+---
+
+## 延伸閱讀
+
+- [BMH 生命週期](./bmh-lifecycle.md) — BMH 如何響應 Metal3Machine 的設定
+- [Data Templates](./data-templates.md) — dataTemplate 如何產生 metadata/networkdata
+- [Node Reuse](./node-reuse.md) — Metal3MachineTemplate 的 keepBMH 機制
+- [LabelSync](./labelsync.md) — hostSelector 使用的 BMH labels 與 Node labels 的關係
