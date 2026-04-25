@@ -3,11 +3,9 @@
   "version": "1.0.0",
   "type": "module",
   "scripts": {
-    "dev": "vitepress dev docs-site",
-    "build": "vitepress build docs-site",
-    "preview": "vitepress preview docs-site"
+    "dev": "cd next-site && npm run dev",
+    "build": "cd next-site && npm run build",
+    "preview": "cd next-site && npm run preview"
   },
-  "devDependencies": {
-    "vitepress": "^1.6.4"
-  }
+  "devDependencies": {}
 }

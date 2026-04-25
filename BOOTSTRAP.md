@@ -74,11 +74,10 @@ MDX 格式：
 
 ```mdx
 ---
+layout: doc
 title: My Project — 主題名稱
 description: 一句話說明這頁的核心概念
 ---
-
-import { Callout } from '../../..'
 
 ## 場景
 
@@ -89,13 +88,15 @@ import { Callout } from '../../..'
 ![架構圖](/diagrams/my-project/architecture.png)
 
 <Callout type="info" title="重點">
-  關鍵洞察說明
+  關鍵洞察說明（Callout 是全域元件，不需要 import）
 </Callout>
 
 ## 程式碼細節
 
 ...
 ```
+
+> **注意：** `Callout` 和 `QuizQuestion` 都是全域 MDX 元件（在 `MDXComponents.tsx` 中註冊），**不需要在 MDX 檔案中 import**，直接使用即可。
 
 ### Step 5：確認 sidebar 自動生成
 
@@ -122,7 +123,8 @@ Sidebar 項目由 `content/{project}/features/` 目錄自動生成，**不需手
 ```json
 [
   {
-    "question": "1. 題目文字（第幾題用數字前綴）",
+    "id": 1,
+    "question": "題目文字（不含題號，題號由頁面自動加上）",
     "options": [
       "選項 A — 正確答案",
       "選項 B — 似是而非的誘答",
@@ -135,7 +137,9 @@ Sidebar 項目由 `content/{project}/features/` 目錄自動生成，**不需手
 ]
 ```
 
+- `id` 為整數，從 1 開始遞增（整個陣列全域唯一）
 - `answer` 是 0-indexed（第一個選項 = 0）
+- `question` **不含題號** — 頁面渲染時自動補上 `1. ` `2. ` 等前綴，若手動加會變成 `1. 1. 題目`
 - 題目必須基於文件內容，**禁止杜撰**
 - 每個主題至少 3 題，建議 5-8 題
 

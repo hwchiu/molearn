@@ -88,7 +88,8 @@ description: 一句話說明這頁的核心概念
 // content/{project}/quiz.json
 [
   {
-    "question": "1. 題目文字",
+    "id": 1,
+    "question": "題目文字（不含題號）",
     "options": ["選項 A", "選項 B", "選項 C", "選項 D"],
     "answer": 0,
     "explanation": "解釋文字..."
@@ -96,7 +97,10 @@ description: 一句話說明這頁的核心概念
 ]
 ```
 
-quiz 頁面（`content/{project}/quiz.mdx`）從 JSON 讀取並渲染 `<QuizQuestion>` 元件。
+- `id` 為整數，從 1 起遞增（全域唯一）
+- `question` **不含題號** — `app/[project]/quiz/page.tsx` 在渲染時自動補上 `${i+1}. ` 前綴
+- quiz 路由是 `app/[project]/quiz/page.tsx`（Server Component，用 `readFileSync` 讀取 quiz.json）
+- **不要** 在 MDX 裡直接使用 `<QuizQuestion>` 元件
 
 ### 新增專案 Sidebar
 

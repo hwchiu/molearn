@@ -18,19 +18,19 @@ setup: check-deps init-submodules install
 	@echo "   執行 make dev 啟動開發伺服器"
 
 install:
-	npm install
+	cd next-site && npm install
 
 dev:
-	npm run dev
+	cd next-site && npm run dev
 
 build:
-	npm run build
+	cd next-site && npm run build
 
 preview: build
 	npm run preview
 
 clean:
-	rm -rf docs-site/.vitepress/dist docs-site/.vitepress/cache node_modules
+	rm -rf next-site/out next-site/.next next-site/node_modules
 
 check-updates:
 	@echo "🔍 檢查各專案 submodule 更新..."

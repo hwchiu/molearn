@@ -625,8 +625,115 @@ See [content-writing-guide.md](./content-writing-guide.md) for:
 | 3.5: Story | Landing page story data | Yes — parallel with Phase 3 |
 | 4: Integrate | projects.ts + sidebar groups | No |
 | 5: Verify | npm run build + commit | No |
+| 6: Update | Diff → identify changed areas → update MDX | No |
 
-## Common Mistakes
+---
+
+## Phase 6: Updating Docs When Source Changes
+
+Use this phase when the upstream project releases a new version **after** you already completed Phases 1–5.
+
+### 6.1 Find what changed
+
+```bash
+# Check which commit you previously documented (stored in repo root)
+cat versions.json
+
+# Fetch the latest upstream code
+git -C {project-name} fetch origin
+git -C {project-name} checkout <new-tag-or-commit>
+
+# List all changed Go/YAML files between the old commit and new commit
+OLD_COMMIT=$(python3 -c "import json; d=json.load(open('versions.json')); print(d['{project-name}']['commit'])")
+NEW_COMMIT=$(git -C {project-name} rev-parse HEAD)
+
+git -C {project-name} diff --name-only $OLD_COMMIT $NEW_COMMIT -- '*.go' '*.yaml' '*.json'
+```
+
+### 6.2 Categorize the changes
+
+Send this prompt to your AI:
+
+```
+I documented {project-name} at commit {OLD_COMMIT}.
+The project is now at commit {NEW_COMMIT}.
+
+Here are the changed files:
+{paste: git -C {project-name} diff --name-only $OLD_COMMIT $NEW_COMMIT}
+
+Here are the key diffs for the most critical files:
+{paste: git -C {project-name} diff $OLD_COMMIT $NEW_COMMIT -- path/to/important/file.go}
+
+Our documentation site has these existing pages:
+{paste: ls next-site/content/{project-name}/features/}
+
+For each changed file, tell me:
+1. Which existing doc page covers this code (if any)?
+2. What changed — new function, renamed type, new CRD field, new webhook, deleted feature?
+3. Action: UPDATE (edit existing page) or ADD (create new page)?
+4. Priority: High (visible user-facing change) / Medium / Low (internal refactor)
+
+Output as a table: Changed File | Doc Page | Change Type | Action | Priority
+```
+
+### 6.3 Execute the updates
+
+**For each HIGH priority UPDATE (existing page needs editing):**
+```
+Read next-site/content/{project}/features/{page}.mdx
+and the diff below.
+
+Update only the sections that are affected by this diff.
+Do not change accurate sections. Correct any symbol names or file paths
+that no longer match the new source code.
+
+IMPORTANT: Every symbol you write must exist in the NEW commit at {NEW_COMMIT}.
+Run grep to verify before writing.
+
+Diff:
+{paste relevant diff}
+```
+
+**For each HIGH priority ADD (new feature, new page):**
+Follow the full Phase 3 writing prompt for the new page, then add the new page to `featureGroups` in `next-site/lib/projects.ts`.
+
+### 6.4 Update versions.json
+
+After all pages are updated:
+
+```bash
+NEW_COMMIT=$(git -C {project-name} rev-parse HEAD)
+NEW_TAG=$(git -C {project-name} describe --tags --abbrev=0 2>/dev/null || echo "no-tag")
+TODAY=$(date +%Y-%m-%d)
+```
+
+Edit `versions.json` manually to update the entry:
+```json
+"{project-name}": {
+  "commit": "{NEW_COMMIT}",
+  "tag": "{NEW_TAG}",
+  "analyzed_at": "{TODAY}"
+}
+```
+
+### 6.5 Verify and commit
+
+```bash
+cd next-site && npm run build   # must succeed with 0 errors
+
+git add next-site/content/{project-name}/ versions.json
+git commit -m "docs({project-name}): update docs for {new-tag}
+
+Updated pages: {list}
+New pages: {list if any}
+Source: {project-name} @ {NEW_COMMIT}
+
+Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>"
+git push origin main
+```
+
+---
+
 
 | Mistake | Fix |
 |---------|-----|

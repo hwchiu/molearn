@@ -104,24 +104,103 @@ mkdir -p next-site/content/{name}/features
 
 這套設計可以完整移植到任何組織，AI 工具可以是 Cursor、GitHub Copilot、內部 LLM，都適用。
 
-### 方法一：使用現有 repo 作為 Template
+### 方法一：Fork 現有 repo（快速啟動）
 
-1. Fork 或複製 `next-site/` 目錄到公司內部 Git
-2. 清空 `next-site/content/`（移除現有三個專案的文件）
-3. 更新 `next-site/lib/projects.ts`（移除現有三個專案）
-4. 按照 `BOOTSTRAP.md` 步驟加入你的專案
+適合：你想保留現有三個 CAPI 專案文件，並在此基礎上加入新專案。
 
-### 方法二：從零建立（推薦給新環境）
+```bash
+# 1. Fork 或 clone 到公司內部 Git
+git clone https://github.com/hwchiu/molearn.git my-company-docs
+cd my-company-docs
+git remote set-url origin https://your-company.git/my-company-docs.git
 
-1. 把 [`skills/site-bootstrap/SKILL.md`](./skills/site-bootstrap/SKILL.md) 貼給你的 AI
-2. AI 會從 `npx create-next-app` 開始，完整 scaffold 出相同風格的網站
-3. 不需要 clone 這個 repo
+# 2. 初始化 submodules（現有三個專案的原始碼）
+git submodule update --init --recursive
+
+# 3. 安裝依賴
+cd next-site && npm install
+```
+
+然後直接按 `BOOTSTRAP.md` 步驟加入你的公司專案。
+
+---
+
+### 方法二：清空內容，重新開始（推薦給全新環境）
+
+適合：你想使用同樣的框架風格，但內容完全換成自己的專案。
+
+**Step 1：Fork 或 clone**
+```bash
+git clone https://github.com/hwchiu/molearn.git my-company-docs
+cd my-company-docs
+```
+
+**Step 2：移除現有三個專案的 submodules**
+```bash
+# 逐一移除每個 submodule
+git submodule deinit -f cluster-api
+git rm -f cluster-api
+rm -rf .git/modules/cluster-api
+
+git submodule deinit -f cluster-api-provider-maas
+git rm -f cluster-api-provider-maas
+rm -rf .git/modules/cluster-api-provider-maas
+
+git submodule deinit -f cluster-api-provider-metal3
+git rm -f cluster-api-provider-metal3
+rm -rf .git/modules/cluster-api-provider-metal3
+```
+
+**Step 3：清空文件內容**
+```bash
+# 刪除現有三個專案的內容
+rm -rf next-site/content/cluster-api
+rm -rf next-site/content/cluster-api-provider-maas
+rm -rf next-site/content/cluster-api-provider-metal3
+
+# 刪除現有的靜態圖表
+rm -rf next-site/public/diagrams/cluster-api
+rm -rf next-site/public/diagrams/cluster-api-provider-maas
+rm -rf next-site/public/diagrams/cluster-api-provider-metal3
+```
+
+**Step 4：清空 projects.ts**
+
+開啟 `next-site/lib/projects.ts`，把 `PROJECTS` 陣列改為空陣列：
+```typescript
+export const PROJECTS: Project[] = []
+export const PROJECT_IDS = PROJECTS.map(p => p.id)
+```
+
+**Step 5：清空 versions.json**
+```bash
+echo '{}' > versions.json
+```
+
+**Step 6：驗證框架可以正常建置**
+```bash
+cd next-site && npm install && npm run build
+# 應該成功，只是首頁沒有任何專案卡片
+```
+
+**Step 7：按照 `BOOTSTRAP.md` 加入你的第一個專案**
+
+---
+
+### 方法三：完全從零建立（不需要 clone 這個 repo）
+
+適合：公司有安全限制無法使用外部 repo，或需要完全自定義框架。
+
+把 [`skills/site-bootstrap/SKILL.md`](./skills/site-bootstrap/SKILL.md) 的內容貼給你的 AI，AI 會從 `npx create-next-app` 開始，完整 scaffold 出相同風格的網站（所有元件程式碼都嵌在 SKILL.md 裡）。
+
+---
 
 ### 給 AI 的工作說明
 
-分析新專案時，給 AI 以下兩份文件：
-- [`BOOTSTRAP.md`](./BOOTSTRAP.md) — 告訴 AI 要動哪些檔案
-- [`skills/analyzing-source-code/content-writing-guide.md`](./skills/analyzing-source-code/content-writing-guide.md) — 文件寫作的 5 條 UX 規則
+分析新專案時，給 AI 以下文件（按順序）：
+1. [`BOOTSTRAP.md`](./BOOTSTRAP.md) — 告訴 AI 要動哪些檔案
+2. [`skills/analyzing-source-code/SKILL.md`](./skills/analyzing-source-code/SKILL.md) — 完整分析流程
+3. [`skills/analyzing-source-code/content-writing-guide.md`](./skills/analyzing-source-code/content-writing-guide.md) — 文件寫作的 5 條 UX 規則
 
 ---
 
