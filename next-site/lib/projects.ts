@@ -7,6 +7,12 @@ export interface LearningPathStep {
   note: string
 }
 
+export interface FeatureGroup {
+  label: string
+  icon: string
+  slugs: string[]
+}
+
 export interface ProjectMeta {
   id: ProjectId
   displayName: string
@@ -17,6 +23,7 @@ export interface ProjectMeta {
   color: string
   accentClass: string
   features: string[]
+  featureGroups: FeatureGroup[]
   difficulty: '🟢 入門' | '🟡 中階' | '🔴 進階'
   difficultyColor: string
   problemStatement: string
@@ -45,6 +52,13 @@ export const PROJECTS: Record<ProjectId, ProjectMeta> = {
       'bootstrap-kubeadmconfig', 'machine-lifecycle', 'machine-health-check',
       'clusterclass-topology', 'addons-clusterresourceset',
       'provider-contracts-runtime-hooks', 'clusterctl',
+    ],
+    featureGroups: [
+      { label: '從這裡開始', icon: '🚀', slugs: ['architecture'] },
+      { label: '控制器原理', icon: '🔄', slugs: ['controller-core', 'controller-kcp', 'controller-topology'] },
+      { label: 'API 資源設計', icon: '📋', slugs: ['api-cluster-machine', 'api-machineset-machinedeployment', 'api-kubeadm-controlplane', 'bootstrap-kubeadmconfig'] },
+      { label: '機器生命週期', icon: '⚙️', slugs: ['machine-lifecycle', 'machine-health-check'] },
+      { label: '進階管理', icon: '🏗', slugs: ['clusterclass-topology', 'addons-clusterresourceset', 'provider-contracts-runtime-hooks', 'clusterctl'] },
     ],
     difficulty: '🟡 中階',
     difficultyColor: 'text-yellow-400 bg-yellow-400/10 border-yellow-400/30',
@@ -77,6 +91,11 @@ export const PROJECTS: Record<ProjectId, ProjectMeta> = {
     color: 'orange',
     accentClass: 'border-orange-500 text-orange-400',
     features: ['architecture', 'controllers', 'machine-lifecycle', 'api-types', 'integration'],
+    featureGroups: [
+      { label: '從這裡開始', icon: '🚀', slugs: ['architecture'] },
+      { label: '核心機制', icon: '🔄', slugs: ['controllers', 'machine-lifecycle'] },
+      { label: 'API 與整合', icon: '📋', slugs: ['api-types', 'integration'] },
+    ],
     difficulty: '🟡 中階',
     difficultyColor: 'text-yellow-400 bg-yellow-400/10 border-yellow-400/30',
     problemStatement: '想像你管理著一個有 100 台實體伺服器的數據中心。每次需要新 Kubernetes 節點，你都要：登入 MAAS UI → 找到空閒的機器 → 分配 IP → 選 OS image → 等待部署 → 設定 Kubernetes。這個流程費時且容易出錯。MAAS Provider 讓這一切變成一個 YAML 宣告，Kubernetes 自動透過 MAAS API 完成剩下的事，讓裸機如同雲端資源一樣彈性。',
@@ -110,6 +129,12 @@ export const PROJECTS: Record<ProjectId, ProjectMeta> = {
     features: [
       'architecture', 'bmh-lifecycle', 'crds-cluster', 'crds-machine',
       'labelsync', 'node-reuse', 'data-templates', 'ipam', 'remediation', 'advanced-features',
+    ],
+    featureGroups: [
+      { label: '從這裡開始', icon: '🚀', slugs: ['architecture'] },
+      { label: '裸機生命週期', icon: '⚙️', slugs: ['bmh-lifecycle', 'crds-cluster', 'crds-machine'] },
+      { label: '資料與網路', icon: '🌐', slugs: ['data-templates', 'ipam'] },
+      { label: '運維與自癒', icon: '🔧', slugs: ['labelsync', 'node-reuse', 'remediation', 'advanced-features'] },
     ],
     difficulty: '🔴 進階',
     difficultyColor: 'text-red-400 bg-red-400/10 border-red-400/30',

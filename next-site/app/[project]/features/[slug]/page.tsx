@@ -39,7 +39,7 @@ export default async function FeaturePage({ params }: { params: { project: strin
   return (
     <div className="flex min-w-0">
       {/* Main content */}
-      <article className="flex-1 min-w-0 max-w-3xl px-8 py-10">
+      <article className="flex-1 min-w-0 px-8 py-10 max-w-[860px]">
         {data.title && (
           <div className="mb-8">
             {data.category && (
