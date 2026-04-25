@@ -17,7 +17,7 @@ title: MAAS Provider — 整合與部署指南
 </Callout>
 
 
-本指南說明如何在既有環境中部署 MAAS Provider，並從零開始建立第一個裸金屬 Kubernetes 叢集。
+本指南說明如何在既有環境中部署 MAAS Provider，並從零開始建立第一個bare-metal Kubernetes 叢集。
 
 ## 前置需求
 
@@ -45,7 +45,7 @@ kubectl get pods -n cert-manager
 
 <Callout type="warning" title="MAAS API Key 安全性">
 
-MAAS API key 具有完整的機器控制權（包含部署、刪除、重開機）。請**妥善保管**並使用 Kubernetes Secret 儲存，**絕對不要**直接寫入 MaasCluster 或 MaasMachine 等 CRD spec 中。一旦洩漏，攻擊者可以透過 MAAS API 任意操控所有裸金屬機器。
+MAAS API key 具有完整的機器控制權（包含部署、刪除、重開機）。請**妥善保管**並使用 Kubernetes Secret 儲存，**絕對不要**直接寫入 MaasCluster 或 MaasMachine 等 CRD spec 中。一旦洩漏，攻擊者可以透過 MAAS API 任意操控所有bare-metal 機器。
 
 </Callout>
 
