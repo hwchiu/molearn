@@ -486,7 +486,7 @@ The story should naturally introduce the core concepts of {project-name}:
 
 The protagonist should make at least one mistake or hit one unexpected obstacle. Real learning involves confusion.
 
-The story is in Traditional Chinese (zh-TW). Technical terms stay in English.
+The story is in Traditional Chinese (zh-TW). Technical terms stay in English. Infrastructure terms such as `bare-metal`, `node`, `pod`, `cluster` are **never translated**.
 ```
 
 ---
@@ -598,6 +598,7 @@ If grep returns no results → the symbol does not exist in this version. Do not
 ### Language
 - All documentation in **zh-TW** (Traditional Chinese)
 - Technical terms keep English originals (Controller, CRD, Webhook, Reconcile, etc.)
+- **Never translate infrastructure terms** — keep as-is: `bare-metal`, `node`, `pod`, `cluster`, `namespace`, etc.
 - Code comments remain in English
 
 ### Content UX
