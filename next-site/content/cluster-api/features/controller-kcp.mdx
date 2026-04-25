@@ -15,6 +15,13 @@ title: Cluster API — KubeadmControlPlane Controller
 
 </Callout>
 
+<Callout type="tip" title="本文適用對象">
+- 🟢 **初學者**：建議先閱讀 KubeadmControlPlane API 頁面，再來理解 KCP Controller 的運作細節
+- 🟡 **中階工程師**：重點掌握 Preflight Checks 機制，了解 KCP 在什麼條件下才允許 scale/rollout
+- 🔴 **資深工程師**：深入研究 etcd quorum 保護設計與 Rolling Update 演算法中的機器選擇策略
+</Callout>
+
+> ⚙️ **類比**：KCP Controller 就像一位「嚴格遵守作業程序的資深工程師」— 在操作任何高風險動作（scale up/down、rollout）前，他必須逐項確認安全清單（preflight checks），確保 etcd 委員會成員數量充足（quorum），系統各元件都健康，才肯動手。而且他每次只做一個動作（一次一個操作原則），完成後才考慮下一步。
 
 ## KCP Controller 概覽
 
@@ -164,6 +171,10 @@ KCP 設計上，Machine 的 labels 和 annotations 變更**不會觸發 Rolling 
 只有 `EligibleForInPlaceUpdate = true` 且啟用 `InPlaceUpdates` feature gate 時，KCP 才會嘗試 in-place update 而非重建 Machine。
 
 ---
+
+<Callout type="tip" title="新手提示：一次一個操作原則">
+KCP 的「一次一個操作（One Operation at a Time）」原則是確保 Control Plane 穩定性的關鍵。每次 Reconcile 循環中，KCP 只會執行以下其中一個操作：建立新 CP Machine、刪除舊 CP Machine、或執行 in-place 更新。這樣即使操作失敗，影響範圍也限定在單台機器，不會造成多台 CP 同時不健康。這和一般應用服務可以批量更新的做法完全不同，因為 Control Plane 承擔整個叢集的管理功能，任何操作都必須格外謹慎。
+</Callout>
 
 ## Rolling Update 演算法細節
 
@@ -554,3 +565,23 @@ spec:
 - **注意**：暫停期間憑證不會自動輪替，請務必在憑證到期前恢復 KCP 正常運作
 
 </Callout>
+
+> 💡 **思考一下**：KCP 在 Rolling Update 中採用「先 Scale Up 再 Scale Down」的策略（先建立新 CP 節點，確認健康後才刪除舊節點）。這個策略在 etcd quorum 的視角下有什麼特別考量？如果 replicas=3，升級過程中叢集短暫有 4 台 CP 節點，etcd 如何處理這個「過渡狀態」？
+
+---
+
+## 常見誤解
+
+<Callout type="warning" title="常見誤解澄清">
+1. **「KCP Controller 直接控制 kubeadm 執行」** — 不正確。KCP Controller 透過建立 Machine 物件來間接觸發節點的 bootstrap 流程，`kubeadm init/join` 是由 Bootstrap Provider（CABPK）產生的 cloud-init 腳本在節點上自動執行，KCP 本身並不直接 SSH 進機器操作。
+2. **「Preflight 檢查失敗後 KCP 會無限重試」** — 不正確。KCP 在 Preflight 失敗時會 requeue（加上延遲重試），但如果是結構性問題（如 etcd quorum 長期無法恢復），需要人工介入修復，KCP 不會強行跳過 Preflight 繼續執行。
+3. **「KCP 的憑證輪替會導致服務中斷」** — 通常不會。憑證輪替（Certificate Rotation）只是重新產生並替換 Secret，API Server 重啟期間有短暫不可用，但 etcd 和其他組件不受影響，client 端通常在 retry 後即可恢復連線。
+</Callout>
+
+---
+
+## 延伸閱讀
+
+- [KubeadmControlPlane API](/cluster-api/features/api-kubeadm-controlplane) — KCP Spec 欄位與 RemediationStrategy 設定
+- [CAPI 架構概覽](/cluster-api/features/architecture) — Control Plane Provider 合約介面
+- [Bootstrap KubeadmConfig](/cluster-api/features/bootstrap-kubeadmconfig) — kubeadm init/join 設定詳解

@@ -17,6 +17,13 @@ title: Cluster API — Cluster 與 Machine 核心資源
 
 </Callout>
 
+<Callout type="tip" title="本文適用對象">
+- 🟢 **初學者**：先理解 Cluster 與 Machine 的關係，把握 CAPI 核心資源的設計脈絡
+- 🟡 **中階工程師**：重點研究 infrastructureRef / controlPlaneRef 設計模式，以及 Finalizer 的作用
+- 🔴 **資深工程師**：深入刪除 Hook 機制（pre-drain / pre-terminate）與 ownerReference 串接的 GC 行為
+</Callout>
+
+> 📋 **類比**：Cluster 就像一張「訂單總表」，描述整份訂單的配送地址（controlPlaneEndpoint）和客製化選項（topology）；Machine 則是訂單中每一個「商品規格項目」，詳細記載個別節點要用哪種基礎設施（infrastructureRef）和如何初始化（bootstrapRef）。訂單系統（CAPI Controller）負責追蹤每個商品的備貨狀態，直到全部到位。
 
 ---
 
@@ -143,6 +150,10 @@ Machine 同樣採用 Provider 引用模式：`infrastructureRef` 指向 InfraMac
 | `conditions` | Conditions | 目前服務狀態 |
 | `deletion.waitForNodeVolumeDetach` | bool | 是否正在等待 volume detach |
 
+<Callout type="tip" title="新手提示：為何不直接建立 Machine？">
+在實際操作中，我們幾乎不會手動建立 Machine 物件。Worker 節點透過 MachineDeployment 統一管理（支援自動擴縮容和滾動更新），Control Plane 節點透過 KubeadmControlPlane 管理（確保 etcd quorum）。直接建立 Machine 就像直接建立 Pod 而不使用 Deployment — 雖然可行，但沒有自癒和版本管理能力。
+</Callout>
+
 ### Machine 生命週期 Phase
 
 | Phase | 說明 | 觸發條件 |
@@ -203,3 +214,23 @@ Machine 刪除涉及多個步驟，以確保節點安全退出叢集：
 完整的 Machine 刪除流程（包含 hook 機制、PDB 處理、逾時邏輯）請參閱：[Machine 生命週期](/cluster-api/machine-lifecycle)
 
 </Callout>
+
+> 💡 **思考一下**：為什麼 Machine 的 `spec.clusterName` 設計成 Immutable（不可變）？如果允許變更會造成什麼問題？Cluster 的哪些欄位也有類似的 Immutable 限制，原因是什麼？
+
+---
+
+## 常見誤解
+
+<Callout type="warning" title="常見誤解澄清">
+1. **「Cluster 物件建立後就代表叢集已可用」** — 錯誤。Cluster 物件只是「期望狀態」的宣告，實際的 Control Plane 和 Worker 節點要等 Infrastructure Provider 完成機器建立、Bootstrap Provider 完成節點初始化後，Cluster 的 `status.phase` 才會進入 `Provisioned`。
+2. **「直接刪除 Machine 物件即可快速移除節點」** — 危險做法。CAPI 設計了完整的安全刪除流程（Cordon → Drain → Volume Detach），直接刪除物件雖然可行，但會跳過 Pod 驅逐步驟，可能導致服務中斷或有狀態應用的資料遺失。
+3. **「Machine labels 可以任意修改」** — 有限制。部分 label（如 `cluster.x-k8s.io/cluster-name`）若被修改，會影響 Controller 的 selector 邏輯，導致該 Machine 被視為「孤立」（orphaned）而不再受 MachineSet 管控。
+</Callout>
+
+---
+
+## 延伸閱讀
+
+- [Machine 生命週期詳解](/cluster-api/features/machine-lifecycle) — 完整的 Machine Phase 狀態機與刪除流程
+- [KubeadmControlPlane API](/cluster-api/features/api-kubeadm-controlplane) — Control Plane 節點的設定方式
+- [MachineSet 與 MachineDeployment](/cluster-api/features/api-machineset-machinedeployment) — Worker 節點的批量管理

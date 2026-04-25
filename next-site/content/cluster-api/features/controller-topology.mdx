@@ -15,6 +15,13 @@ title: Cluster API — Topology Controller 詳解
 
 </Callout>
 
+<Callout type="tip" title="本文適用對象">
+- 🟢 **初學者**：建議先閱讀 ClusterClass 與 Topology 頁面，再來理解 Topology Controller 的運作
+- 🟡 **中階工程師**：重點理解 Variables 解析與 Patches 注入的完整流程
+- 🔴 **資深工程師**：深入研究 Runtime Extension Hooks 整合點與 ClusterClass 不可變性的設計取捨
+</Callout>
+
+> 🗺️ **類比**：Topology Controller 就像「建築工地的施工監理」— ClusterClass 是建築藍圖，Cluster.Spec.Topology 是業主的客製化需求說明，而 Topology Controller 則是監理工程師，負責將藍圖與需求結合（Apply Patches），翻譯成具體的施工指令（CAPI 資源），再交給各專業承包商（Core Controllers）去執行，確保最終成果符合業主期望。
 
 ## Topology Controller 概覽
 
@@ -66,6 +73,10 @@ Patch 是 ClusterTopology 最強大的功能之一，控制器會依序執行：
    - `InfraClusterTemplate`（已填入所有變數值）
    - `KCPTemplate`（已填入所有變數值）
    - 各 `MachineDeploymentTemplate`（已填入所有變數值）
+
+<Callout type="tip" title="新手提示：Patches 如何把參數「注入」到 Template？">
+想像 ClusterClass 的 Template 就像有預留空格的合約範本，`patches` 就是「填空規則」。你在 `spec.topology.variables` 填入的值（例如 `imageURL: "https://example.com/ubuntu.img"`），Topology Controller 會按照 patches 定義的路徑（例如 `/spec/template/spec/image/url`），把這個值精確填入對應 Template 的那個欄位。整個過程在 Controller 記憶體中完成，不會直接修改 ClusterClass 或 Template 物件，而是產生一個「具體化版本」再套用到叢集。
+</Callout>
 
 ### Step 4 — 建立或更新資源
 
@@ -322,3 +333,23 @@ Patch 可以透過兩種方式引用 variable 值：
 若要啟用，需設定 Feature Gate `--feature-gates=RuntimeSDK=true` 並部署對應的 Runtime Extension webhook。
 
 </Callout>
+
+> 💡 **思考一下**：Topology Controller 在 Apply Patches 時，需要把 ClusterClass 的 Template 「具體化」為實際資源。如果兩個叢集使用同一個 ClusterClass 但設定了不同的 variables，Topology Controller 如何確保它們各自產生獨立的 Template 實例，而不會互相干擾？
+
+---
+
+## 常見誤解
+
+<Callout type="warning" title="常見誤解澄清">
+1. **「Topology Controller 修改了 ClusterClass 的 Template 物件」** — 錯誤。Topology Controller 會為每個叢集建立獨立的「owned Template 複本」（透過 ownerReference 標記），並對這份複本套用 patches，而不是直接修改 ClusterClass 中的原始 Template。因此多個叢集共用同一個 ClusterClass 時，各自的 Template 是完全獨立的複本。
+2. **「版本升級時 Topology Controller 會直接修改所有 Machine 的版本」** — 不正確。Topology Controller 只更新 KubeadmControlPlane 和 MachineDeployment 的 `version` 欄位，實際的節點替換滾動升級由 KCP Controller 和 MachineSetReconciler 各自執行，Topology Controller 不直接接觸 Machine 物件。
+3. **「Runtime Extension Hooks 是必要的設定」** — 非必要。Runtime Extension（RuntimeSDK）是進階功能，需要額外部署 webhook 服務並啟用 Feature Gate。大多數使用案例不需要 hooks，只有在需要整合外部系統（如 CMDB、審核系統）時才考慮使用。
+</Callout>
+
+---
+
+## 延伸閱讀
+
+- [ClusterClass 與 Topology](/cluster-api/features/clusterclass-topology) — ClusterClass 結構、Variables 與 Patches 設定
+- [KCP Controller 詳解](/cluster-api/features/controller-kcp) — Control Plane Rolling Update 流程
+- [CAPI 架構概覽](/cluster-api/features/architecture) — Topology Controller 在整體架構中的位置

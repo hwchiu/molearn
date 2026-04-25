@@ -15,6 +15,13 @@ title: Cluster API — KubeadmControlPlane
 
 </Callout>
 
+<Callout type="tip" title="本文適用對象">
+- 🟢 **初學者**：先理解 KCP 與一般 Machine 的差異 — KCP 是專門管理 Control Plane 節點的「人事主管」
+- 🟡 **中階工程師**：重點掌握 Rolling Upgrade 策略與 maxSurge 的運作方式
+- 🔴 **資深工程師**：深入研究 etcd quorum 保護機制與 RemediationStrategy 的邊界條件
+</Callout>
+
+> 👔 **類比**：KubeadmControlPlane 就像公司的「人事主管（HR Manager）」，專門負責管理 Control Plane 這個核心部門的人員。他確保部門始終維持正確的人數（replicas），在招募新員工時（kubeadm init/join）嚴格把關，在替換人員時（Rolling Update）也要確保工作不中斷 — 先請新人試用通過後，再讓舊員工離職。最重要的是，他永遠確保「決策委員會（etcd）」的成員數維持在能有效表決的奇數以上。
 
 ## 什麼是 KubeadmControlPlane（KCP）
 
@@ -64,6 +71,10 @@ initConfiguration:
     advertiseAddress: "{{ ds.meta_data.local_ipv4 }}"
     bindPort: 6443
 ```
+
+<Callout type="tip" title="新手提示：initConfiguration vs joinConfiguration">
+第一台 Control Plane 使用 `initConfiguration`（kubeadm init，建立全新叢集），後續的 Control Plane 節點使用 `joinConfiguration`（kubeadm join，加入現有叢集）。KCP Controller 會根據目前是「第一台」還是「後續台」自動選擇正確的設定區塊，使用者不需要手動區分。KCP 內部用 `KubeadmControlPlaneInitialized` 這個 Condition 來判斷叢集是否已初始化。
+</Callout>
 
 ### clusterConfiguration（K8s 叢集全域設定）
 
@@ -244,3 +255,23 @@ spec:
 | `maxRetry` | 最大重試次數，超過後不再自動 remediate |
 | `retryPeriod` | 兩次 remediation 之間的最短間隔，避免過於頻繁地替換節點 |
 | `minHealthyPeriod` | 節點必須持續健康達此時間才視為「曾健康過」，防止對剛修好的節點重複觸發 remediation |
+
+> 💡 **思考一下**：KCP 在升級 Control Plane 時為何堅持「一次只動一台」的策略？如果允許同時替換多台 Control Plane Machine，在 etcd quorum 的角度來看會有什麼風險？
+
+---
+
+## 常見誤解
+
+<Callout type="warning" title="常見誤解澄清">
+1. **「KCP 的 replicas 設為 3 就能保證高可用」** — 不完全正確。replicas=3 只是數量，還需要確保機器分散在不同的 Failure Domain（可用區），否則 3 台同在一個 AZ，該 AZ 故障時整個 Control Plane 仍會失效。
+2. **「修改 kubeadmConfigSpec 中任何欄位都會觸發滾動更新」** — 不正確。只有「immutable 欄位」（如 `clusterConfiguration`、`initConfiguration`）的修改才會觸發，其他欄位（如 `files`、`preKubeadmCommands`）的修改不一定觸發滾動更新。
+3. **「KCP remediation 和 MachineHealthCheck 是同一件事」** — 錯誤。KCP Remediation 是 KubeadmControlPlane 內建的 Control Plane 自癒機制；MachineHealthCheck 是通用的、針對所有 Machine 的健康檢查機制，兩者獨立運作，設定方式也不同。
+</Callout>
+
+---
+
+## 延伸閱讀
+
+- [KCP Controller 詳解](/cluster-api/features/controller-kcp) — KCP Reconcile 流程、Rolling Update 演算法、Preflight 檢查
+- [Cluster 與 Machine API](/cluster-api/features/api-cluster-machine) — Machine 核心欄位與生命週期
+- [Bootstrap KubeadmConfig](/cluster-api/features/bootstrap-kubeadmconfig) — kubeadmConfigSpec 各欄位詳解

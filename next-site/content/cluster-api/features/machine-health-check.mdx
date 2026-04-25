@@ -14,6 +14,13 @@ title: Cluster API — MachineHealthCheck
 
 </Callout>
 
+<Callout type="tip" title="本文適用對象">
+- 🟢 **初學者**：理解為什麼需要自動健康檢查 — 在大規模叢集中，人工監控每台節點是不可行的
+- 🟡 **中階工程師**：重點掌握 maxUnhealthy Circuit Breaker 邏輯與兩種 Remediation 策略的選擇時機
+- 🔴 **資深工程師**：深入研究 Circuit Breaker 邊界條件與 remediationTemplate Provider 整合方式
+</Callout>
+
+> 🍽️ **類比**：MachineHealthCheck 就像「廚房的食材保鮮監控系統」— 系統持續監測每項食材（節點）的新鮮度，當某項食材不新鮮超過一定時間（timeout），就自動處理：換掉壞的（刪除 Machine）或嘗試讓它恢復（自定義 Remediation）。但若同時太多食材都壞掉（超過 maxUnhealthy），系統會啟動「斷路器」，停止自動處理，改為發出警報等待人工介入，避免把整個廚房的食材都丟掉。
 
 ## 什麼是 MachineHealthCheck
 
@@ -115,6 +122,10 @@ maxUnhealthy: "40%"  # 最多允許 40% 不健康
 
 
 ---
+
+<Callout type="tip" title="新手提示：Circuit Breaker 為何存在？">
+想像一個叢集有 10 台 Worker 節點，突然發生大規模網路故障，所有節點同時顯示 NotReady。若沒有 Circuit Breaker，MHC 會嘗試刪除全部 10 台並重建，這可能讓服務完全中斷。Circuit Breaker（maxUnhealthy）的目的是：當不健康節點超過閾值時，停止自動修復，避免「治療比疾病更嚴重」的情況。此時 MHC 保持現狀等待人工介入，而不是持續刪除節點讓情況更糟。
+</Callout>
 
 ## 預設 Remediation 策略（刪除 Machine）
 
@@ -243,3 +254,23 @@ spec:
 - 建議為 Control Plane 和 Worker 分別建立不同的 MHC，設定不同的 `maxUnhealthy` 策略
 
 </Callout>
+
+> 💡 **思考一下**：MachineHealthCheck 的 `nodeStartupTimeout` 設計成「新節點在這個時間內若未出現 Node 物件則觸發修復」。如果叢集整體 API Server 過載導致所有新節點都無法及時加入，這個設計會帶來什麼風險？CAPI 的 fail-safe 機制如何緩解這個問題？
+
+---
+
+## 常見誤解
+
+<Callout type="warning" title="常見誤解澄清">
+1. **「MHC 能監控 Pod 的健康狀態」** — 錯誤。MHC 只監控 Kubernetes Node 物件的 Conditions（如 `Ready`、`MemoryPressure`），不感知 Pod 層面的狀態。如果 Pod crash 但 Node 本身仍然 Ready，MHC 不會觸發任何修復動作。
+2. **「設定 maxUnhealthy: "100%" 代表永遠不觸發 Circuit Breaker」** — 這是合法設定，但高度危險。`maxUnhealthy: "100%"` 意味著所有節點都不健康時仍然繼續 remediation，在大規模故障時可能造成大量 Machine 被同時刪除重建，加劇服務中斷。
+3. **「remediationTemplate 設定後就不再使用預設的刪除策略」** — 正確，但需確保外部 Remediation Provider 能正常運作。若 remediationTemplate 指向的 Provider 無法建立 remediation 物件，該不健康節點將持續保持不健康狀態，不會 fallback 到刪除 Machine 的預設行為。
+</Callout>
+
+---
+
+## 延伸閱讀
+
+- [Machine 生命週期](/cluster-api/features/machine-lifecycle) — Machine 刪除流程（MHC 觸發的 remediation 最終執行的步驟）
+- [Core Controller 詳解](/cluster-api/features/controller-core) — MachineHealthCheckReconciler 的協調邏輯
+- [Cluster 與 Machine API](/cluster-api/features/api-cluster-machine) — Machine Status Conditions 欄位說明

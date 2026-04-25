@@ -15,6 +15,13 @@ title: Cluster API — Core Controller 詳解
 
 </Callout>
 
+<Callout type="tip" title="本文適用對象">
+- 🟢 **初學者**：建議先閱讀架構概覽再來看此頁，了解各 Controller 在整體架構中的位置
+- 🟡 **中階工程師**：重點理解各 Reconcile 流程的責任邊界，以及 ClusterCache 的必要性
+- 🔴 **資深工程師**：深入研究 ClusterCache 連線管理設計與 Finalizer 模式的正確用法
+</Callout>
+
+> 🧑‍💻 **類比**：Core Controller 就像「自動化值班人員」— 他們 24 小時不間斷地監看系統狀態，一旦發現現實（actual state）與預期（desired state）不符，立刻採取行動讓兩者一致。每位值班人員（Controller）只負責自己那塊職責：ClusterReconciler 管叢集層面，MachineReconciler 管單台機器，MachineSetReconciler 確保機器數量正確 — 各司其職，互不干擾。
 
 ## Core Controller 概覽
 
@@ -133,6 +140,10 @@ metadata:
 
 ---
 
+<Callout type="tip" title="新手提示：Reconcile Loop 是什麼？">
+Reconcile Loop（協調循環）是 Kubernetes Controller 的核心概念。每個 Controller 持續「觀察現實狀態，比對期望狀態，採取行動讓兩者一致」。當你修改一個 YAML 設定，Controller 就會被觸發執行 Reconcile，嘗試讓現實符合新設定。如果執行失敗（例如資源暫時不足），Controller 會自動重試，直到成功為止 — 這就是 Kubernetes「最終一致性」的核心機制。
+</Callout>
+
 ## MachineSetReconciler 詳解
 
 `MachineSetReconciler` 確保 workload cluster 中始終運行指定數量的 Machine，類似 Kubernetes 原生的 ReplicaSet。
@@ -228,3 +239,23 @@ CAPI core controllers 在 management cluster 運行，但需要存取 workload c
 ClusterCache 是 CAPI v1.4+ 引入的重構，取代舊的 RemoteClusterCache，提供更好的連線管理和錯誤處理。新版本支援更精細的健康狀態回報，並改善了在 workload cluster 暫時失聯時的行為。
 
 </Callout>
+
+> 💡 **思考一下**：CAPI 的 MachineReconciler 在刪除 Machine 時需要 Cordon → Drain → Volume Detach。但這些操作需要連接到 workload cluster 的 API Server。如果 workload cluster API Server 暫時不可用，刪除流程會如何處理？Controller 有哪些機制來應對這種情況？
+
+---
+
+## 常見誤解
+
+<Callout type="warning" title="常見誤解澄清">
+1. **「ClusterReconciler 負責建立所有子資源（KCP、MachineDeployment）」** — 錯誤。ClusterReconciler 只協調 Cluster 本身的狀態（等待 InfraCluster ready、等待 ControlPlane ready），實際建立 KCP 或 MachineDeployment 是由使用者透過 YAML 或 Topology Controller 完成的，ClusterReconciler 不主動建立這些資源。
+2. **「MachineSetReconciler 在擴縮容時會立即建立/刪除所有差異數量的 Machine」** — 不完全正確。MachineSetReconciler 在每次 reconcile 中只處理部分差異（受 `concurrentReconciles` 限制），且刪除時會根據 `deletePolicy` 選擇特定 Machine，不是隨機批量操作。
+3. **「ClusterCache 連線失敗後 reconcile 就會永遠停止」** — 錯誤。ClusterCache 採用 exponential backoff 重試機制，連線失敗後會以遞增的間隔重新嘗試建立連線。一旦恢復連線，相關 Controller 的 reconcile 會自動繼續。
+</Callout>
+
+---
+
+## 延伸閱讀
+
+- [CAPI 架構概覽](/cluster-api/features/architecture) — Manager 架構與事件驅動機制
+- [KCP Controller 詳解](/cluster-api/features/controller-kcp) — Control Plane 的 Reconcile 流程
+- [Machine 生命週期](/cluster-api/features/machine-lifecycle) — Machine 完整刪除流程（含 Drain、Hook 機制）

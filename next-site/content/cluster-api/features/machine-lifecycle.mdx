@@ -15,6 +15,13 @@ title: Cluster API — Machine 生命週期
 
 </Callout>
 
+<Callout type="tip" title="本文適用對象">
+- 🟢 **初學者**：理解 Machine Phase 狀態機 — 掌握機器從建立到刪除的七個階段
+- 🟡 **中階工程師**：重點理解刪除 Hook 機制（pre-drain / pre-terminate）與 PDB 的交互作用
+- 🔴 **資深工程師**：深入研究 ProviderID 不可變性設計與多版本升級的約束條件
+</Callout>
+
+> 🔄 **類比**：Machine 的生命週期就像一位「外派員工的工作旅程」— 從收到派遣通知（Pending）、準備出發（Provisioning）、抵達目的地上班（Running），到最後任務結束的離職程序（Deleting）。離職程序特別嚴謹：要先完成交接（Pre-drain Hook）、結束手上工作（Drain）、歸還設備（Volume Detach）、最後告知相關系統（Pre-terminate Hook）才能正式離職，確保不影響團隊運作。
 
 ## Machine 生命週期概覽
 
@@ -119,6 +126,10 @@ MachineReconciler 透過 ClusterCache 對 workload cluster 中對應的 Node 執
 - 新的 Pod 不再排程到此節點，確保後續 drain 的影響範圍可控
 
 ---
+
+<Callout type="tip" title="新手提示：為什麼刪除要這麼多步驟？">
+Machine 的刪除流程（8 個步驟）看起來很複雜，但每一步都有其必要性：Cordon 確保不再有新工作分配到這台節點；Drain 讓現有工作優雅地遷移到其他節點（遵守 PDB）；Volume Detach 保護有狀態應用的資料；最後才真正刪除機器。這些步驟合在一起，確保服務在節點被移除時不會有任何中斷或資料遺失。
+</Callout>
 
 ### Step 3 — Drain（驅逐 Pods）
 
@@ -269,3 +280,23 @@ CAPI 建議嚴格遵守以下升級原則，違反可能導致叢集不穩定：
 違反版本順序可能導致 API 相容性問題，造成 workload cluster 控制面不穩定。
 
 </Callout>
+
+> 💡 **思考一下**：Machine 的 `ProviderID` 設計成「一旦設定即不可變更」。這個不可變性保護的是什麼？如果 ProviderID 可以被修改，對 Controller 的 reconcile 邏輯和節點身份識別會造成什麼問題？
+
+---
+
+## 常見誤解
+
+<Callout type="warning" title="常見誤解澄清">
+1. **「Machine Phase 是 CAPI 完整管理叢集生命週期的唯一指標」** — 不完全正確。Machine Phase（Pending/Provisioning/Running/Deleting/Failed）是粗粒度的狀態描述，詳細的中間狀態需要查看 Machine 的 `status.conditions`（如 `BootstrapReady`、`InfrastructureReady`）才能了解目前卡在哪個環節。
+2. **「Drain 完成後節點資料就已安全」** — 需要額外確認。Drain 只確保 Pod 已遷移（驅逐），但若有使用 PersistentVolume，還需等待 `VolumeAttachments` 完全 detach（Machine 刪除流程的 Step 5）才能確保磁碟資料安全，否則新節點掛載同一份磁碟時可能發生衝突。
+3. **「設定了 pre-drain hook 就能無限延遲節點刪除」** — 不正確。CAPI 的 hook 機制有超時保護（`nodeDrainTimeout`），超過設定時間後 Controller 會強制繼續刪除流程，不會因為 hook 未回應而永久卡住。
+</Callout>
+
+---
+
+## 延伸閱讀
+
+- [Cluster 與 Machine API](/cluster-api/features/api-cluster-machine) — Machine Spec/Status 欄位說明
+- [Core Controller 詳解](/cluster-api/features/controller-core) — MachineReconciler 的刪除流程實作
+- [MachineHealthCheck](/cluster-api/features/machine-health-check) — 自動偵測不健康節點並觸發刪除修復

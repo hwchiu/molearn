@@ -15,10 +15,29 @@ title: Metal3 Provider — Remediation 機制
 
 </Callout>
 
+<Callout type="tip" title="本文適用對象">
+
+- 🟢 **初學者**：了解「為什麼裸機的自動修復需要特別處理」是本頁核心，先看類比說明
+- 🟡 **中階工程師**：重點關注 Metal3RemediationTemplate、MachineHealthCheck 整合方式
+- 🔴 **資深工程師**：深入理解 Reboot 流程的 out-of-service taint 與 retryLimit 設計
+
+</Callout>
+
 
 ---
 
 ## 什麼是 Remediation
+
+<Callout type="info" title="概念類比：手機故障的兩種修法">
+
+當你的手機出現問題時，你有兩種選擇：
+
+- **重啟手機**（Metal3 Reboot 策略）：問題可能是軟體暫時卡住，重開機 1–2 分鐘就好，資料都在
+- **送修換新機**（CAPI 預設刪除重建）：把手機送去維修、清空、重新設定——對裸機來說就是重新 provision，要 30–60 分鐘
+
+金融機構的裸機節點不可能每次故障都等 60 分鐘修復，Metal3 的 Reboot 策略讓你先試「重啟」，只有重啟失敗才走「換新機」流程。
+
+</Callout>
 
 **Remediation（自動修復）** 是指當叢集中的節點出現問題時（例如持續 `NotReady`、長期不健康），Cluster API（CAPI）提供的自動修復機制，讓運維人員不需手動介入即可恢復節點健康狀態。
 
@@ -210,3 +229,31 @@ spec:
 這些清理動作確保節點在重啟後能無縫重新融入叢集，不影響正常的 workload 排程。
 
 </Callout>
+
+---
+
+## 常見誤解與注意事項
+
+<Callout type="warning" title="常見誤解">
+
+**誤解 1：「Metal3 Remediation 完全取代 CAPI 的 MachineHealthCheck」**
+→ 不對。Metal3Remediation 是由 CAPI 的 MachineHealthCheck 觸發的，兩者是**協同關係**。MachineHealthCheck 負責偵測不健康節點，Metal3RemediationTemplate 告訴 CAPI 用 Metal3 的 Reboot 策略修復。
+
+**誤解 2：「Reboot 策略一定有效，不需要設定 retryLimit」**
+→ 硬體層級故障（磁碟損壞、記憶體錯誤）重啟無法修復。`retryLimit` 確保在多次嘗試失敗後，自動降級為刪除重建策略，避免無限重試。建議設定 `retryLimit: 3` 作為安全網。
+
+**誤解 3：「Remediation 發生時節點 Pod 會立即被驅逐」**
+→ 不一定。加上 `node.kubernetes.io/out-of-service` taint 後，StatefulSet 的 Pod 才會被強制重新排程。沒有此 taint 的情況下，Pod 可能繼續卡在 Terminating 狀態。
+
+**誤解 4：「Metal3Remediation 物件可以手動刪除」**
+→ 不建議在修復進行中手動刪除 Metal3Remediation，可能導致狀態不一致（例如 BMH 已在 reboot 中但 controller 失去追蹤）。應讓 controller 完成修復流程後自動刪除。
+
+</Callout>
+
+---
+
+## 延伸閱讀
+
+- [BMH 生命週期](./bmh-lifecycle.md) — Reboot 時 BMH 狀態如何變化
+- [Node Reuse](./node-reuse.md) — 另一個避免完整 reprovisioning 的機制
+- [機器層級 CRD](./crds-machine.md) — Metal3MachineTemplate 的 remediationStrategy 設定

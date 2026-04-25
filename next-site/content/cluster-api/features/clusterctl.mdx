@@ -14,6 +14,13 @@ title: Cluster API — clusterctl 操作指南
 
 </Callout>
 
+<Callout type="tip" title="本文適用對象">
+- 🟢 **初學者**：從 `clusterctl init` 開始，這是安裝 CAPI Provider 的第一步
+- 🟡 **中階工程師**：重點掌握 `clusterctl move`（pivot 流程）與升級 Provider 的操作順序
+- 🔴 **資深工程師**：深入研究離線（air-gapped）安裝方式與自定義 Provider URL 設定
+</Callout>
+
+> 🎛️ **類比**：clusterctl 是 CAPI 的「維運駕駛艙」— 就像飛機駕駛艙中有各種儀表板和控制桿，`kubectl` 負責操控工作叢集內部的應用程式，而 `clusterctl` 則是操控叢集本身的生命週期。安裝 Provider、建立叢集、搬移管理權、升級版本，這些「叢集級別的操作」都透過 clusterctl 這個駕駛艙來執行，讓維運人員有清晰的控制界面。
 
 ## clusterctl 是什麼
 
@@ -132,6 +139,10 @@ clusterctl generate cluster my-cluster \
 ```
 
 ---
+
+<Callout type="tip" title="新手提示：clusterctl vs kubectl 的使用場景">
+`kubectl` 操作的是 Kubernetes 資源物件（Pod、Service、Deployment），`clusterctl` 操作的是 CAPI 的管理層面（Provider 安裝、叢集搬移、Provider 升級）。平時運維 workload cluster 的應用程式用 `kubectl`；安裝或升級 CAPI 本身、搬移管理叢集等「叢集基礎設施管理」操作才使用 `clusterctl`。
+</Callout>
 
 ## clusterctl describe cluster — 查看叢集狀態
 
@@ -282,3 +293,23 @@ clusterctl generate cluster my-cluster \
   --infrastructure metal3 \
   --list-variables
 ```
+
+> 💡 **思考一下**：`clusterctl move` 在搬移叢集管理權時，為什麼需要「先 Pause 來源叢集、複製資源到目標叢集、再 Resume」這樣的三段式操作？如果省略 Pause 步驟直接複製資源，可能發生什麼問題？
+
+---
+
+## 常見誤解
+
+<Callout type="warning" title="常見誤解澄清">
+1. **「clusterctl init 只需要執行一次」** — 不完全正確。每次新增 Provider 或升級 Provider 版本都需要再次執行（`clusterctl upgrade apply` 或重新 `clusterctl init`）。此外，在 air-gapped 環境中還需要額外設定 custom image repository。
+2. **「clusterctl generate cluster 會直接建立叢集」** — 錯誤。`clusterctl generate cluster` 只是**產生 YAML manifest**，並輸出到 stdout。你還需要把這份 YAML 透過 `kubectl apply` 套用到 management cluster，才會真正觸發叢集建立流程。
+3. **「clusterctl move 可以在任何時候執行」** — 不正確。`clusterctl move` 有前置條件：目標 management cluster 必須已安裝相同的 CAPI Provider，且版本相容。另外，如果叢集處於升級進行中狀態時搬移，可能造成 reconcile 狀態不一致。
+</Callout>
+
+---
+
+## 延伸閱讀
+
+- [CAPI 架構概覽](/cluster-api/features/architecture) — CAPI Provider 的種類與設計
+- [ClusterClass 與 Topology](/cluster-api/features/clusterclass-topology) — 使用 `clusterctl generate cluster --topology` 產生 Topology 叢集
+- [Controller Core 詳解](/cluster-api/features/controller-core) — management cluster 中各 Controller 的運作方式

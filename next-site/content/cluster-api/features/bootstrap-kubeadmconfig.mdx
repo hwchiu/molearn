@@ -14,6 +14,13 @@ title: Cluster API — Bootstrap KubeadmConfig
 
 </Callout>
 
+<Callout type="tip" title="本文適用對象">
+- 🟢 **初學者**：理解 Bootstrap Data 是什麼 — 節點啟動時需要的「開機設定包」，告訴節點如何加入叢集
+- 🟡 **中階工程師**：重點比較 InitConfiguration（第一台 CP）與 JoinConfiguration（後續節點）的差異
+- 🔴 **資深工程師**：深入研究 Ignition 格式支援與替代 Bootstrap Provider 的整合方式
+</Callout>
+
+> 📱 **類比**：Bootstrap Data 就像新手機的「開箱設定精靈」— 手機出廠時是白板，第一次開機時精靈會引導你設定語言、網路、帳號（對應 cloud-init 執行 kubeadm init/join）。KubeadmConfig 就是這份設定精靈的「腳本」，Infrastructure Provider 在建立機器時將這份腳本注入機器，確保節點啟動後自動完成所有 Kubernetes 初始化步驟。
 
 ## Bootstrap Provider 概念
 
@@ -189,6 +196,10 @@ CABPK Controller 負責監聽 KubeadmConfig 物件，並依序完成以下步驟
 - Machine 的 `spec.bootstrap.configRef` 指向 KubeadmConfig
 - CABPK Controller watch 所有 KubeadmConfig 物件，偵測到新建或未就緒的物件後開始處理
 
+<Callout type="tip" title="新手提示：Bootstrap Data 是什麼格式？">
+Bootstrap Data 本質上是一段「開機腳本」，格式通常是 **cloud-init**（cloud-config 格式）。當 Infrastructure Provider 建立一台新 VM 或裸機時，會把這段腳本作為 `user-data` 注入機器。機器第一次開機時，cloud-init 程式會自動執行這段腳本，安裝 containerd、kubelet，並執行 `kubeadm init` 或 `kubeadm join` 將節點加入 Kubernetes 叢集。整個過程完全自動，無需人工介入。
+</Callout>
+
 ### Step 2 — 等待必要資訊就緒
 
 - 等待 `Cluster.Status.InfrastructureReady = true`
@@ -235,3 +246,23 @@ spec:
 - `files` 欄位的語法與 cloud-init 略有不同，部分子欄位（如 `encoding`）的處理方式有差異
 - Ignition 的 `users` 和 `ntp` 設定也會轉換為對應的 Ignition 規格
 - 在 Metal3 環境中，BMH（BareMetalHost）支援透過 live-ISO 或 virtual media 方式注入 Ignition 設定，適合無狀態、不可變的裸機節點管理場景
+
+> 💡 **思考一下**：Bootstrap Data 只能被使用一次（一次性 Secret）。如果機器開機失敗需要重試，CAPI 是如何處理的？為什麼不直接讓機器重新讀取同一份 Secret？
+
+---
+
+## 常見誤解
+
+<Callout type="warning" title="常見誤解澄清">
+1. **「Bootstrap Data 就是 kubeadm 的設定檔」** — 不完全正確。Bootstrap Data 是一個完整的「開機初始化腳本」，通常以 cloud-init 格式呈現，其中**包含** kubeadm 設定（`kubeadm-config.yaml`），但還包含安裝 containerd、kubelet、設定 NTP、建立使用者等許多其他步驟，遠比單純的 kubeadm 設定豐富。
+2. **「KubeadmConfig 和 KubeadmConfigTemplate 功能完全相同」** — 有差別。`KubeadmConfig` 是一次性物件（1 對 1 對應一台 Machine），`KubeadmConfigTemplate` 是可重用的範本（1 對多），由 MachineSet 或 MachineDeployment 管理，每次建立新 Machine 時都會從 Template 複製出一個新的 KubeadmConfig。
+3. **「Bootstrap Provider 可以省略」** — 不正確。每台 Machine 的節點初始化都需要 Bootstrap Data。若不使用 CABPK，也必須提供其他 Bootstrap Provider（或自定義機制），否則節點永遠無法加入叢集。
+</Callout>
+
+---
+
+## 延伸閱讀
+
+- [KubeadmControlPlane API](/cluster-api/features/api-kubeadm-controlplane) — `kubeadmConfigSpec` 在 Control Plane 的完整設定
+- [Machine 生命週期](/cluster-api/features/machine-lifecycle) — Bootstrap Data 在哪個 Phase 被消費
+- [CAPI 架構概覽](/cluster-api/features/architecture) — Bootstrap Provider 在整體架構中的角色

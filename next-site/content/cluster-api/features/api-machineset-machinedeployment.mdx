@@ -14,6 +14,13 @@ title: Cluster API — MachineSet 與 MachineDeployment
 
 </Callout>
 
+<Callout type="tip" title="本文適用對象">
+- 🟢 **初學者**：理解 MachineSet 與 MachineDeployment 的層級關係，就像 Kubernetes 的 ReplicaSet 與 Deployment
+- 🟡 **中階工程師**：掌握 Rolling Update 策略與 maxUnavailable / maxSurge 的交互作用
+- 🔴 **資深工程師**：深入研究 MachineDeployment 不可變欄位（clusterName）與 ownerReference 串接的 GC 行為
+</Callout>
+
+> 🏢 **類比**：MachineDeployment 就像公司的「人力資源部門策略」，MachineSet 是具體執行這個策略的「用人小組」，而 Machine 則是每一位實際在職的「員工」。當策略更新（版本升級）時，部門不會立刻解雇所有舊員工，而是先招募新員工培訓（建立新 MachineSet），新員工上線後再逐步讓舊員工離職（縮減舊 MachineSet），確保服務不中斷。
 
 ## MachineSet
 
@@ -77,6 +84,10 @@ spec:
         kind: AWSMachineTemplate
         name: my-cluster-workers
 ```
+
+<Callout type="tip" title="新手提示：MachineSet 和 MachineDeployment 的選擇">
+大多數情況下應使用 MachineDeployment 而非直接使用 MachineSet。MachineDeployment 提供滾動更新能力 — 當你修改節點版本或硬體規格時，它會自動管理新舊 MachineSet 的切換，確保服務不中斷。只有在非常特殊的靜態節點場景（不需要版本升級）才考慮直接使用 MachineSet。
+</Callout>
 
 ### deletePolicy 說明
 
@@ -224,3 +235,23 @@ MachineDeployment → MachineSet → Machine → Node
 若要保留某台 Machine 不被 MachineSet 刪除（例如需要手動維護），需移除該 Machine 上的 `cluster.x-k8s.io/set-name` label，使其脫離 MachineSet 的管轄範圍。
 
 </Callout>
+
+> 💡 **思考一下**：MachineDeployment 的 Rolling Update 中，為什麼「先建立新 Machine，確認就緒後再刪除舊 Machine」（surge 策略）比「先刪除舊 Machine 再建立新 Machine」更安全？在什麼場景下你會希望使用相反的順序？
+
+---
+
+## 常見誤解
+
+<Callout type="warning" title="常見誤解澄清">
+1. **「修改 MachineDeployment 的 spec 欄位後，現有 Machine 會立即被替換」** — 不一定。只有「不可變欄位」（如 `infrastructure.ref`、`bootstrap.ref`）的變更才會觸發滾動更新。修改 `replicas` 只是擴縮容，不會替換現有 Machine。
+2. **「MachineSet 和 ReplicaSet 的行為完全相同」** — 有差異。MachineSet 在刪除機器時有 `deletePolicy`（Newest/Oldest/Random）設定，而 Kubernetes ReplicaSet 刪除 Pod 時只考慮排程分佈，概念不同。另外，MachineSet 還涉及跨可用區的 Failure Domain 分散邏輯。
+3. **「直接刪除 MachineDeployment 下的 Machine 會讓 MachineDeployment 自動縮容」** — 錯誤。MachineDeployment 在偵測到 Machine 數量不足時，會**建立新的 Machine** 以維持期望副本數，而非縮容。若想真正縮容，應減少 `spec.replicas`。
+</Callout>
+
+---
+
+## 延伸閱讀
+
+- [Machine 生命週期](/cluster-api/features/machine-lifecycle) — Machine Phase 狀態機與刪除流程
+- [Core Controller 詳解](/cluster-api/features/controller-core) — MachineSetReconciler 的 Reconcile 邏輯
+- [ClusterClass 與 Topology](/cluster-api/features/clusterclass-topology) — 使用 ClusterClass 統一管理 MachineDeployment 設定

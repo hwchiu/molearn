@@ -15,6 +15,14 @@ title: Metal3 Provider — 進階功能
 
 </Callout>
 
+<Callout type="tip" title="本文適用對象">
+
+- 🟢 **初學者**：本頁內容較進階，建議先閱讀架構概覽、BMH 生命週期、IPAM 整合後再回來
+- 🟡 **中階工程師**：重點關注 ClusterClass 整合與多叢集隔離的設計思路
+- 🔴 **資深工程師**：深入理解 Pivot 操作流程與 Controller Manager 調校參數
+
+</Callout>
+
 
 本頁涵蓋 Metal3 Provider 的進階功能，包括 ClusterClass 整合、多叢集隔離、Pivot 操作以及 Controller Manager 調校等主題。
 
@@ -240,3 +248,33 @@ kubectl patch deployment capm3-controller-manager \
   --type=json \
   -p='[{"op":"add","path":"/spec/template/spec/containers/0/args/-","value":"--watchAllNamespaces=true"}]'
 ```
+
+---
+
+## 常見誤解與注意事項
+
+<Callout type="warning" title="常見誤解">
+
+**誤解 1：「ClusterClass 只是 YAML 模板，不需要特別處理」**
+→ ClusterClass 引入了 **topology 控制器**，它會動態 patch 由 ClusterClass 產生的物件。若直接修改由 ClusterClass 產生的 Metal3Cluster/Metal3Machine，修改可能被 topology 控制器覆蓋。需透過 ClusterClass variables 或 patches 正式修改。
+
+**誤解 2：「Pivot 只是把 controller 從 bootstrap cluster 搬到 workload cluster」**
+→ Pivot 是複雜的狀態遷移操作，包括 CRD 安裝、物件複製、owner reference 調整、provider 組件安裝等多個步驟。Pivot 失敗可能導致 object 孤立（orphaned）。必須在 Pivot 前後執行健康檢查，並備份所有 CAPI 物件。
+
+**誤解 3：「watchAllNamespaces=true 在小型叢集中效能影響不大」**
+→ 監控所有 namespace 會讓 controller 的 informer 快取大幅增長，在有大量 namespace 的叢集中可能導致記憶體壓力。除非有明確需求（如多租戶共用管理叢集），否則建議保持預設值。
+
+**誤解 4：「MachinePool 和 MachineDeployment 功能相同，只是命名不同」**
+→ 兩者架構不同。MachineDeployment 是 1:1 管理（一個 Machine 對應一台裸機），MachinePool 是批量管理模式，適合同質化的大規模節點群。Metal3 的 MachinePool 支援仍處於實驗性階段。
+
+</Callout>
+
+---
+
+## 延伸閱讀
+
+- [架構概覽](./architecture.md) — 理解各元件職責後再看進階功能
+- [IPAM 整合](./ipam.md) — ClusterClass 變數化 IP 配置
+- [Node Reuse](./node-reuse.md) — 進階升級策略與 ClusterClass 結合
+- [CAPI ClusterClass 官方文件](https://cluster-api.sigs.k8s.io/tasks/experimental-features/cluster-class/index.html) — ClusterClass topology feature 詳細說明
+- [clusterctl move](https://cluster-api.sigs.k8s.io/clusterctl/commands/move.html) — Pivot 操作的官方工具說明
