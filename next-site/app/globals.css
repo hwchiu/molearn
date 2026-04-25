@@ -65,3 +65,35 @@ body {
 
 .react-flow__background { fill: var(--background) !important; }
 .react-flow__edge-path { stroke: var(--border) !important; }
+
+/* Shiki / rehype-pretty-code syntax highlighting */
+.prose-content [data-rehype-pretty-code-figure] {
+  margin-bottom: 1rem;
+  position: relative;
+}
+.prose-content [data-rehype-pretty-code-figure] pre {
+  margin: 0;
+  padding: 1rem;
+  border-radius: 0.5rem;
+  overflow-x: auto;
+  border: 1px solid var(--border);
+  font-size: 0.875rem;
+  line-height: 1.6;
+}
+.prose-content [data-rehype-pretty-code-figure] code {
+  background: none;
+  color: inherit;
+  padding: 0;
+  border-radius: 0;
+  font-size: inherit;
+  font-family: 'JetBrains Mono', 'Fira Code', ui-monospace, monospace;
+}
+/* Highlighted lines */
+.prose-content [data-highlighted-line] {
+  background: rgba(47, 129, 247, 0.1);
+  border-left: 2px solid #2f81f7;
+  padding-left: calc(1rem - 2px);
+  margin-left: -1rem;
+  padding-right: 1rem;
+  margin-right: -1rem;
+}

@@ -8,6 +8,7 @@ import Link from 'next/link'
 import { ChevronLeft, ChevronRight } from 'lucide-react'
 import remarkGfm from 'remark-gfm'
 import rehypeSlug from 'rehype-slug'
+import rehypePrettyCode from 'rehype-pretty-code'
 import { extractHeadings } from '@/lib/extract-headings'
 import { TableOfContents } from '@/components/TableOfContents'
 
@@ -58,7 +59,15 @@ export default async function FeaturePage({ params }: { params: { project: strin
             <MDXRemote
               source={content}
               components={MDX_COMPONENTS as any}
-              options={{ mdxOptions: { remarkPlugins: [remarkGfm], rehypePlugins: [rehypeSlug] } }}
+              options={{
+                mdxOptions: {
+                  remarkPlugins: [remarkGfm],
+                  rehypePlugins: [
+                    [rehypePrettyCode, { theme: 'github-dark', keepBackground: true }] as any,
+                    rehypeSlug,
+                  ],
+                },
+              }}
             />
           </div>
 

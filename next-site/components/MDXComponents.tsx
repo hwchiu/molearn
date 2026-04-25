@@ -26,8 +26,28 @@ export const MDX_COMPONENTS = {
   ul: (props: any) => <ul className="list-disc pl-6 mb-4 space-y-1 text-[#e6edf3]" {...props} />,
   ol: (props: any) => <ol className="list-decimal pl-6 mb-4 space-y-1 text-[#e6edf3]" {...props} />,
   li: (props: any) => <li className="leading-7" {...props} />,
-  code: (props: any) => <code className="bg-[#21262d] text-[#e3b341] px-1.5 py-0.5 rounded text-sm font-mono" {...props} />,
-  pre: (props: any) => <pre className="bg-[#161b22] rounded-lg overflow-x-auto mb-4 p-4" {...props} />,
+  // Inline code (no data-language = not a fenced block)
+  code: ({ children, className, 'data-language': dataLanguage, ...props }: any) => {
+    if (dataLanguage) {
+      // Inside a fenced block — rehype-pretty-code already highlighted it
+      return <code className={className} {...props}>{children}</code>
+    }
+    return <code className="bg-[#21262d] text-[#e3b341] px-1.5 py-0.5 rounded text-sm font-mono" {...props}>{children}</code>
+  },
+  // Fenced code blocks — show a language badge in top-right
+  pre: ({ children, 'data-language': language, ...props }: any) => (
+    <div className="relative mb-4">
+      {language && (
+        <span className="absolute top-2 right-3 text-[10px] font-mono uppercase tracking-widest text-[#6e7681] select-none z-10">
+          {language}
+        </span>
+      )}
+      <pre
+        className="rounded-lg overflow-x-auto p-4 text-sm leading-relaxed border border-[#30363d]"
+        {...props}
+      >{children}</pre>
+    </div>
+  ),
   table: (props: any) => <div className="overflow-x-auto mb-4"><table className="w-full border-collapse text-sm" {...props} /></div>,
   th: (props: any) => <th className="bg-[#21262d] text-[#e6edf3] p-2 border border-[#30363d] text-left font-semibold" {...props} />,
   td: (props: any) => <td className="p-2 border border-[#30363d] text-[#8b949e]" {...props} />,
