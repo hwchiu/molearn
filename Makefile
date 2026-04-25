@@ -37,9 +37,9 @@ check-updates:
 	@git submodule foreach 'echo "📦 $$name: $$(git log --oneline -1)"'
 
 validate:
-@echo "🧪 執行網站驗證..."
-python3 scripts/validate.py
+	@echo "🧪 執行完整驗證（含 build）..."
+	python3 scripts/validate.py
 
-validate-build:
-@echo "🧪 執行完整驗證（含 build）..."
-python3 scripts/validate.py --build
+validate-quick:
+	@echo "🧪 快速驗證（不跑 build）..."
+	python3 scripts/validate.py --no-build

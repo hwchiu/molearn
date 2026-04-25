@@ -317,11 +317,11 @@ def main() -> None:
     check_feature_files()
     check_no_vitepress()
 
-    # Run build only if --build flag passed (slow)
-    if "--build" in sys.argv or "-b" in sys.argv:
-        check_build()
+    # Build runs by default. Use --no-build / -n to skip (e.g. in quick iteration loops)
+    if "--no-build" in sys.argv or "-n" in sys.argv:
+        print(f"\n  {WARN}  Skipping build check (--no-build flag passed)")
     else:
-        print(f"\n  {WARN}  Skipping build check (add --build to include)")
+        check_build()
 
     # Summary
     print(f"\n{BOLD}{'='*50}")

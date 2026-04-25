@@ -549,11 +549,11 @@ cd next-site && npm run dev
 ## Phase 5: Verification
 
 ```bash
-cd next-site
-npm run build
+# From repo root — runs ALL checks including build (mandatory)
+make validate
 ```
 
-The build must succeed with zero errors.
+**This must exit 0 before any commit.** Build failures here are bugs, not warnings.
 
 **Common build errors and fixes:**
 
@@ -562,9 +562,11 @@ The build must succeed with zero errors.
 | `Module not found` | MDX file references a component that isn't in MDX_COMPONENTS | Add it to MDXComponents.tsx |
 | `hydration mismatch` | Client component rendered differently on server | Check 'use client' directive |
 | `Cannot find module 'content/...'` | File doesn't exist at expected path | Create the missing .mdx file |
+| `Cannot find module './vendor-chunks/...js'` | Stale `.next` cache after dependency changes | `rm -rf next-site/.next && make validate` |
 | Broken link in ToC | Heading ID doesn't match ToC anchor | Check slugify output vs rehype-slug |
+| `Unhandled Runtime Error` in dev server | Stale `.next` cache after code changes | `rm -rf next-site/.next`, restart dev server |
 
-**After successful build, commit:**
+**After successful validation, commit:**
 
 ```bash
 git add next-site/content/{project-name}/ next-site/lib/projects.ts

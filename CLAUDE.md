@@ -127,14 +127,14 @@ make check-update-project PROJECT=cluster-api  # 單一專案差異分析
 
 ### 驗證 & 建置
 
-**每次 commit 前必須執行 `make validate`。**
+**每次 commit 前必須執行 `make validate`（含 build，約 30 秒）。**
 
 ```bash
-# 快速驗證（不跑 build，幾秒完成）
+# 完整驗證（含 Next.js build）— 預設，commit 前必跑
 make validate
 
-# 完整驗證（含 Next.js build，約 30 秒）
-make validate-build
+# 快速驗證（不跑 build，僅靜態檢查）— 只在快速迭代時使用
+make validate-quick
 ```
 
 `make validate` 自動檢查：
@@ -144,6 +144,12 @@ make validate-build
 - quiz.json 格式（id、answer 索引）
 - `projects.ts` 裡所有 slug 都有對應 MDX 檔
 - 無 VitePress 遺留產物
+- **Next.js build 必須 exit 0**（含 vendor chunks、TypeScript 型別）
+
+若 build 出現 `Cannot find module './vendor-chunks/...'`：
+```bash
+rm -rf next-site/.next && make validate
+```
 
 ---
 
