@@ -186,7 +186,7 @@ next-site/
 │   ├── projects.ts                    # Project registry (all metadata)
 │   ├── content-loader.ts              # Reads .mdx files from content/
 │   └── extract-headings.ts            # Parses headings for ToC
-├── next.config.js
+├── next.config.mjs
 ├── tailwind.config.ts
 ├── tsconfig.json
 └── postcss.config.js
@@ -214,6 +214,224 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
         {children}
       </body>
     </html>
+  )
+}
+```
+
+### `app/page.tsx` (Site Homepage)
+
+> This is the **site-wide homepage** (`/`). It renders a hero section, a CAPI ecosystem explainer, learning paths, and project cards. It does NOT use `SiteHeader` with a `currentProject` prop — the header renders without any active tab.
+
+```tsx
+import Link from 'next/link'
+import { SiteHeader } from '@/components/SiteHeader'
+import { PROJECTS, PROJECT_IDS } from '@/lib/projects'
+import { ExternalLink, BookOpen, Map, HelpCircle, ArrowRight } from 'lucide-react'
+
+const LEARNING_PATHS = [
+  {
+    level: '🟢 初學者',
+    title: '第一次接觸此生態系',
+    color: 'border-green-500/30 bg-green-500/5',
+    labelColor: 'text-green-400',
+    steps: [
+      { label: '① 從核心專案開始', desc: '理解宣告式管理的核心概念與架構設計' },
+      { label: '② 選擇一個延伸專案', desc: '了解 Provider 如何整合到核心框架' },
+      { label: '③ 完成互動測驗', desc: '測試你對各專案的理解，確認學習成果' },
+    ],
+  },
+  {
+    level: '🟡 中階工程師',
+    title: '已懂 Kubernetes，要深入原始碼',
+    color: 'border-yellow-500/30 bg-yellow-500/5',
+    labelColor: 'text-yellow-400',
+    steps: [
+      { label: '① 控制器解析', desc: '直接深入 Reconcile 邏輯、狀態機與 Provider 合約' },
+      { label: '② 實作對比', desc: '比較各 Provider 在相同合約下的不同設計決策' },
+      { label: '③ Edge case 分析', desc: '研究錯誤處理、冪等性、Finalizer 的處理方式' },
+    ],
+  },
+  {
+    level: '🔴 資深工程師',
+    title: '要深度貢獻或 debug',
+    color: 'border-red-500/30 bg-red-500/5',
+    labelColor: 'text-red-400',
+    steps: [
+      { label: '① 原始碼結構分析', desc: '從 code layout 到 interface 設計，理解可擴充性考量' },
+      { label: '② 跨元件追蹤流程', desc: '追蹤一個請求穿越所有控制器的完整路徑' },
+      { label: '③ 測驗挑戰模式', desc: '以進階題目驗證你對實作細節的掌握程度' },
+    ],
+  },
+]
+
+export default function HomePage() {
+  return (
+    <div className="min-h-screen flex flex-col">
+      <SiteHeader />
+      <main className="flex-1">
+        {/* Hero */}
+        <section className="px-6 py-24 max-w-5xl mx-auto text-center">
+          <h1 className="text-5xl md:text-6xl font-bold text-white mb-6 leading-tight tracking-tight">
+            深入 Kubernetes<br />
+            <span className="text-[#2f81f7]">基礎設施管理</span>
+          </h1>
+          <p className="text-xl text-[#8b949e] max-w-2xl mx-auto mb-10 leading-relaxed">
+            從功能視角出發，逐層深入原始碼。理解每個 Controller 的設計決策與實作細節。
+          </p>
+          <div className="flex items-center justify-center gap-4">
+            <Link href={`/${PROJECT_IDS[0]}`}
+              className="inline-flex items-center gap-2 px-6 py-3 rounded-lg bg-[#2f81f7] text-white font-semibold hover:bg-blue-600 transition-colors">
+              開始學習 <ArrowRight size={16} />
+            </Link>
+          </div>
+        </section>
+
+        {/* Learning Paths */}
+        <section className="px-6 pb-16 max-w-5xl mx-auto">
+          <h2 className="text-lg font-semibold text-[#8b949e] uppercase tracking-wider mb-6 text-center">學習路徑建議</h2>
+          <div className="grid grid-cols-1 md:grid-cols-3 gap-5">
+            {LEARNING_PATHS.map(lp => (
+              <div key={lp.level} className={`rounded-xl border p-5 ${lp.color}`}>
+                <div className={`text-sm font-bold mb-1 ${lp.labelColor}`}>{lp.level}</div>
+                <div className="text-xs text-[#8b949e] mb-4">{lp.title}</div>
+                <ol className="space-y-3">
+                  {lp.steps.map(step => (
+                    <li key={step.label}>
+                      <div className="text-xs font-semibold text-[#e6edf3] mb-0.5">{step.label}</div>
+                      <div className="text-xs text-[#8b949e] leading-relaxed">{step.desc}</div>
+                    </li>
+                  ))}
+                </ol>
+              </div>
+            ))}
+          </div>
+        </section>
+
+        {/* Projects */}
+        <section className="px-6 pb-24 max-w-5xl mx-auto">
+          <h2 className="text-lg font-semibold text-[#8b949e] uppercase tracking-wider mb-8 text-center">涵蓋專案</h2>
+          <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
+            {PROJECT_IDS.map(id => {
+              const proj = PROJECTS[id]
+              return (
+                <Link key={id} href={`/${id}`}
+                  className="group flex flex-col p-6 rounded-2xl border border-[#30363d] bg-[#161b22] hover:bg-[#21262d] transition-all duration-200">
+                  <h3 className="text-xl font-bold text-white mb-2 group-hover:text-[#2f81f7] transition-colors">
+                    {proj.name}
+                  </h3>
+                  <p className="text-sm text-[#8b949e] leading-relaxed flex-1 mb-4">
+                    {proj.description}
+                  </p>
+                  <div className="flex items-center gap-4 text-xs text-[#8b949e]">
+                    <span className="flex items-center gap-1"><Map size={11} /> 功能地圖</span>
+                    <span className="flex items-center gap-1"><BookOpen size={11} /> {proj.features.length} 功能</span>
+                    <span className="flex items-center gap-1"><HelpCircle size={11} /> 測驗</span>
+                  </div>
+                </Link>
+              )
+            })}
+          </div>
+        </section>
+      </main>
+    </div>
+  )
+}
+```
+
+### `app/[project]/page.tsx` (Project Landing Page)
+
+> This is the **per-project homepage** (`/{project}`). It renders: project header, problem statement, ProjectStory timeline, navigation cards (feature map / features / quiz), learning paths, and all features list.
+
+```tsx
+import Link from 'next/link'
+import { getProject, PROJECT_IDS } from '@/lib/projects'
+import { notFound } from 'next/navigation'
+import { ExternalLink, Map, BookOpen, HelpCircle, Lightbulb, ArrowRight } from 'lucide-react'
+import { ProjectStory } from '@/components/ProjectStory'
+
+export function generateStaticParams() {
+  return PROJECT_IDS.map(id => ({ project: id }))
+}
+
+const PATH_CONFIG = [
+  {
+    key: 'beginner' as const,
+    label: '🟢 初學者',
+    subtitle: '第一次接觸此專案',
+    borderColor: 'border-green-500/30',
+    bgColor: 'bg-green-500/5',
+    textColor: 'text-green-400',
+    dotColor: 'bg-green-400',
+  },
+  {
+    key: 'intermediate' as const,
+    label: '🟡 中階工程師',
+    subtitle: '已懂 Kubernetes，要學此專案',
+    borderColor: 'border-yellow-500/30',
+    bgColor: 'bg-yellow-500/5',
+    textColor: 'text-yellow-400',
+    dotColor: 'bg-yellow-400',
+  },
+  {
+    key: 'advanced' as const,
+    label: '🔴 資深工程師',
+    subtitle: '要深度貢獻或 debug',
+    borderColor: 'border-red-500/30',
+    bgColor: 'bg-red-500/5',
+    textColor: 'text-red-400',
+    dotColor: 'bg-red-400',
+  },
+]
+
+export default function ProjectPage({ params }: { params: { project: string } }) {
+  const project = getProject(params.project)
+  if (!project) notFound()
+
+  return (
+    <div className="max-w-4xl mx-auto px-8 py-10">
+      {/* Header */}
+      <div className="mb-8">
+        <h1 className="text-4xl font-bold text-white mb-3">{project.name}</h1>
+        <p className="text-lg text-[#8b949e] mb-4">{project.description}</p>
+        <a href={project.repoUrl} target="_blank" rel="noopener noreferrer"
+          className="inline-flex items-center gap-1.5 text-sm text-[#2f81f7] hover:underline">
+          <ExternalLink size={13} /> GitHub Repository
+        </a>
+      </div>
+
+      {/* Story */}
+      {project.story && <ProjectStory story={project.story} />}
+
+      {/* Navigation Cards */}
+      <div className="grid grid-cols-1 md:grid-cols-3 gap-4 mb-8">
+        <Link href={`/${project.id}/features/${project.features[0]}`}
+          className="flex flex-col gap-2 p-5 rounded-xl border border-[#30363d] bg-[#161b22] hover:border-[#2f81f7] transition-colors">
+          <BookOpen size={20} className="text-[#2f81f7]" />
+          <div className="font-semibold text-white">功能說明 ({project.features.length})</div>
+          <div className="text-sm text-[#8b949e]">深入解析每個功能模組的設計與原始碼</div>
+        </Link>
+        <Link href={`/${project.id}/quiz`}
+          className="flex flex-col gap-2 p-5 rounded-xl border border-[#30363d] bg-[#161b22] hover:border-[#2f81f7] transition-colors">
+          <HelpCircle size={20} className="text-[#2f81f7]" />
+          <div className="font-semibold text-white">互動測驗</div>
+          <div className="text-sm text-[#8b949e]">測試你對此專案的理解程度</div>
+        </Link>
+      </div>
+
+      {/* All Features */}
+      <div>
+        <h2 className="text-base font-semibold text-white mb-4">所有功能模組</h2>
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+          {project.features.map((slug, i) => (
+            <Link key={slug} href={`/${project.id}/features/${slug}`}
+              className="flex items-center gap-3 p-3 rounded-lg border border-[#30363d] hover:border-[#2f81f7] hover:bg-[#161b22] transition-colors">
+              <span className="text-xs font-mono text-[#8b949e] w-5">{String(i + 1).padStart(2, '0')}</span>
+              <span className="text-sm text-[#e6edf3]">{slug}</span>
+            </Link>
+          ))}
+        </div>
+      </div>
+    </div>
   )
 }
 ```
@@ -920,52 +1138,48 @@ export default async function FeaturePage({
 
 ### `app/[project]/quiz/page.tsx`
 
-```tsx
-'use client'
-import { useEffect, useState } from 'react'
-import { QuizQuestion } from '@/components/QuizQuestion'
+> ⚠️ **Server Component — reads `quiz.json` at build time via `readFileSync`.** Do NOT use `'use client'` + `fetch()` here — the `content/` directory is not a public URL in a static export, so runtime fetch would 404 on the deployed site.
 
-interface QuizItem {
-  question: string
-  options: string[]
-  answer: number
-  explanation: string
-  section?: string
+```tsx
+import { getProject, PROJECT_IDS } from '@/lib/projects'
+import { notFound } from 'next/navigation'
+import { QuizQuestion } from '@/components/QuizQuestion'
+import { existsSync, readFileSync } from 'fs'
+import path from 'path'
+
+export function generateStaticParams() {
+  return PROJECT_IDS.map(id => ({ project: id }))
 }
 
-// Dynamic import — quiz.json loaded at runtime since this is a client component
-export default function QuizPage({ params }: { params: { project: string } }) {
-  const [questions, setQuestions] = useState<QuizItem[]>([])
+export default async function QuizPage({ params }: { params: { project: string } }) {
+  const project = getProject(params.project)
+  if (!project) notFound()
 
-  useEffect(() => {
-    fetch(`/content/${params.project}/quiz.json`)
-      .then(r => r.json())
-      .then(setQuestions)
-      .catch(() => setQuestions([]))
-  }, [params.project])
-
-  // Group by section
-  const sections = questions.reduce((acc, q) => {
-    const key = q.section || '一般題目'
-    if (!acc[key]) acc[key] = []
-    acc[key].push(q)
-    return acc
-  }, {} as Record<string, QuizItem[]>)
+  const quizPath = path.join(process.cwd(), 'content', project.id, 'quiz.json')
+  let quiz: any[] = []
+  if (existsSync(quizPath)) {
+    quiz = JSON.parse(readFileSync(quizPath, 'utf-8'))
+  }
 
   return (
-    <div className="px-10 py-8 max-w-4xl">
-      <h1 className="text-3xl font-bold text-white mb-2">互動式測驗</h1>
-      <p className="text-[#8b949e] mb-8">共 {questions.length} 題，點選選項後立即查看結果。</p>
-      {Object.entries(sections).map(([sectionName, qs]) => (
-        <div key={sectionName} className="mb-12">
-          <h2 className="text-xl font-bold text-white mb-4 pb-2 border-b border-[#30363d]">
-            {sectionName}
-          </h2>
-          {qs.map((q, i) => (
-            <QuizQuestion key={i} {...q} />
+    <div className="max-w-3xl mx-auto px-8 py-10">
+      <h1 className="text-3xl font-bold text-white mb-2">{project.displayName} 測驗</h1>
+      <p className="text-[#8b949e] mb-8">測試你對 {project.shortName} 的理解程度</p>
+      {quiz.length === 0 ? (
+        <div className="text-[#8b949e]">測驗題目尚未建立</div>
+      ) : (
+        <div className="space-y-4">
+          {quiz.map((q: any, i: number) => (
+            <QuizQuestion
+              key={q.id || i}
+              question={`${i + 1}. ${q.question}`}
+              options={q.options}
+              answer={q.answer}
+              explanation={q.explanation}
+            />
           ))}
         </div>
-      ))}
+      )}
     </div>
   )
 }
@@ -973,7 +1187,9 @@ export default function QuizPage({ params }: { params: { project: string } }) {
 
 ---
 
-## next.config.js
+## next.config.mjs
+
+> ⚠️ **File must be named `next.config.mjs`** — `create-next-app@14` generates `.mjs` by default. If your file is named `next.config.js`, rename it.
 
 ```javascript
 /** @type {import('next').NextConfig} */
@@ -1207,7 +1423,7 @@ jobs:
 ### One-time GitHub repository setup
 
 1. Go to **Settings → Pages → Source** and select **GitHub Actions**.
-2. Update `basePath` and `assetPrefix` in `next.config.js` to match your repo name.
+2. Update `basePath` and `assetPrefix` in `next.config.mjs` to match your repo name.
 3. Push to `main` — the workflow will build and deploy automatically.
 
 ---

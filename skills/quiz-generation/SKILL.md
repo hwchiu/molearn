@@ -158,11 +158,13 @@ ls next-site/content/{project}/features/
 
 每道題按以下 JSON 格式輸出。**最終輸出必須是一個合法的 JSON 陣列，不要有任何其他文字。**
 
+> ⚠️ **不要在 `question` 欄位加題號（如「1. 」）**— quiz page 在渲染時會自動加上 `${i+1}. ` 前綴，手動加號碼會導致「1. 1. 題目…」的雙重編號。
+
 ```json
 [
   {
-    "section": "{分區名稱（含 emoji）}",
-    "question": "1. {題目文字}",
+    "id": 1,
+    "question": "{題目文字（不含題號）}",
     "options": [
       "{選項A}",
       "{選項B}",
@@ -173,19 +175,21 @@ ls next-site/content/{project}/features/
     "explanation": "{解釋為什麼此選項正確，其他選項為何錯誤}"
   },
   {
-    "section": "{分區名稱}",
-    "question": "2. {題目文字}",
-    ...
+    "id": 2,
+    "question": "{題目文字（不含題號）}",
+    "options": ["{選項A}", "{選項B}", "{選項C}", "{選項D}"],
+    "answer": 1,
+    "explanation": "..."
   }
 ]
 ```
 
 **JSON 規則：**
+- `id` 為整數，從 1 開始遞增（整個 quiz.json 全域唯一）
 - `answer` 是 0-indexed（第一個選項為 0，第四個為 3）
+- `question` **不含題號** — page.tsx 自動補上
 - 所有字串值內的雙引號用 `\"` 跳脫
 - 不要在陣列最後一個元素後加逗號
-- 題號從 1 開始，每個分區獨立計算
-```
 
 ---
 
@@ -243,8 +247,6 @@ with open('next-site/content/{project}/quiz.json', 'r') as f:
 
 issues = []
 for i, q in enumerate(questions):
-    if 'section' not in q:
-        issues.append(f"Question {i}: missing 'section'")
     if 'question' not in q:
         issues.append(f"Question {i}: missing 'question'")
     if 'options' not in q or len(q['options']) != 4:
@@ -259,11 +261,6 @@ if issues:
         print(f"ERROR: {issue}")
 else:
     print(f"✓ All {len(questions)} questions valid")
-    # Count by section
-    from collections import Counter
-    sections = Counter(q['section'] for q in questions)
-    for section, count in sections.items():
-        print(f"  {section}: {count} questions")
 ```
 
 ---
@@ -304,8 +301,8 @@ Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>"
 ```json
 [
   {
-    "section": "🏗️ 核心架構",
-    "question": "1. ClusterController 在協調 Cluster CR 時，建立 Infrastructure 物件的目的是什麼？",
+    "id": 1,
+    "question": "ClusterController 在協調 Cluster CR 時，建立 Infrastructure 物件的目的是什麼？",
     "options": [
       "在雲端或實體環境建立對應的基礎設施（VPC、機器等）",
       "產生 kubeconfig 讓工作節點加入叢集",
@@ -316,8 +313,8 @@ Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>"
     "explanation": "Infrastructure 物件（如 AWSCluster、MaasCluster）由對應的 Infrastructure Provider 實作，負責在底層環境建立實際的計算資源。kubeconfig 是由 ControlPlane 物件負責產生，TLS 和 etcd 管理也由 ControlPlane Provider 負責。"
   },
   {
-    "section": "🏗️ 核心架構",
-    "question": "2. ...",
+    "id": 2,
+    "question": "另一道題...",
     "options": ["...", "...", "...", "..."],
     "answer": 1,
     "explanation": "..."
@@ -326,9 +323,9 @@ Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>"
 ```
 
 **必須遵守：**
+- `id` 為整數，從 1 開始遞增（整個陣列全域唯一）
 - `answer` 是 0-indexed（0 = 選項A, 1 = 選項B, 2 = 選項C, 3 = 選項D）
-- `section` 每個分區內的所有題目使用完全相同的字串（含 emoji）
-- `question` 包含題號（從 1 開始，每個 section 重新計數）
+- `question` **不含題號** — quiz page 自動在渲染時補上 `${i+1}. ` 前綴
 - `explanation` 說明為何此選項正確，且指出其他選項錯誤的原因
 - 所有字串值使用合法的 JSON 跳脫（雙引號用 `\"`）
 
@@ -375,11 +372,11 @@ The `QuizQuestion` component is defined in `next-site/components/QuizQuestion.ts
 Props interface:
 ```typescript
 interface Props {
-  question: string     // Full question text including number prefix
+  question: string     // Full question text — page.tsx prepends "${i+1}. " automatically
   options: string[]    // Exactly 4 options
   answer: number       // 0-indexed correct answer index
   explanation: string  // Shown after user selects an answer
 }
 ```
 
-The quiz page groups questions by their `section` field and renders each group under a heading. See `skills/site-bootstrap/SKILL.md` for the full route source code.
+The quiz page renders all questions as a **flat list** in array order. Questions are numbered automatically (`1.`, `2.`, etc.) — do NOT include numbers in the `question` field. See `skills/site-bootstrap/SKILL.md` for the full route source code.

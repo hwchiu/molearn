@@ -86,6 +86,8 @@ Run all 5 explorations in parallel — they are independent.
 
 If you are using an AI tool that supports multiple parallel contexts (e.g., running multiple Copilot chats, or multiple Claude conversations), send each prompt in its own conversation simultaneously. If you must run them sequentially, that is fine — the prompts are independent.
 
+> **If your AI does not have filesystem access** (e.g., a plain web chat interface with no IDE integration): paste the file contents directly into the prompt. Suggested order: first paste `README.md` and `go.mod`, then each additional file listed in the exploration prompt. You don't need to paste everything at once — the AI will ask for more if needed. Cursor, VS Code Copilot, and Claude Code all have filesystem access and can read files directly.
+
 ---
 
 ### Exploration 1: Project Structure
