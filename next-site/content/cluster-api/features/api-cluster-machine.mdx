@@ -52,6 +52,43 @@ title: Cluster API — Cluster 與 Machine 核心資源
 | `infrastructureRef` | ObjectReference | Infrastructure Provider 資源引用（例如 Metal3Cluster）|
 | `topology` | Topology | ClusterClass 拓撲設定（ClusterTopology feature gate）|
 
+### 原始碼定義
+
+以下為 `ClusterSpec` 在原始碼中的實際 struct 定義（已略去 kubebuilder 標注），可以看出幾個關鍵設計選擇：
+
+- `ControlPlaneRef` 和 `InfrastructureRef` 均為 **指標型別**（`*corev1.ObjectReference`），允許為 `nil`，讓叢集在無 ControlPlane Provider 的情況下也能建立（例如匯入已存在的叢集）。
+- `Topology` 亦為指標，代表 ClusterClass 拓撲功能是**完全選擇性**的，不啟用時為 nil。
+- `AvailabilityGates` 機制讓第三方 Controller 能夠擴充叢集的「可用性」判斷條件，而不需要修改核心程式碼。
+
+```go
+// 原始碼: api/core/v1beta1/cluster_types.go
+type ClusterSpec struct {
+    // paused 用於暫停所有 Controller 對此 Cluster 的 reconcile。
+    Paused bool `json:"paused,omitempty"`
+
+    // clusterNetwork 代表叢集的網路設定（Pod/Service CIDR 等）。
+    ClusterNetwork *ClusterNetwork `json:"clusterNetwork,omitempty"`
+
+    // controlPlaneEndpoint 為 API Server 的對外端點（host:port）。
+    ControlPlaneEndpoint APIEndpoint `json:"controlPlaneEndpoint,omitempty"`
+
+    // controlPlaneRef 指向 ControlPlane Provider 資源（例如 KubeadmControlPlane）。
+    // 使用指標型別，允許 nil（適用於匯入既有叢集的情境）。
+    ControlPlaneRef *corev1.ObjectReference `json:"controlPlaneRef,omitempty"`
+
+    // infrastructureRef 指向 Infrastructure Provider 資源（例如 Metal3Cluster）。
+    // 同樣為指標型別，解耦核心邏輯與底層基礎設施實作。
+    InfrastructureRef *corev1.ObjectReference `json:"infrastructureRef,omitempty"`
+
+    // topology 為 ClusterClass 拓撲設定。
+    // 需啟用 ClusterTopology feature gate 才有作用；未使用時為 nil。
+    Topology *Topology `json:"topology,omitempty"`
+
+    // availabilityGates 可讓第三方 Controller 注入額外的可用性判斷條件。
+    AvailabilityGates []ClusterAvailabilityGate `json:"availabilityGates,omitempty"`
+}
+```
+
 ### ClusterStatus 欄位
 
 | 欄位 | 類型 | 說明 |
@@ -63,6 +100,44 @@ title: Cluster API — Cluster 與 Machine 核心資源
 | `conditions` | Conditions | 目前服務狀態 |
 | `failureDomains` | FailureDomains | 從 InfraCluster 取得的 failure domain 清單 |
 | `observedGeneration` | int64 | 最後 reconcile 的 generation |
+
+### 原始碼定義
+
+`ClusterStatus` 記錄了 Controller 觀察到的叢集實際狀態。值得注意的設計細節：
+
+- `ControlPlaneReady` 的注解說明它**只在初始 provisioning 時更新**，叢集穩定運行後要查看 ControlPlane 狀態應使用 `conditions`，而非這個布林值。
+- `V1Beta2` 欄位封裝了下一版 API 將引入的新狀態欄位，以子結構方式新增可避免破壞舊版 API 合約。
+- `FailureReason` / `FailureMessage` 在原始碼中已被標記為 **Deprecated**，未來版本將移除。
+
+```go
+// 原始碼: api/core/v1beta1/cluster_types.go
+type ClusterStatus struct {
+    // failureDomains 從 InfraCluster 同步的 failure domain 清單。
+    FailureDomains FailureDomains `json:"failureDomains,omitempty"`
+
+    // phase 代表叢集目前的 phase。
+    // +kubebuilder:validation:Enum=Pending;Provisioning;Provisioned;Deleting;Failed;Unknown
+    Phase string `json:"phase,omitempty"`
+
+    // infrastructureReady 代表 InfraCluster 的就緒狀態。
+    InfrastructureReady bool `json:"infrastructureReady"`
+
+    // controlPlaneReady 代表 ControlPlane 在初始 provisioning 時是否就緒。
+    // 注意：此欄位在 provisioning 完成後不再更新，
+    // 運行期間請改用 conditions 判斷 ControlPlane 狀態。
+    ControlPlaneReady bool `json:"controlPlaneReady"`
+
+    // conditions 定義目前叢集的服務狀態（v1beta1 Conditions）。
+    Conditions Conditions `json:"conditions,omitempty"`
+
+    // observedGeneration 是 Controller 最後一次 reconcile 的 generation。
+    ObservedGeneration int64 `json:"observedGeneration,omitempty"`
+
+    // v1beta2 封裝未來 V1Beta2 API 版本中新增或修改的 status 欄位。
+    // 以子結構方式新增，確保不破壞現有 v1beta1 API 合約。
+    V1Beta2 *ClusterV1Beta2Status `json:"v1beta2,omitempty"`
+}
+```
 
 ### Cluster 生命週期 Phase
 
@@ -138,6 +213,53 @@ Machine 同樣採用 Provider 引用模式：`infrastructureRef` 指向 InfraMac
 
 > \* `bootstrap.configRef` 和 `bootstrap.dataSecretName` 至少需要提供一個。
 
+### 原始碼定義
+
+以下為 `MachineSpec` 的實際 struct 定義，幾個值得深入了解的設計：
+
+- `Bootstrap` 欄位型別為值型別（非指標），表示 Bootstrap 設定是**必填的**，但其內部的 `configRef` 和 `dataSecretName` 都是 optional，讓 Webhook 在建立時驗證「至少提供其中一個」。
+- `ProviderID` 由 InfraMachine Controller 設定，不應由使用者手動填寫；Cluster Autoscaler 等工具依賴此欄位對應實體機器。
+- 三個 Timeout 欄位（`NodeDrainTimeout`、`NodeVolumeDetachTimeout`、`NodeDeletionTimeout`）均為 `*metav1.Duration`，預設值各不相同（drain/detach 預設無限，deletion 預設 10s）。
+- `Taints` 欄位使用 `+listType=map`，允許不同 owner 分別管理不同的 taint，不互相覆蓋。
+
+```go
+// 原始碼: api/core/v1beta1/machine_types.go
+type MachineSpec struct {
+    // clusterName 是此 Machine 所屬叢集的名稱，建立後不可更改。
+    ClusterName string `json:"clusterName"`
+
+    // bootstrap 封裝 Bootstrap Provider 的設定。
+    // 內部 configRef 或 dataSecretName 至少需提供一個（Webhook 驗證）。
+    Bootstrap Bootstrap `json:"bootstrap"`
+
+    // infrastructureRef 指向 InfraMachine 資源（例如 Metal3Machine）。
+    InfrastructureRef corev1.ObjectReference `json:"infrastructureRef"`
+
+    // version 定義此節點期望的 Kubernetes 版本（例如 v1.28.0）。
+    Version *string `json:"version,omitempty"`
+
+    // providerID 由 InfraMachine Controller 填寫，對應實體/虛擬機器的唯一識別碼。
+    // Cluster Autoscaler 等工具依賴此欄位比對節點與機器的對應關係。
+    ProviderID *string `json:"providerID,omitempty"`
+
+    // failureDomain 指定部署的 failure domain，必須對應 Cluster.status.failureDomains。
+    FailureDomain *string `json:"failureDomain,omitempty"`
+
+    // nodeDrainTimeout 為 drain 節點的超時時間，預設 0（無限制）。
+    NodeDrainTimeout *metav1.Duration `json:"nodeDrainTimeout,omitempty"`
+
+    // nodeVolumeDetachTimeout 為等待 Volume detach 的超時時間，預設 0（無限制）。
+    NodeVolumeDetachTimeout *metav1.Duration `json:"nodeVolumeDetachTimeout,omitempty"`
+
+    // nodeDeletionTimeout 為嘗試刪除 Node 物件的超時時間，預設 10 秒。
+    NodeDeletionTimeout *metav1.Duration `json:"nodeDeletionTimeout,omitempty"`
+
+    // taints 是 CAPI 負責管理的 node taint 清單（最多 64 個）。
+    // +listType=map 允許不同 owner 各自管理特定 taint，不互相覆蓋。
+    Taints []MachineTaint `json:"taints,omitempty"`
+}
+```
+
 ### MachineStatus 欄位
 
 | 欄位 | 類型 | 說明 |
@@ -207,6 +329,32 @@ Machine 刪除涉及多個步驟，以確保節點安全退出叢集：
 6. 執行 **pre-terminate hooks**（若有設定）
 7. 刪除 Bootstrap 與 InfraMachine 資源
 8. 移除 finalizer，完成刪除
+
+### 原始碼：Finalizer 定義
+
+Finalizer 是 Kubernetes 物件刪除保護機制的核心。在 CAPI 中，Cluster 和 Machine 各有自己的 Finalizer 字串常數，Controller 在 reconcile 時會確認這些 Finalizer 存在，並在完成清理工作後才移除它們。
+
+以下為原始碼中的實際常數定義：
+
+```go
+// 原始碼: api/core/v1beta1/cluster_types.go
+const (
+    // ClusterFinalizer 由 Cluster Controller 設置，
+    // 確保 Cluster 刪除前完成所有基礎設施與 Machine 資源的清理。
+    ClusterFinalizer = "cluster.cluster.x-k8s.io"
+)
+```
+
+```go
+// 原始碼: api/core/v1beta1/machine_types.go
+const (
+    // MachineFinalizer 在 PrepareForCreate 回呼時設置，
+    // 確保 Machine 刪除前完成 drain、volume detach 及 InfraMachine 刪除流程。
+    MachineFinalizer = "machine.cluster.x-k8s.io"
+)
+```
+
+**設計意義**：這兩個 Finalizer 決定了刪除順序的安全性 — 若直接強制移除 Finalizer（`kubectl patch ... -p '{"metadata":{"finalizers":[]}}'`），將跳過上述所有保護步驟，可能導致孤立的基礎設施資源或服務中斷。
 
 
 <Callout type="info" title="詳細刪除流程">

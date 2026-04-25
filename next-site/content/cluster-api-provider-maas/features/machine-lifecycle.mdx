@@ -25,6 +25,115 @@ Reconciler 監聽 `MaasMachine` 物件的變化，並根據目前狀態決定下
 
 ---
 
+### 原始碼：Controller 結構
+
+`MaasMachineReconciler` 的結構體定義與 `Reconcile()` 進入點，是整個生命週期管理的核心：
+
+```go
+// 原始碼: controllers/maasmachine_controller.go
+
+// MaasMachineReconciler reconciles a MaasMachine object
+type MaasMachineReconciler struct {
+	client.Client
+	Log      logr.Logger
+	Scheme   *runtime.Scheme
+	Recorder record.EventRecorder
+	Tracker  *remote.ClusterCacheTracker // 存取 workload cluster 的 k8s client
+}
+
+func (r *MaasMachineReconciler) Reconcile(ctx context.Context, req ctrl.Request) (_ ctrl.Result, rerr error) {
+	maasMachine := &infrav1beta1.MaasMachine{}
+	if err := r.Get(ctx, req.NamespacedName, maasMachine); err != nil {
+		return ctrl.Result{}, client.IgnoreNotFound(err)
+	}
+
+	// 建立 clusterScope 與 machineScope（封裝 MAAS API 所需上下文）
+	machineScope, err := scope.NewMachineScope(scope.MachineScopeParams{ ... })
+
+	// 離開時自動 Patch MaasMachine 狀態
+	defer func() { machineScope.Close() }()
+
+	// 依 DeletionTimestamp 分流：刪除或正常 reconcile
+	if !maasMachine.DeletionTimestamp.IsZero() {
+		return r.reconcileDelete(ctx, machineScope, clusterScope)
+	}
+	return r.reconcileNormal(ctx, machineScope, clusterScope)
+}
+```
+
+### 原始碼：reconcileNormal 關鍵流程
+
+```go
+// 原始碼: controllers/maasmachine_controller.go
+
+func (r *MaasMachineReconciler) reconcileNormal(_ context.Context, machineScope *scope.MachineScope, clusterScope *scope.ClusterScope) (ctrl.Result, error) {
+	// Bootstrap Guard：等待 cloud-init userdata 就緒才能繼續
+	if machineScope.Machine.Spec.Bootstrap.DataSecretName == nil {
+		conditions.MarkFalse(machineScope.MaasMachine, infrav1beta1.MachineDeployedCondition,
+			infrav1beta1.WaitingForBootstrapDataReason, clusterv1.ConditionSeverityInfo, "")
+		return ctrl.Result{}, nil
+	}
+
+	// 查找現有機器；若不存在或狀態不對，觸發 deployMachine（allocate + deploy）
+	m, _ := r.findMachine(machineScope, machineSvc)
+	if m == nil || !(m.State == infrav1beta1.MachineStateDeployed || m.State == infrav1beta1.MachineStateDeploying) {
+		m, err = r.deployMachine(machineScope, machineSvc)
+	}
+
+	// 根據 MAAS 機器狀態更新 Kubernetes Condition
+	switch s := m.State; {
+	case s == infrav1beta1.MachineStateDeploying, s == infrav1beta1.MachineStateAllocated:
+		machineScope.SetNotReady()
+		conditions.MarkFalse(machineScope.MaasMachine, infrav1beta1.MachineDeployedCondition,
+			infrav1beta1.MachineDeployingReason, clusterv1.ConditionSeverityWarning, "")
+	case s == infrav1beta1.MachineStateDeployed:
+		machineScope.SetReady()
+		conditions.MarkTrue(machineScope.MaasMachine, infrav1beta1.MachineDeployedCondition)
+	}
+
+	// 設定 DNS（僅 Control Plane）
+	r.reconcileDNSAttachment(machineScope, clusterScope, m)
+
+	// 等 API Server 上線後，patch Node.Spec.ProviderID
+	if err := machineScope.SetNodeProviderID(); err != nil {
+		return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
+	}
+	return ctrl.Result{}, nil
+}
+```
+
+### 原始碼：MaasMachine 型別定義
+
+```go
+// 原始碼: api/v1beta1/maasmachine_types.go
+
+type MaasMachineSpec struct {
+	FailureDomain  *string  `json:"failureDomain,omitempty"`
+	SystemID       *string  `json:"systemID,omitempty"`       // MAAS system_id，分配後填入
+	ProviderID     *string  `json:"providerID,omitempty"`     // maas://<zone>/<system_id>
+	ResourcePool   *string  `json:"resourcePool,omitempty"`
+	MinCPU         *int     `json:"minCPU"`
+	MinMemoryInMB  *int     `json:"minMemory"`
+	Tags           []string `json:"tags,omitempty"`
+	Image          string   `json:"image"`                    // OS image 名稱（MAAS distro_series）
+	DeployInMemory bool     `json:"deployInMemory,omitempty"` // true = ephemeral 部署
+}
+
+type MaasMachineStatus struct {
+	Ready          bool                       `json:"ready"`
+	MachineState   *MachineState              `json:"machineState,omitempty"`
+	MachinePowered bool                       `json:"machinePowered,omitempty"`
+	Hostname       *string                    `json:"hostname,omitempty"`
+	DNSAttached    bool                       `json:"dnsAttached,omitempty"`
+	Addresses      []clusterv1.MachineAddress `json:"addresses,omitempty"`
+	Conditions     clusterv1.Conditions       `json:"conditions,omitempty"`
+	FailureReason  *errors.MachineStatusError `json:"failureReason,omitempty"`
+	FailureMessage *string                    `json:"failureMessage,omitempty"`
+}
+```
+
+---
+
 ## MAAS Machine 狀態說明
 
 MAAS 內部為每台機器維護一個狀態，CAPM3 在每次 reconcile 時會讀取此狀態並據此行動。

@@ -47,6 +47,89 @@ MAAS Provider 以標準 CAPI Infrastructure Provider 模式運作。MAAS（Metal
 | `MaasMachineReconciler` | Allocate → Deploy → ProviderID → Ready 完整機器生命週期 |
 | `spectrocloud/maas-client-go` | 封裝 MAAS REST API 的 Go SDK |
 
+---
+
+### 原始碼：MaasCluster 型別
+
+```go
+// 原始碼: api/v1beta1/maascluster_types.go
+
+type MaasClusterSpec struct {
+	DNSDomain            string      `json:"dnsDomain"`            // MAAS DNS 網域（例如 maas）
+	ControlPlaneEndpoint APIEndpoint `json:"controlPlaneEndpoint"` // API Server FQDN:port
+	FailureDomains       []string    `json:"failureDomains,omitempty"` // 可用 MAAS Zone 清單
+}
+
+type MaasClusterStatus struct {
+	Ready          bool                   `json:"ready"`
+	Network        Network                `json:"network,omitempty"`  // 含 DNSName
+	FailureDomains clusterv1.FailureDomains `json:"failureDomains,omitempty"`
+	Conditions     clusterv1.Conditions   `json:"conditions,omitempty"`
+}
+
+// APIEndpoint 代表 kube-apiserver 對外的端點
+type APIEndpoint struct {
+	Host string `json:"host"` // FQDN（由 DNS service 建立）
+	Port int    `json:"port"`
+}
+```
+
+### 原始碼：Reconcile 進入點
+
+```go
+// 原始碼: controllers/maascluster_controller.go
+
+// MaasClusterReconciler reconciles a MaasCluster object
+type MaasClusterReconciler struct {
+	client.Client
+	Log                 logr.Logger
+	Scheme              *runtime.Scheme
+	Recorder            record.EventRecorder
+	GenericEventChannel chan event.GenericEvent // API Server 上線通知
+	Tracker             *remote.ClusterCacheTracker
+}
+
+func (r *MaasClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request) (_ ctrl.Result, rerr error) {
+	maasCluster := &infrav1beta1.MaasCluster{}
+	r.Client.Get(ctx, req.NamespacedName, maasCluster)
+
+	// 建立 clusterScope（封裝 DNS 操作、API Server 探活邏輯）
+	clusterScope, _ := scope.NewClusterScope(scope.ClusterScopeParams{ ... })
+	defer clusterScope.Close()
+
+	// 將 spec.failureDomains 轉換為 CAPI 標準 FailureDomains map
+	failureDomains := make(clusterv1.FailureDomains)
+	for _, az := range maasCluster.Spec.FailureDomains {
+		failureDomains[az] = clusterv1.FailureDomainSpec{ControlPlane: true}
+	}
+	maasCluster.Status.FailureDomains = failureDomains
+
+	// 依 DeletionTimestamp 分流
+	if !maasCluster.DeletionTimestamp.IsZero() {
+		return r.reconcileDelete(ctx, clusterScope)
+	}
+	return r.reconcileNormal(ctx, clusterScope)
+}
+
+func (r *MaasClusterReconciler) reconcileNormal(_ context.Context, clusterScope *scope.ClusterScope) (ctrl.Result, error) {
+	// 呼叫 MAAS DNS API 建立 FQDN
+	dnsService.ReconcileDNS()
+
+	// 設定 ControlPlaneEndpoint 並標記叢集 Ready
+	maasCluster.Spec.ControlPlaneEndpoint = infrav1beta1.APIEndpoint{
+		Host: maasCluster.Status.Network.DNSName,
+		Port: clusterScope.APIServerPort(),
+	}
+	maasCluster.Status.Ready = true
+
+	// 持續監控 API Server 可用性
+	clusterScope.ReconcileMaasClusterWhenAPIServerIsOnline()
+	return ctrl.Result{}, nil
+}
+```
+
+---
+
 ## ⚠️ 常見陷阱
 
 <Callout type="warning" title="使用前須知">
