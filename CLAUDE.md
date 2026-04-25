@@ -125,11 +125,25 @@ make check-updates                          # 查看哪些專案有新版本
 make check-update-project PROJECT=cluster-api  # 單一專案差異分析
 ```
 
-### 建置驗證
+### 驗證 & 建置
+
+**每次 commit 前必須執行 `make validate`。**
+
 ```bash
-cd next-site && npm run build
-# 失敗時先看 TypeScript 型別錯誤，再查 MDX frontmatter
+# 快速驗證（不跑 build，幾秒完成）
+make validate
+
+# 完整驗證（含 Next.js build，約 30 秒）
+make validate-build
 ```
+
+`make validate` 自動檢查：
+- MDX frontmatter（`layout: doc` + `title:`）
+- 所有 `![...]()` 圖片引用存在且非 1×1 placeholder
+- QuizQuestion 語法（quotes、answer 格式）
+- quiz.json 格式（id、answer 索引）
+- `projects.ts` 裡所有 slug 都有對應 MDX 檔
+- 無 VitePress 遺留產物
 
 ---
 

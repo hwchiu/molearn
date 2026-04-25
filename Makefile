@@ -1,4 +1,4 @@
-.PHONY: dev build preview install clean setup check-deps init-submodules check-updates
+.PHONY: dev build preview install clean setup check-deps init-submodules check-updates validate validate-build
 
 check-deps:
 	@echo "🔍 檢查必要工具..."
@@ -35,3 +35,11 @@ clean:
 check-updates:
 	@echo "🔍 檢查各專案 submodule 更新..."
 	@git submodule foreach 'echo "📦 $$name: $$(git log --oneline -1)"'
+
+validate:
+@echo "🧪 執行網站驗證..."
+python3 scripts/validate.py
+
+validate-build:
+@echo "🧪 執行完整驗證（含 build）..."
+python3 scripts/validate.py --build
