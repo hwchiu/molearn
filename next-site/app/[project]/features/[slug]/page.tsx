@@ -7,6 +7,9 @@ import matter from 'gray-matter'
 import Link from 'next/link'
 import { ChevronLeft, ChevronRight } from 'lucide-react'
 import remarkGfm from 'remark-gfm'
+import rehypeSlug from 'rehype-slug'
+import { extractHeadings } from '@/lib/extract-headings'
+import { TableOfContents } from '@/components/TableOfContents'
 
 export function generateStaticParams() {
   const params: { project: string; slug: string }[] = []
@@ -27,44 +30,55 @@ export default async function FeaturePage({ params }: { params: { project: strin
   if (!source) notFound()
 
   const { content, data } = matter(source)
+  const headings = extractHeadings(content)
 
   const slugIndex = project.features.indexOf(params.slug)
   const prevSlug = slugIndex > 0 ? project.features[slugIndex - 1] : null
   const nextSlug = slugIndex < project.features.length - 1 ? project.features[slugIndex + 1] : null
 
   return (
-    <article className="max-w-4xl mx-auto px-8 py-10">
-      {data.title && (
-        <div className="mb-8">
-          {data.category && (
-            <span className="text-xs font-semibold uppercase tracking-wider text-[#2f81f7] mb-2 block">
-              {data.category}
-            </span>
-          )}
-          <h1 className="text-3xl font-bold text-white mb-3">{data.title}</h1>
-          {data.description && (
-            <p className="text-lg text-[#8b949e]">{data.description}</p>
-          )}
+    <div className="flex min-w-0">
+      {/* Main content */}
+      <article className="flex-1 min-w-0 max-w-3xl px-8 py-10">
+        {data.title && (
+          <div className="mb-8">
+            {data.category && (
+              <span className="text-xs font-semibold uppercase tracking-wider text-[#2f81f7] mb-2 block">
+                {data.category}
+              </span>
+            )}
+            <h1 className="text-3xl font-bold text-white mb-3">{data.title}</h1>
+            {data.description && (
+              <p className="text-lg text-[#8b949e]">{data.description}</p>
+            )}
+          </div>
+        )}
+        <div className="prose-content">
+          <MDXRemote
+            source={content}
+            components={MDX_COMPONENTS as any}
+            options={{ mdxOptions: { remarkPlugins: [remarkGfm], rehypePlugins: [rehypeSlug] } }}
+          />
         </div>
-      )}
-      <div className="prose-content">
-        <MDXRemote source={content} components={MDX_COMPONENTS as any} options={{ mdxOptions: { remarkPlugins: [remarkGfm] } }} />
-      </div>
 
-      <div className="mt-12 pt-6 border-t border-[#30363d] flex items-center justify-between">
-        {prevSlug ? (
-          <Link href={`/${project.id}/features/${prevSlug}`}
-            className="flex items-center gap-2 text-sm text-[#8b949e] hover:text-white transition-colors">
-            <ChevronLeft size={16} /> 上一篇
-          </Link>
-        ) : <div />}
-        {nextSlug ? (
-          <Link href={`/${project.id}/features/${nextSlug}`}
-            className="flex items-center gap-2 text-sm text-[#8b949e] hover:text-white transition-colors">
-            下一篇 <ChevronRight size={16} />
-          </Link>
-        ) : <div />}
-      </div>
-    </article>
+        <div className="mt-12 pt-6 border-t border-[#30363d] flex items-center justify-between">
+          {prevSlug ? (
+            <Link href={`/${project.id}/features/${prevSlug}`}
+              className="flex items-center gap-2 text-sm text-[#8b949e] hover:text-white transition-colors">
+              <ChevronLeft size={16} /> 上一篇
+            </Link>
+          ) : <div />}
+          {nextSlug ? (
+            <Link href={`/${project.id}/features/${nextSlug}`}
+              className="flex items-center gap-2 text-sm text-[#8b949e] hover:text-white transition-colors">
+              下一篇 <ChevronRight size={16} />
+            </Link>
+          ) : <div />}
+        </div>
+      </article>
+
+      {/* Sticky Table of Contents */}
+      <TableOfContents headings={headings} />
+    </div>
   )
 }
