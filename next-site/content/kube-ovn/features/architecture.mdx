@@ -1,0 +1,73 @@
+---
+layout: doc
+title: Kube-OVN — 整體架構
+description: Kube-OVN 各核心元件的職責與 OVN/OVS 整合層的協作關係
+---
+
+## 工程師面臨的問題
+
+當你在一個多租戶 Kubernetes 平台上接到需求：「不同部門的 Pod 必須有完全隔離的 L3 網路，而且每個 namespace 都要能自訂 gateway 和路由策略。」Flannel 做不到，Calico 需要大量手動設定，而 Kube-OVN 的答案是：用 OVN 的 Logical Router 與 Logical Switch 直接映射成 Kubernetes 資源，讓 CRD 成為網路的真相來源。
+
+## Kube-OVN 的元件全貌
+
+Kube-OVN 並不是一個單體 binary，而是由多個角色分工的程序組成：
+
+**kube-ovn-controller** 是整個系統的大腦，執行於 control plane。它 watch Kubernetes 的 Pod、Node、Service、NetworkPolicy，以及 Kube-OVN 自訂的 VPC、Subnet、SecurityGroup 等 CRD，並將這些資源翻譯成 OVN Northbound DB 的 Logical Switch、Logical Router、ACL、Load Balancer 等物件。
+
+```go
+// pkg/controller/controller.go
+type Controller struct {
+    config *Configuration
+    ipam   *ovnipam.IPAM
+
+    OVNNbClient ovs.NbClient   // 操作 OVN Northbound DB
+    OVNSbClient ovs.SbClient   // 讀取 OVN Southbound DB（chassis 資訊）
+
+    vpcsLister    kubeovnlister.VpcLister
+    subnetsLister kubeovnlister.SubnetLister
+    // ... 其餘 informer/lister
+}
+```
+
+**kube-ovn-cni** 以 DaemonSet 執行在每個 node 上，是標準 CNI plugin 的入口。當 kubelet 呼叫 ADD/DEL，kube-ovn-cni 會透過 gRPC 呼叫同一節點的 **kube-ovn-daemon**。
+
+**kube-ovn-daemon** 也是 DaemonSet，負責在節點上實際操作 OVS，包含設定 veth pair、安裝流表、設定 QoS 規則等。它透過 OVSDB 協定直接與本地的 `ovs-vswitchd` 溝通。
+
+**ovn-central** 是 OVN 控制平面，包含 `ovn-northd`、`ovn-nb`、`ovn-sb`。`ovn-northd` 負責將 Northbound DB 的高階邏輯網路（Logical Switch、Router）編譯成 Southbound DB 的流表規則（Logical Flow），再由每個節點的 `ovn-controller` 轉化為 OpenFlow 規則並下發到 `ovs-vswitchd`。
+
+**ovn-speaker** 是可選元件，整合 GoBGP，讓 Pod IP 或 Subnet CIDR 可以透過 BGP 協定宣告給外部路由器。詳見 [BGP 整合](/kube-ovn/features/bgp)。
+
+## 控制平面的資料流
+
+當使用者建立一個新的 Subnet CRD 時，整個鏈路如下：
+
+1. **kube-ovn-controller** 的 Subnet informer 觸發 `enqueueAddSubnet`，將 key 放入 `addOrUpdateSubnetQueue`
+2. worker goroutine 呼叫 `handleAddOrUpdateSubnet`，驗證 spec、格式化 CIDR
+3. 呼叫 `OVNNbClient.CreateLogicalSwitch`，在 OVN NB DB 建立對應的 Logical Switch 及 Logical Router Port
+4. 同時更新內嵌 IPAM 的 Subnet 資料結構（在記憶體中維護可用 IP 池）
+5. `ovn-northd` 偵測 NB DB 變更，生成新的 Logical Flow 到 SB DB
+6. 每個節點的 `ovn-controller` 從 SB DB 拉取 Flow，更新本地 OVS 流表
+
+## IPAM 的位置
+
+Kube-OVN 的 IPAM 模組（`pkg/ipam/`）以純記憶體 map 維護所有 subnet 的 IP 分配狀態。它**不依賴** etcd 或 CRD 做 IP 持久化，而是在 controller 啟動時從現有的 IP CRD 物件重建狀態。詳見 [IPAM 設計](/kube-ovn/features/ipam)。
+
+## 與標準 CNI 的差異
+
+傳統 overlay CNI（如 Flannel）每個節點固定一段 /24，所有 Pod 扁平化在同一 L2 domain。Kube-OVN 的設計讓每個 Subnet 對應一個 OVN Logical Switch，Subnet 之間的流量必須經過 OVN Logical Router 路由，天然實現 L3 隔離，也讓 VPC 多租戶成為可能。
+
+<Callout type="info" title="OVN 版本相依">
+Kube-OVN 對 OVN 版本有明確要求，透過內建的 `ovn-central` container image 管理。升級 Kube-OVN 時請同步升級 OVN 元件，避免 NB/SB schema 不相容。
+</Callout>
+
+## 元件間的通訊協定
+
+| 通訊路徑 | 協定 |
+|---|---|
+| controller → OVN NB DB | OVSDB over TCP/SSL |
+| kube-ovn-cni → kube-ovn-daemon | Unix socket gRPC |
+| ovn-northd → OVN SB DB | OVSDB |
+| ovn-controller → ovs-vswitchd | OpenFlow / OVSDB |
+| ovn-speaker → 外部路由器 | BGP（TCP 179）|
+
+進一步了解 Subnet 與 VPC 的設計，請見 [VPC 與 Subnet CRD 設計](/kube-ovn/features/vpc-subnet)。

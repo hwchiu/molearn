@@ -1,0 +1,144 @@
+---
+layout: doc
+title: Kube-OVN — IPAM 設計
+description: Kube-OVN 記憶體內嵌 IPAM 的架構與靜態/動態 IP 分配機制
+---
+
+## 工程師面臨的問題
+
+生產環境中，StatefulSet 的 Pod 重啟後 IP 改變，導致資料庫叢集的 peer 發現失敗；或是應用程式需要固定 IP 才能通過防火牆白名單審核。傳統 CNI 的 IPAM 只負責隨機分配，沒有靜態 IP 的概念。Kube-OVN 自行實作了一個記憶體 IPAM，讓每個 Pod 可以在 annotation 中宣告靜態 IP，並確保跨重啟保持不變。
+
+## IPAM 的核心資料結構
+
+IPAM 模組位於 `pkg/ipam/`，以純記憶體 map 維護所有 subnet 的分配狀態：
+
+```go
+// pkg/ipam/ipam.go
+type IPAM struct {
+    mutex   sync.RWMutex
+    Subnets map[string]*Subnet  // key 為 subnet name
+}
+```
+
+每個 `Subnet` 物件在記憶體中追蹤可用位址池、已分配 IP 與 MAC 的對應關係：
+
+```go
+// pkg/ipam/subnet.go（概念示意）
+type Subnet struct {
+    Name     string
+    Protocol string    // IPv4 | IPv6 | Dual
+    V4CIDR   *net.IPNet
+    V6CIDR   *net.IPNet
+
+    V4FreeIPList   IPRangeList  // 未分配的 IPv4 範圍
+    V4UsingIPList  IPRangeList  // 已分配的 IPv4 範圍
+    V4ReservedIPList IPRangeList // excludeIps
+
+    PodToIP  map[string]IPPair  // podName → {v4, v6}
+    IPToPod  map[IP]string      // IP → podName
+    PodToMac map[string]string  // podName → MAC
+    MacToPod map[string]string  // MAC → podName
+}
+```
+
+## 動態 IP 分配
+
+當 Pod 沒有指定靜態 IP 時，controller 呼叫 `GetRandomAddress`：
+
+```go
+// pkg/ipam/ipam.go
+func (ipam *IPAM) GetRandomAddress(
+    podName, nicName string,
+    mac *string,
+    subnetName, poolName string,
+    skippedAddrs []string,
+    checkConflict bool,
+) (string, string, string, error) {
+    ipam.mutex.Lock()
+    defer ipam.mutex.Unlock()
+
+    subnet, ok := ipam.Subnets[subnetName]
+    if !ok {
+        return "", "", "", ErrNoSubnet
+    }
+    v4IP, v6IP, macStr, err := subnet.GetRandomAddress(
+        poolName, podName, nicName, mac, skippedAddrs, checkConflict)
+    // ...
+}
+```
+
+分配結果會記錄在 `PodToIP` map 中，同時從 `V4FreeIPList` 移除。由於 IPAM 是記憶體狀態，controller 重啟時會從現有的 **IP CRD**（`kind: IP`，`kubeovn.io/v1`）重建整個 map，確保不丟失已分配的記錄。
+
+## 靜態 IP 分配
+
+使用者透過 Pod annotation 指定靜態 IP：
+
+```yaml
+# 靜態 IP 範例
+apiVersion: v1
+kind: Pod
+metadata:
+  name: db-master
+  annotations:
+    ovn.kubernetes.io/ip_address: "10.20.0.100"
+    ovn.kubernetes.io/mac_address: "00:00:00:12:34:56"  # 可選
+spec:
+  # ...
+```
+
+Controller 呼叫 `GetStaticAddress`，驗證指定的 IP 是否在 CIDR 範圍內、是否已被佔用：
+
+```go
+// pkg/ipam/ipam.go
+func (ipam *IPAM) GetStaticAddress(
+    podName, nicName, ip string,
+    mac *string,
+    subnetName string,
+    checkConflict bool,
+) (string, string, string, error) {
+    // ...
+    ipAddr, macStr, err = subnet.GetStaticAddress(
+        podName, nicName, ip, mac, false, checkConflict)
+    // 錯誤類型：ErrOutOfRange | ErrConflict
+}
+```
+
+若指定的 IP 已被其他 Pod 佔用，回傳 `ErrConflict`；若超出 subnet CIDR，回傳 `ErrOutOfRange`。
+
+## DualStack 處理
+
+當 subnet protocol 為 `Dual` 時，只指定一個 IP（例如只給 IPv4），IPAM 會自動補充對應的 IPv6 隨機地址：
+
+```go
+// pkg/ipam/ipam.go
+func checkAndAppendIpsForDual(
+    ips []IP, mac, podName, nicName string,
+    subnet *Subnet, checkConflict bool,
+) ([]IP, error) {
+    if subnet.Protocol != kubeovnv1.ProtocolDual || len(ips) == 2 {
+        return ips, nil
+    }
+    // 補充缺少的 IP family
+}
+```
+
+## IP CRD 作為持久化層
+
+每次 IP 分配成功後，controller 會建立一個 `IP` CRD 物件（`kind: IP`）記錄 podName、IP、MAC、subnet 的對應關係。這是 IPAM 狀態的唯一持久化來源。
+
+```bash
+kubectl get ips -n finance
+# NAME                     V4IP          V6IP  MAC                   NODE
+# finance-db-master        10.20.0.100         00:00:00:12:34:56     node-1
+# finance-api-xxxx         10.20.0.23          0a:00:00:11:22:33     node-2
+```
+
+<Callout type="warning" title="IP 記憶體狀態與重建">
+Controller crash 後重啟，若 IP CRD 尚未寫入 etcd（例如 write 失敗），重建的 IPAM 狀態可能遺失該分配，導致 IP 衝突。生產環境需確保 etcd 的寫入延遲和穩定性。
+</Callout>
+
+## IPPool：細粒度 IP 池管理
+
+除了 subnet 級別的 IP 池，Kube-OVN 還支援 `IPPool` CRD，讓你在同一個 subnet 內為不同 workload 劃定專屬 IP 範圍，避免關鍵服務的 IP 被搶佔。
+
+更多 subnet 設計細節請見 [VPC 與 Subnet CRD 設計](/kube-ovn/features/vpc-subnet)。

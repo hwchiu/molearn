@@ -1,0 +1,144 @@
+---
+layout: doc
+title: Kube-OVN — 核心 Controller Reconcile 邏輯
+description: Subnet、VPC、Node 三個 controller 的 reconcile 流程與關鍵實作細節
+---
+
+## 工程師面臨的問題
+
+你更新了一個 Subnet 的 `gatewayType` 從 `distributed` 改為 `centralized`，但幾分鐘後發現某些節點的 Pod 仍然用舊的路徑出去。究竟 controller 什麼時候會觸發、觸發後做了什麼、哪些步驟可能失敗？讀懂 reconcile 邏輯，就能預判行為並快速定位問題。
+
+## Controller 的 workqueue 架構
+
+Kube-OVN controller 遵循標準的 Kubernetes controller 模式：每類資源有自己的 informer + workqueue。以 Subnet 為例：
+
+```go
+// pkg/controller/controller.go
+type Controller struct {
+    subnetsLister           kubeovnlister.SubnetLister
+    addOrUpdateSubnetQueue  workqueue.TypedRateLimitingInterface[string]
+    deleteSubnetQueue       workqueue.TypedRateLimitingInterface[*kubeovnv1.Subnet]
+    updateSubnetStatusQueue workqueue.TypedRateLimitingInterface[string]
+    subnetKeyMutex          keymutex.KeyMutex  // 防止同一 subnet 並發處理
+}
+```
+
+`subnetKeyMutex` 確保同一個 subnet 在任何時刻只有一個 reconcile goroutine 在執行，避免競態條件。
+
+## Subnet Controller 的 Reconcile 路徑
+
+`handleAddOrUpdateSubnet` 是 Subnet reconcile 的主入口（`pkg/controller/subnet.go`），大約 300 行，主要做以下事情：
+
+**1. 格式化與校驗**
+
+```go
+func (c *Controller) handleAddOrUpdateSubnet(key string) error {
+    subnet, err := c.subnetsLister.Get(key)
+    // formatSubnet 補齊預設值：provider、vpc、gatewayType 等
+    newSubnet, err := c.formatSubnet(subnet)
+    // 若 spec 有變化，先 patch 回 Kubernetes
+    if !reflect.DeepEqual(subnet.Spec, newSubnet.Spec) {
+        subnet = newSubnet
+        // ... patch
+    }
+}
+```
+
+**2. 建立或更新 OVN Logical Switch**
+
+```go
+    // 決定是否需要連接 Logical Router
+    needRouter := isOvnSubnet(subnet)
+    if err := c.OVNNbClient.CreateLogicalSwitch(
+        subnet.Name,
+        vpc.Status.Router,
+        subnet.Spec.CIDRBlock,
+        gateway, gatewayMAC,
+        needRouter, randomAllocateGW,
+    ); err != nil { ... }
+```
+
+**3. 更新 IPAM 狀態**
+
+```go
+    // 同步 CIDR 到記憶體 IPAM
+    if err := c.ipam.AddOrUpdateSubnet(
+        subnet.Name,
+        subnet.Spec.CIDRBlock,
+        subnet.Spec.Gateway,
+        subnet.Spec.ExcludeIps,
+    ); err != nil { ... }
+```
+
+**4. 呼叫 reconcileSubnet 處理附屬邏輯**
+
+`reconcileSubnet` 再分發到數個子函數：
+- `reconcileNamespaces`：更新 namespace annotation，讓新 Pod 知道要用哪個 subnet
+- `reconcileDistributedSubnetRouteInDefaultVpc`：設定分散式 gateway 的路由
+- `reconcileVlan`：如果是 underlay 模式，設定 VLAN
+
+<Callout type="tip" title="gatewayType 變更的影響">
+當你把 `gatewayType` 從 distributed 改為 centralized，controller 會重新計算路由規則並更新 OVN Logical Router Policy。存量 Pod 的路徑在 OVN 流表更新後才會切換，通常在幾秒內完成，但 in-flight 連線可能短暫中斷。
+</Callout>
+
+## VPC Controller 的 Reconcile
+
+VPC controller（`pkg/controller/vpc.go`）的 `handleAddOrUpdateVpc` 負責：
+
+1. 建立或更新 OVN Logical Router（若 VPC 是新建的）
+2. 同步 `spec.staticRoutes` 到 LR 的靜態路由
+3. 同步 `spec.policyRoutes` 到 LR 的 Policy-based Routing 規則
+4. 若 `spec.enableExternal = true`，確保 LR 有通往外部 subnet 的連接埠
+
+觸發條件由 `enqueueUpdateVpc` 嚴格控制——只有 spec 真正變化才入隊，避免無謂的重複調和：
+
+```go
+// pkg/controller/vpc.go
+func (c *Controller) enqueueUpdateVpc(oldObj, newObj any) {
+    if !slices.Equal(oldVpc.Spec.Namespaces, newVpc.Spec.Namespaces) ||
+        !reflect.DeepEqual(oldVpc.Spec.StaticRoutes, newVpc.Spec.StaticRoutes) ||
+        !reflect.DeepEqual(oldVpc.Spec.PolicyRoutes, newVpc.Spec.PolicyRoutes) ||
+        oldVpc.Spec.EnableExternal != newVpc.Spec.EnableExternal ||
+        // ...
+    {
+        c.addOrUpdateVpcQueue.Add(key)
+    }
+}
+```
+
+## Node Controller 的 Reconcile
+
+Node 加入 cluster 時，`handleAddNode`（`pkg/controller/node.go`）完成下列工作：
+
+1. 在 join subnet（node 與 controller 的互聯網段）為這個 node 分配 IP
+2. 在 OVN NB 建立 Logical Switch Port，名稱為 `NodeLspName(nodeName)`
+3. 在 OVN SB 確認 chassis 存在並設定 vendor tag
+4. 將分配的 IP 寫回 node annotation（`ovn.kubernetes.io/ip_address`）
+
+```go
+// pkg/controller/node.go
+func (c *Controller) handleAddNode(key string) error {
+    node, _ := c.nodesLister.Get(key)
+    portName := util.NodeLspName(key)
+
+    // 從 join subnet 分配 IP
+    v4IP, v6IP, mac, err := c.ipam.GetRandomAddress(
+        portName, portName, nil,
+        c.config.NodeSwitch, "", nil, true)
+    // 建立 LSP
+    c.OVNNbClient.CreateLogicalSwitchPort(
+        c.config.NodeSwitch, portName, ...)
+    // 驗證 chassis
+    c.validateChassis(node)
+}
+```
+
+<Callout type="warning" title="Chassis 驗證失敗">
+若 chassis 未完成註冊（kube-ovn-cni 尚未就緒），`handleAddNode` 會回傳錯誤並由 workqueue 進行 rate-limited retry。這是節點剛加入時常見的短暫錯誤，通常 30 秒內自動恢復。
+</Callout>
+
+## GC（垃圾回收）機制
+
+`pkg/controller/gc.go` 定期執行，比對 Kubernetes 中存在的資源與 OVN NB DB 中的物件，刪除「孤兒」Logical Switch Port（對應的 Pod 已不存在但 LSP 還留著）。這是確保 OVN 狀態與 Kubernetes 狀態最終一致的安全網。
+
+了解 OVN NB DB 操作細節，請見 [OVN Northbound DB 同步機制](/kube-ovn/features/ovn-integration)。

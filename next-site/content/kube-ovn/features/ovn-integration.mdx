@@ -1,0 +1,116 @@
+---
+layout: doc
+title: Kube-OVN — OVN Northbound DB 同步機制
+description: Kube-OVN 如何將 Kubernetes CRD 翻譯成 OVN Logical Switch 與 Logical Router
+---
+
+## 工程師面臨的問題
+
+網路故障排查時，你發現某個 Pod 的流量被莫名丟棄，但 Kubernetes 層面的 NetworkPolicy 看起來沒問題。問題可能出在 OVN 層：ACL 規則、Logical Switch Port 的 addresses 欄位或 Logical Router 的路由表。理解 Kube-OVN 如何將 CRD 同步到 OVN Northbound DB，是診斷這類問題的基礎。
+
+## OVN 的邏輯拓撲模型
+
+OVN 使用資料庫（OVSDB）儲存邏輯網路拓撲。Kube-OVN 操作的核心物件是：
+
+- **Logical Switch（LS）**：對應一個 L2 廣播域，每個 Kube-OVN Subnet 對應一個 LS
+- **Logical Switch Port（LSP）**：每個 Pod 的虛擬網卡對應一個 LSP
+- **Logical Router（LR）**：VPC 的路由器，負責 subnet 間路由和 NAT
+- **Logical Router Port（LRP）**：LR 連接到 LS 的介面
+- **ACL**：附在 LS 或 Port Group 上的存取控制規則
+
+## CreateLogicalSwitch 的實作
+
+當 Subnet controller 呼叫 `CreateLogicalSwitch` 時，實際執行以下步驟：
+
+```go
+// pkg/ovs/ovn-nb-logical_switch.go
+func (c *OVNNbClient) CreateLogicalSwitch(
+    lsName, lrName, cidrBlock, gateway, gatewayMAC string,
+    needRouter, randomAllocateGW bool,
+) error {
+    // 1. 計算 gateway IP with mask（用於 LRP networks 欄位）
+    networks, _ := util.GetIPAddrWithMask(gateway, cidrBlock)
+
+    // 2. 若 LS 已存在，只更新 LRP 的 networks（idempotent）
+    if exist {
+        lrp := &ovnnb.LogicalRouterPort{
+            Name:     fmt.Sprintf("%s-%s", lrName, lsName),
+            Networks: strings.Split(networks, ","),
+        }
+        return c.UpdateLogicalRouterPort(lrp, &lrp.Networks)
+    }
+
+    // 3. 建立 bare LS（含 vendor external_id）
+    c.CreateBareLogicalSwitch(lsName)
+
+    // 4. 若需要 router，建立 patch port 連接 LS 與 LR
+    if needRouter {
+        c.CreateLogicalPatchPort(lsName, lrName, lspName, lrpName, networks, gatewayMAC)
+    }
+}
+```
+
+所有操作都是冪等的（idempotent）：若物件已存在，只更新差異欄位，不會重複建立。
+
+## Logical Switch Port 的建立
+
+每個 Pod 調度到節點後，controller 為它建立 LSP：
+
+```go
+// pkg/ovs/ovn-nb-logical_switch.go（概念示意）
+func (c *OVNNbClient) CreateLogicalSwitchPort(
+    lsName, lspName, ip, mac, podName, namespace string,
+    // ...
+) error {
+    lsp := &ovnnb.LogicalSwitchPort{
+        Name:      lspName,
+        Addresses: []string{fmt.Sprintf("%s %s", mac, ip)},
+        // PortSecurity: 啟用後只允許設定的 MAC+IP 組合
+    }
+    // 將 LSP 加入 LS
+}
+```
+
+LSP 的 `addresses` 欄位告訴 OVN 這個 port 擁有哪些 MAC/IP 組合。ARP responder 功能讓 OVN 直接在本地代答 ARP，不需要廣播到整個 overlay。
+
+## 與 OVN NB DB 的通訊
+
+Kube-OVN 使用 **libovsdb** 與 OVN NB DB 通訊，並在記憶體中維護 NB DB 的快取（client-side cache），避免每次操作都要查詢資料庫：
+
+```go
+// pkg/ovs/adapter.go
+type OVNNbClient struct {
+    ovnNbClient.Client   // libovsdb client（含本地 cache）
+    Timeout    time.Duration
+}
+```
+
+所有寫入操作封裝成 OVSDB Transaction，若 NB DB 的 schema 版本不相符，transaction 會直接失敗，避免靜默資料損壞。
+
+## 路由同步：StaticRoute 到 Logical Router
+
+VPC 的 `spec.staticRoutes` 欄位同步到 OVN LR 的靜態路由：
+
+```go
+// pkg/controller/vpc.go（概念示意）
+for _, route := range vpc.Spec.StaticRoutes {
+    c.OVNNbClient.AddLogicalRouterStaticRoute(
+        vpc.Status.Router,
+        route.Policy,     // policySrc | policyDst
+        route.CIDR,
+        route.NextHopIP,
+    )
+}
+```
+
+Policy-based Routing（`policyRoutes`）則轉換為 OVN 的 Logical Router Policy，可以根據來源 IP、目的 IP 或 DSCP 值做差異化路由。
+
+## Northbound → Southbound 的編譯
+
+Kube-OVN 只需要維護 NB DB 的正確性。`ovn-northd` 是 OVN 自己的 daemon，它監聽 NB DB 的變更，將 Logical Switch/Router/ACL 編譯成 **Logical Flow**，寫入 SB DB。各節點的 `ovn-controller` 再把 Logical Flow 轉為 OpenFlow 規則，下發到本地 `ovs-vswitchd`。
+
+<Callout type="info" title="NB DB 是唯一真相">
+Kube-OVN controller 只寫 OVN NB DB，從不直接操作 OVS flow table。這讓 OVN 成為 Kube-OVN 和底層 OVS 之間的清晰抽象層，也讓故障排查可以分層進行：先查 CRD → 再查 NB DB → 再查 SB DB → 最後查 OVS flow。
+</Callout>
+
+理解 controller 如何觸發這些 OVN 操作，請見 [核心 Controller Reconcile 邏輯](/kube-ovn/features/controllers)。
