@@ -39,6 +39,7 @@ export interface ProjectMeta {
   accentClass: string
   features: string[]
   featureGroups: FeatureGroup[]
+  usecases: string[]
   difficulty: '🟢 入門' | '🟡 中階' | '🔴 進階'
   difficultyColor: string
   problemStatement: string
@@ -76,6 +77,7 @@ export const PROJECTS: Record<ProjectId, ProjectMeta> = {
       { label: '機器生命週期', icon: '⚙️', slugs: ['machine-lifecycle', 'machine-health-check'] },
       { label: '進階管理', icon: '🏗', slugs: ['clusterclass-topology', 'addons-clusterresourceset', 'provider-contracts-runtime-hooks', 'clusterctl'] },
     ],
+    usecases: ['multi-team-platform', 'cluster-self-healing'],
     difficulty: '🟡 中階',
     difficultyColor: 'text-yellow-400 bg-yellow-400/10 border-yellow-400/30',
     problemStatement: '想像你需要管理 50 個 Kubernetes 叢集，分散在 AWS、裸機、vSphere 等不同環境。每個環境的建立方式都不同，維運成本極高。Cluster API 定義了一套統一的「語言」：你只需要宣告「我想要一個有 3 個 master + 5 個 worker 的叢集」，由各個 Provider 去翻譯並執行。就像 Kubernetes 統一了容器管理，CAPI 統一了叢集管理。',
@@ -124,6 +126,7 @@ export const PROJECTS: Record<ProjectId, ProjectMeta> = {
       { label: '核心機制', icon: '🔄', slugs: ['controllers', 'machine-lifecycle'] },
       { label: 'API 與整合', icon: '📋', slugs: ['api-types', 'integration'] },
     ],
+    usecases: ['on-demand-baremetal'],
     difficulty: '🟡 中階',
     difficultyColor: 'text-yellow-400 bg-yellow-400/10 border-yellow-400/30',
     problemStatement: '想像你管理著一個有 100 台實體伺服器的數據中心。每次需要新 Kubernetes 節點，你都要：登入 MAAS UI → 找到空閒的機器 → 分配 IP → 選 OS image → 等待部署 → 設定 Kubernetes。這個流程費時且容易出錯。MAAS Provider 讓這一切變成一個 YAML 宣告，Kubernetes 自動透過 MAAS API 完成剩下的事，讓裸機如同雲端資源一樣彈性。',
@@ -176,6 +179,7 @@ export const PROJECTS: Record<ProjectId, ProjectMeta> = {
       { label: '資料與網路', icon: '🌐', slugs: ['data-templates', 'ipam'] },
       { label: '運維與自癒', icon: '🔧', slugs: ['labelsync', 'node-reuse', 'remediation', 'advanced-features'] },
     ],
+    usecases: ['edge-auto-recovery', 'bulk-os-upgrade'],
     difficulty: '🔴 進階',
     difficultyColor: 'text-red-400 bg-red-400/10 border-red-400/30',
     problemStatement: 'Metal3 解決的問題與 MAAS Provider 類似，但走的是另一條路：它不依賴外部平台，而是讓 Kubernetes 自己管理裸機——透過 BMC（伺服器遠端管理介面，如 iDRAC / iLO）直接控制電源、開機、掛載 ISO。整個裸機生命週期完全在 Kubernetes 生態系內閉環。代價是元件更多、概念更複雜，但換來的是更強的可擴充性與對底層硬體的完整掌控。',
@@ -227,6 +231,7 @@ export const PROJECTS: Record<ProjectId, ProjectMeta> = {
       { label: 'Ceph 核心', icon: '🗄️', slugs: ['ceph-cluster', 'osds-monitors', 'ceph-controllers'] },
       { label: '儲存服務', icon: '💾', slugs: ['storage-classes', 's3-object-store', 'csi-driver'] },
     ],
+    usecases: ['stateful-storage'],
     difficulty: '🟡 中階',
     difficultyColor: 'text-yellow-400 bg-yellow-400/10 border-yellow-400/30',
     problemStatement: '在 Kubernetes 叢集中，Pod 需要持久化儲存，但傳統的 NFS 或本地磁碟無法滿足雲端原生的彈性與高可用性需求。Rook 把 Ceph 這套企業級分散式儲存系統包裝成 Kubernetes Operator，讓你用宣告式 YAML 管理整個儲存叢集——從磁碟格式化、Monitor 選舉到 S3 物件儲存，全部自動化。',
@@ -282,6 +287,7 @@ export const PROJECTS: Record<ProjectId, ProjectMeta> = {
       { label: '服務與對外連通', icon: '🌍', slugs: ['load-balancing', 'bgp', 'nat-gateway'] },
       { label: '控制器與安全策略', icon: '⚙️', slugs: ['controllers', 'qos-security'] },
     ],
+    usecases: ['multi-tenant-network'],
     difficulty: '🔴 進階',
     difficultyColor: 'text-red-400 bg-red-400/10 border-red-400/30',
     problemStatement: '預設的 Kubernetes 網路只有一個扁平的 Pod CIDR——所有 Pod 在同一個廣播域，沒有隔離、沒有 QoS、無法精確控制 IP。Kube-OVN 在 Kubernetes 上構建了一套完整的虛擬網路基礎設施：每個 Namespace 可以有獨立的 VPC 和子網路，Pod 可以綁定靜態 IP，跨叢集流量可以走 BGP 路由，安全策略細粒度到單一 Pod。',
@@ -335,6 +341,7 @@ export const PROJECTS: Record<ProjectId, ProjectMeta> = {
       { label: '儲存與網路', icon: '🌐', slugs: ['vm-storage', 'vm-network'] },
       { label: '進階功能', icon: '✈️', slugs: ['live-migration'] },
     ],
+    usecases: ['vm-container-mixed'],
     difficulty: '🔴 進階',
     difficultyColor: 'text-red-400 bg-red-400/10 border-red-400/30',
     problemStatement: '企業的基礎設施中仍有大量虛擬機器無法輕易容器化——Legacy 應用程式、Windows 工作負載、需要完整 OS 的測試環境。KubeVirt 讓這些 VM 直接跑在 Kubernetes 上，用同一套 kubectl 管理，共用同一套網路與儲存策略，讓「容器化遷移」不再是全有全無的選擇。',

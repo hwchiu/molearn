@@ -1,0 +1,238 @@
+---
+layout: doc
+title: KubeVirt — VM 與 Container 混合部署
+description: 企業如何在同一個 Kubernetes cluster 上同時運行 VM（Windows Server、Legacy 應用）和 Container，用同一套 GitOps 流程管理，並在維護時不停機地把 VM 遷移到其他節點
+---
+
+# 使用情境：VM 與 Container 混合部署
+
+> **目標效果**：200 台 VM（包含無法容器化的 Windows Server 和 Legacy Java 應用）遷移到 KubeVirt，與容器工作負載共用同一個 Kubernetes cluster，用 `kubectl` 管理 VM，維護節點時 VM 無感知地 Live Migration 到其他節點。
+
+## 你會遇到什麼問題
+
+企業從 VMware/vSphere 遷移到 Kubernetes 的過程中，有一個常見的兩難：
+
+- **無法全部容器化**：Windows Server AD、SAP、老舊 Java EE 應用需要完整 OS，短期內容器化成本極高
+- **兩套平台難維護**：同時維護 vSphere + Kubernetes，運維人員需要學兩套工具，成本加倍
+- **資源浪費**：VM 叢集和 Container 叢集分開，彼此的閒置資源無法互用
+- **工具碎片化**：VM 用 vSphere Client，容器用 kubectl，告警設定要做兩份，不統一
+
+## 哪些元件協作解決這個問題
+
+| 元件 | 職責 |
+|------|------|
+| [VMI 生命週期](/kubevirt/features/vmi-lifecycle) | VirtualMachine 和 VirtualMachineInstance CRD，VM 的定義與實際運行物件 |
+| [virt-controller](/kubevirt/features/virt-controller) | 類似 Deployment Controller，確保 VMI 處於期望狀態，選擇節點排程 |
+| [virt-handler](/kubevirt/features/virt-handler) | 每台節點上的 DaemonSet，呼叫 libvirt/QEMU 啟動實際 VM 行程 |
+| [VM 網路](/kubevirt/features/vm-network) | 設定 VM 的網路介面，支援 Pod Network 和 SR-IOV/Bridge 直連物理網路 |
+| [VM 存儲](/kubevirt/features/vm-storage) | VM 磁碟來源：PVC、Container Disk image、雲端 image |
+| [Live Migration](/kubevirt/features/live-migration) | 不停機地把運行中的 VM 遷移到其他節點，維護節點時使用 |
+
+## 協作流程
+
+```
+1. 定義 VirtualMachine（持久化的 VM 定義）
+          ↓
+2. virt-controller 建立 VirtualMachineInstance（實際運行實例）
+   ├── 計算資源需求（CPU topology、Memory、KVM overhead）
+   └── 與 Kubernetes Scheduler 協作，選擇有 KVM 能力的節點
+          ↓
+3. virt-handler（目標節點上的 DaemonSet）
+   ├── 建立 virt-launcher Pod（包裝 QEMU 行程的 sandbox）
+   ├── 設定 VM 磁碟（掛載 PVC 或下載 Container Disk）
+   ├── 設定網路（OVS/bridge/SR-IOV）
+   └── 呼叫 libvirt API 啟動 QEMU 行程
+          ↓
+4. VM 運行中，kubectl get vmi 顯示 Running
+          ↓
+5. 維護節點時：kubectl drain node
+   └── virt-controller 自動觸發 Live Migration
+       ├── 在目標節點建立新的 virt-launcher Pod
+       ├── 透過 QEMU migration protocol 傳輸 VM 記憶體狀態
+       ├── 最後 cutover（downtime < 1 秒）
+       └── 舊節點的 VMI 清理
+```
+
+## 最小可行配置
+
+### 第一步：確認節點有 KVM 能力
+
+```bash
+# 確認節點支援硬體虛擬化
+kubectl get nodes -o custom-columns=\
+  'NAME:.metadata.name,KVM:.status.allocatable.devices\.kubevirt\.io/kvm'
+# 應顯示 1（代表節點有 KVM）
+
+# 查看 KubeVirt 版本與狀態
+kubectl -n kubevirt get kubevirt kubevirt -o jsonpath='{.status.observedKubeVirtVersion}'
+```
+
+### 第二步：定義 Linux VM
+
+```yaml
+apiVersion: kubevirt.io/v1
+kind: VirtualMachine
+metadata:
+  name: ubuntu-server-01
+  namespace: default
+spec:
+  running: true              # ★ 啟動 VM
+  template:
+    metadata:
+      labels:
+        app: ubuntu-server
+    spec:
+      domain:
+        cpu:
+          cores: 4
+          sockets: 1
+          threads: 1
+        resources:
+          requests:
+            memory: 8Gi
+        # ★ 使用 KVM 硬體加速（需要 KVM 支援的節點）
+        devices:
+          disks:
+            - name: rootdisk
+              disk:
+                bus: virtio
+            - name: cloudinitdisk
+              disk:
+                bus: virtio
+          interfaces:
+            - name: default
+              masquerade: {}   # ★ 使用 Pod Network（NAT 模式）
+      networks:
+        - name: default
+          pod: {}
+      volumes:
+        # ★ 從 PVC 讀取 OS 磁碟（需要事先把 OS image 匯入為 PVC）
+        - name: rootdisk
+          persistentVolumeClaim:
+            claimName: ubuntu-server-01-disk
+        # ★ cloud-init 設定（設定 root password、SSH key）
+        - name: cloudinitdisk
+          cloudInitNoCloud:
+            userDataBase64: |
+              I2Nsb3VkLWNvbmZpZwp1c2VyczoKICAtIG5hbWU6IHVidW50dQogICAgc3NoX2F1dGhvcml6ZWRfa2V5czoKICAgICAgLSBzc2gtcnNhIEFBQUEuLi4=
+```
+
+### 第三步：定義 Windows Server VM
+
+```yaml
+apiVersion: kubevirt.io/v1
+kind: VirtualMachine
+metadata:
+  name: windows-ad-01
+spec:
+  running: true
+  template:
+    spec:
+      domain:
+        cpu:
+          cores: 8
+        resources:
+          requests:
+            memory: 16Gi
+        devices:
+          disks:
+            - name: rootdisk
+              disk:
+                bus: sata    # ★ Windows 常用 sata 而非 virtio
+          interfaces:
+            - name: default
+              bridge: {}     # ★ Bridge 模式，讓 VM 直接在 Pod Network 上
+            - name: physical
+              bridge: {}     # ★ 第二張網卡，連物理網路（需要 Multus）
+      networks:
+        - name: default
+          pod: {}
+        - name: physical
+          multus:
+            networkName: default/physical-net   # ★ Multus NetworkAttachmentDefinition
+      volumes:
+        - name: rootdisk
+          persistentVolumeClaim:
+            claimName: windows-ad-01-disk
+```
+
+### 第四步：維護節點時的 Live Migration
+
+```bash
+# 維護前：把節點上的所有 VM migrate 走
+kubectl drain node-01 --ignore-daemonsets --delete-emptydir-data
+
+# KubeVirt 自動觸發 Live Migration（也可手動觸發）
+kubectl create -f - <<EOF
+apiVersion: kubevirt.io/v1
+kind: VirtualMachineInstanceMigration
+metadata:
+  name: migrate-ubuntu-server-01
+spec:
+  vmiName: ubuntu-server-01
+EOF
+
+# 監控 Migration 進度
+kubectl get vmim migrate-ubuntu-server-01 -w
+# Phase: Scheduling → Preparing → TargetReady → Running → Succeeded
+
+# 確認 VM 已到新節點（不中斷）
+kubectl get vmi ubuntu-server-01 -o jsonpath='{.status.nodeName}'
+```
+
+## 驗證 VM 運行狀態
+
+```bash
+# 查看所有 VM
+kubectl get vm,vmi -A
+
+# 透過 virtctl 連入 VM 的 Console
+virtctl console ubuntu-server-01
+
+# 透過 VNC 連入（Windows 用）
+virtctl vnc windows-ad-01
+
+# 查看 VM 的資源使用
+kubectl -n kubevirt exec -it deploy/virt-api -- \
+  kubectl get vmi ubuntu-server-01 -o jsonpath='{.status.interfaces}'
+```
+
+## 常見變體
+
+### 匯入現有 VMware VM（不停機遷移）
+
+使用 CDI（Containerized Data Importer）把 VMware 的 VMDK 轉換為 Ceph PVC：
+
+```yaml
+apiVersion: cdi.kubevirt.io/v1beta1
+kind: DataVolume
+metadata:
+  name: vmware-import
+spec:
+  source:
+    http:
+      url: "http://file-server/vm-disk.vmdk"
+  pvc:
+    storageClassName: rook-ceph-block
+    accessModes:
+      - ReadWriteOnce
+    resources:
+      requests:
+        storage: 100Gi
+```
+
+### SR-IOV 高效能網路（5G/HPC 場景）
+
+對於需要低延遲的 VM（5G UPF、HPC 計算），使用 SR-IOV 讓 VM 直接存取物理網卡，繞過虛擬交換機層，延遲可降至微秒級。
+
+### 結合 Rook 提供 VM 持久化存儲
+
+VM 磁碟儲存在 Rook-Ceph 的 Block Storage PVC，有 3 份副本，節點故障時 VM 可以在另一台節點重新啟動並讀取相同磁碟。參考 [Rook 持久化存儲使用情境](/rook/usecases/stateful-storage)。
+
+## 深入閱讀
+
+- [VMI 生命週期](/kubevirt/features/vmi-lifecycle) — VirtualMachine 與 VMI 的關係、狀態機
+- [virt-controller](/kubevirt/features/virt-controller) — 排程邏輯與 VM 狀態管理
+- [virt-handler](/kubevirt/features/virt-handler) — QEMU 行程管理與 libvirt 互動
+- [VM 網路](/kubevirt/features/vm-network) — masquerade/bridge/SR-IOV 模式選擇
+- [Live Migration](/kubevirt/features/live-migration) — Migration 狀態機與 downtime 分析

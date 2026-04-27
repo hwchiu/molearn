@@ -1,0 +1,206 @@
+---
+layout: doc
+title: Kube-OVN — 多租戶網路隔離（VPC 架構）
+description: 電信或 SaaS 公司如何在同一個 Kubernetes cluster 上為多個客戶建立完全隔離的 VPC，支援重疊 IP、靜態 IP 綁定，以及透過 BGP 讓 Pod IP 可被外部路由直接存取
+---
+
+# 使用情境：多租戶網路隔離（VPC 架構）
+
+> **目標效果**：20 個客戶的工作負載共用同一個 Kubernetes cluster，每個客戶有獨立的 VPC（IP 可以重疊），資料庫 Pod 有固定靜態 IP，5G 工作負載透過 BGP 讓外部路由器直接存取 Pod IP（無 NAT）。
+
+## 你會遇到什麼問題
+
+預設的 Kubernetes 網路（Calico/Flannel）只有一個扁平的 Pod CIDR：
+
+- **無隔離**：不同客戶的 Pod 在同一個廣播域，只靠 NetworkPolicy（Layer 4）做限制
+- **IP 衝突**：多租戶環境中，客戶 A 和客戶 B 可能都想用 10.0.0.0/24 作為資料庫 IP
+- **無靜態 IP**：Pod 重啟後 IP 改變，有狀態服務（DB、Cache）的連線設定需要更新
+- **NAT 延遲**：Service LoadBalancer 和 SNAT 增加延遲，不符合 5G 電信等級 SLA
+- **粗糙的 QoS**：無法針對特定 Pod 的流量設定頻寬限制
+
+## 哪些元件協作解決這個問題
+
+| 元件 | 職責 |
+|------|------|
+| [VPC 與 Subnet](/kube-ovn/features/vpc-subnet) | 為每個租戶建立獨立的 OVN 邏輯路由器和交換機，支援 IP 重疊 |
+| [IPAM](/kube-ovn/features/ipam) | 管理每個 Subnet 的 IP 分配，支援靜態 IP annotation |
+| [OVN 整合](/kube-ovn/features/ovn-integration) | 將 Kubernetes 資源同步到 OVN Northbound DB，生成轉發規則 |
+| [Controllers](/kube-ovn/features/controllers) | Reconcile VPC/Subnet/IP 等 CRD 與 OVN 狀態 |
+| [QoS 與安全策略](/kube-ovn/features/qos-security) | OVN ACL 規則（替代 iptables），精細到 Pod 層級的頻寬限制 |
+| [BGP](/kube-ovn/features/bgp) | 將 Pod IP 宣告到上游路由器，讓外部設備直接 IP 路由到 Pod |
+
+## 協作流程
+
+```
+平台工程師為客戶 A 建立 VPC
+        ↓
+Kube-OVN VPC Controller
+  ├── 在 OVN Northbound DB 建立 Logical Router（客戶 A 專屬）
+  └── 為每個 Subnet 建立 Logical Switch 連接到此 Router
+        ↓
+客戶 A 的 Pod 建立時：
+  ├── Kube-OVN CNI 查詢 Pod 所在的 Subnet
+  ├── IPAM 從 Subnet CIDR 分配 IP（或使用 annotation 靜態 IP）
+  ├── 建立 OVN Logical Switch Port
+  ├── 在節點建立 veth pair，設定 OVS Port
+  └── OVN 自動計算並下發轉發規則（Flow Table）
+        ↓
+客戶 B 建立 Pod，使用相同 CIDR（IP 不衝突，不同 VPC）
+        ↓
+5G 工作負載：BGP Controller 宣告 Pod IP 到 ToR 交換機
+  └── 外部流量直接 IP 路由到 Pod，繞過 SNAT
+```
+
+## 最小可行配置
+
+### 第一步：為租戶建立 VPC
+
+```yaml
+apiVersion: kubeovn.io/v1
+kind: Vpc
+metadata:
+  name: customer-a-vpc
+spec:
+  # ★ 靜態路由（可選）：到外部網路的路由
+  staticRoutes:
+    - cidr: 0.0.0.0/0
+      nextHopIP: 10.0.0.1
+      policy: policyDst
+```
+
+### 第二步：在 VPC 內建立 Subnet
+
+```yaml
+apiVersion: kubeovn.io/v1
+kind: Subnet
+metadata:
+  name: customer-a-db-subnet
+spec:
+  vpc: customer-a-vpc          # ★ 屬於哪個 VPC
+  cidrBlock: 10.10.0.0/24     # ★ 可以和其他 VPC 重疊
+  gateway: 10.10.0.1
+  excludeIps:
+    - 10.10.0.1               # 排除 gateway IP
+  # ★ 這個 Subnet 只給 customer-a namespace 用
+  namespaces:
+    - customer-a
+  # ★ Private Subnet：只允許 VPC 內部流量，不對外
+  private: true
+  allowSubnets:
+    - customer-a-app-subnet   # 允許 app subnet 存取 db subnet
+```
+
+### 第三步：為資料庫 Pod 設定靜態 IP
+
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: mysql-master
+  namespace: customer-a
+  annotations:
+    # ★ 靜態 IP：Pod 重啟後 IP 不變
+    ovn.kubernetes.io/ip_address: "10.10.0.100"
+    ovn.kubernetes.io/mac_address: "00:00:00:10:10:64"  # 可選
+spec:
+  containers:
+    - name: mysql
+      image: mysql:8.0
+```
+
+### 第四步：為 5G 工作負載設定 BGP 對等
+
+```yaml
+apiVersion: kubeovn.io/v1
+kind: Subnet
+metadata:
+  name: 5g-upf-subnet
+spec:
+  vpc: default-vpc       # 5G 工作負載在預設 VPC
+  cidrBlock: 10.20.0.0/24
+  # ★ 啟用 BGP 廣播：把這個 Subnet 的 Pod IP 宣告出去
+  bgpPeer: "192.168.1.1:65001"  # ToR 交換機的 BGP peer
+  externalEgressGateway: "192.168.1.2"
+```
+
+### 第五步：設定 QoS 限速（按租戶）
+
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: customer-b-app
+  namespace: customer-b
+  annotations:
+    # ★ 入站限速 100Mbps，出站限速 50Mbps
+    ovn.kubernetes.io/ingress_rate: "100"   # Mbit/s
+    ovn.kubernetes.io/egress_rate: "50"     # Mbit/s
+spec:
+  # ...
+```
+
+## 驗證網路隔離
+
+```bash
+# 確認 VPC 已建立並同步到 OVN
+kubectl get vpc customer-a-vpc -o yaml | grep -A5 status
+
+# 確認 Subnet 已建立
+kubectl get subnet customer-a-db-subnet
+
+# 確認靜態 IP 已分配
+kubectl get ips -n customer-a | grep mysql-master
+
+# 在 customer-a 的 Pod 內，確認無法存取 customer-b 的 Pod（VPC 隔離）
+kubectl exec -n customer-a mysql-master -- ping <customer-b-pod-ip>
+# 預期：100% packet loss
+
+# 確認 BGP 路由已宣告（在 ToR 交換機上）
+# show bgp neighbors <kube-ovn-bgp-peer-ip> received-routes
+```
+
+## 常見變體
+
+### VPC Peering（讓兩個 VPC 互通）
+
+```yaml
+# 在 Vpc 物件的 staticRoutes 加入對方 VPC 的路由
+apiVersion: kubeovn.io/v1
+kind: Vpc
+metadata:
+  name: customer-a-vpc
+spec:
+  staticRoutes:
+    # ★ 允許 customer-a-vpc 存取 customer-c-vpc（業務合作）
+    - cidr: 10.30.0.0/24    # customer-c-vpc 的 CIDR
+      nextHopIP: <vpc-peering-gateway-ip>
+      policy: policyDst
+```
+
+### NAT Gateway（讓 VPC 內 Pod 存取外網）
+
+```yaml
+apiVersion: kubeovn.io/v1
+kind: VpcNatGateway
+metadata:
+  name: customer-a-nat-gw
+spec:
+  vpc: customer-a-vpc
+  subnet: customer-a-nat-subnet
+  lanIp: 10.10.100.254
+  # EIP 綁定（讓這個 VPC 對外用固定 IP）
+  eips:
+    - eipName: customer-a-eip
+```
+
+### Underlay 模式（VM 遷移場景）
+
+如果你的工作負載是從 VM 遷移過來的，Pod 需要直接在物理網路上（二層可達），可以改用 [Underlay 模式](/kube-ovn/features/underlay)，Pod 直接連接到物理交換機 VLAN，不需要 OVN 封裝。
+
+## 深入閱讀
+
+- [VPC 與 Subnet 詳解](/kube-ovn/features/vpc-subnet) — OVN Logical Router/Switch 對應關係
+- [IPAM](/kube-ovn/features/ipam) — 靜態 IP annotation 實作、IP 衝突防護
+- [OVN 整合](/kube-ovn/features/ovn-integration) — CRD 到 OVN NB DB 的同步流程
+- [BGP 整合](/kube-ovn/features/bgp) — GoBGP 整合與路由宣告策略
+- [QoS 與安全策略](/kube-ovn/features/qos-security) — OVN ACL 規則生成、流量整形機制

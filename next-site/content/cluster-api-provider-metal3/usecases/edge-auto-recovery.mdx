@@ -1,0 +1,188 @@
+---
+layout: doc
+title: Metal3 — 無人機房邊緣節點自動修復
+description: 在沒有現場工程師的邊緣機房，當裸機節點故障時，如何透過 BMC 遠端重啟或重新安裝 OS，實現全自動故障恢復
+---
+
+# 使用情境：無人機房邊緣節點自動修復
+
+> **目標效果**：50 個邊緣機房，每個機房只有 2-4 台裸機，無現場人員。節點故障時自動偵測、自動透過 BMC 重啟或重裝 OS，無需人工介入，95% 以上的故障在 30 分鐘內自動恢復。
+
+## 你會遇到什麼問題
+
+邊緣計算場景的裸機節點面臨比雲端更嚴苛的挑戰：
+
+- **無法 SSH 處理**：OS 崩潰後網路不通，傳統方式無法登入修復
+- **無現場人員**：機房可能在偏遠地點，派人去要花幾小時甚至幾天
+- **硬體不可預測**：工業環境溫度、電源不穩定，節點故障頻率高於雲端 VM
+- **服務不可中斷**：5G MEC、工廠自動化等場景要求高可用，不能等人工修復
+
+## 哪些元件協作解決這個問題
+
+| 元件 | 職責 |
+|------|------|
+| [MachineHealthCheck（CAPI）](/cluster-api/features/machine-health-check) | 監控 node Ready 狀態，超過 timeout 觸發 Remediation |
+| [Metal3Remediation](/cluster-api-provider-metal3/features/remediation) | 執行裸機特有的修復策略：BMC 重啟或 OS 重新安裝 |
+| [BareMetalHost（BMO）](/cluster-api-provider-metal3/features/bmh-lifecycle) | 封裝 BMC 操作，提供電源管理、PXE boot 等功能 |
+| [IPAM](/cluster-api-provider-metal3/features/ipam) | 為重新 provision 的節點重新分配固定 IP，保持網路連通性 |
+
+## 協作流程
+
+```
+1. Kubernetes node 進入 NotReady 超過 5 分鐘
+          ↓
+2. MachineHealthCheck 觸發 Remediation
+   (設定 remediationTemplate 指向 Metal3RemediationTemplate)
+          ↓
+3. Metal3RemediationController 建立 Metal3Remediation 物件
+          ↓
+4. 執行修復策略（Strategy）：
+   ├── Reboot（快速，適合 OS hang/kernel panic）
+   │   BareMetalHost → Ironic → BMC IPMI/Redfish 重啟
+   │   等待 node 重新加入 cluster
+   │
+   └── 若 Reboot 失敗超過 retryLimit 次
+       → 降級為 OS 重新安裝（Re-provision）
+         BareMetalHost 回到 available 狀態
+         Metal3MachineReconciler 重新 provision
+         IPAM 為新 provision 的節點分配同樣的 IP
+          ↓
+5. node 重新上線，MachineHealthCheck 恢復 healthy 狀態
+```
+
+## 最小可行配置
+
+### 第一步：定義 BareMetalHost（每台裸機）
+
+```yaml
+apiVersion: metal3.io/v1alpha1
+kind: BareMetalHost
+metadata:
+  name: edge-node-01
+  namespace: metal3
+spec:
+  # ★ BMC 連線資訊（Redfish 支援大多數現代伺服器）
+  bmc:
+    address: redfish+https://192.168.1.100/redfish/v1/Systems/1
+    credentialsName: edge-node-01-bmc-secret
+    disableCertificateVerification: true  # 邊緣環境常用自簽憑證
+  bootMACAddress: "aa:bb:cc:dd:ee:01"
+  # ★ OS image（事先放到本地 HTTP server，避免依賴外網）
+  image:
+    url: http://local-server/ubuntu-22.04-server.qcow2
+    checksum: sha256:abc123...
+  online: true
+```
+
+### 第二步：定義 Metal3RemediationTemplate
+
+```yaml
+apiVersion: infrastructure.cluster.x-k8s.io/v1beta1
+kind: Metal3RemediationTemplate
+metadata:
+  name: edge-remediation-template
+  namespace: metal3
+spec:
+  template:
+    spec:
+      strategy:
+        # ★ 先嘗試重啟（快，通常夠用）
+        type: Reboot
+        retryLimit: 3        # 重啟最多嘗試 3 次
+        timeout: 10m         # 每次等待 10 分鐘讓 node 恢復
+```
+
+### 第三步：在 MachineHealthCheck 引用 RemediationTemplate
+
+```yaml
+apiVersion: cluster.x-k8s.io/v1beta1
+kind: MachineHealthCheck
+metadata:
+  name: edge-worker-health-check
+  namespace: metal3
+spec:
+  clusterName: edge-cluster
+  selector:
+    matchLabels:
+      cluster.x-k8s.io/deployment-name: edge-worker-md
+  unhealthyConditions:
+    - type: Ready
+      status: "False"
+      timeout: 5m
+    - type: Ready
+      status: Unknown
+      timeout: 8m      # 邊緣環境網路不穩，給多一點時間
+  maxUnhealthy: 50%    # 邊緣 cluster 節點少，不能太嚴格
+  # ★ 關鍵：指定 Metal3 的修復方式，而不是預設的刪除 Machine
+  remediationTemplate:
+    apiVersion: infrastructure.cluster.x-k8s.io/v1beta1
+    kind: Metal3RemediationTemplate
+    name: edge-remediation-template
+    namespace: metal3
+```
+
+### 第四步：確保 IPAM 保持 IP 不變（可選但建議）
+
+```yaml
+apiVersion: ipam.metal3.io/v1alpha1
+kind: IPPool
+metadata:
+  name: edge-cluster-pool
+  namespace: metal3
+spec:
+  subnet: 192.168.10.0/24
+  prefix: 24
+  gateway: 192.168.10.1
+  # ★ 為已知節點預留固定 IP
+  preAllocations:
+    edge-node-01-ip: 192.168.10.11
+    edge-node-02-ip: 192.168.10.12
+    edge-node-03-ip: 192.168.10.13
+```
+
+## 監控修復流程
+
+```bash
+# 查看 Metal3Remediation 物件（修復正在進行時自動建立）
+kubectl get metal3remediation -n metal3 -w
+
+# 查看 BareMetalHost 狀態（確認 BMC 操作進行中）
+kubectl get baremetalhost -n metal3
+# 預期看到: edge-node-01 → provisioning → provisioned
+
+# 查看 MachineHealthCheck 統計
+kubectl describe machinehealthcheck edge-worker-health-check -n metal3
+# 注意 Status.CurrentHealthy / Status.RemediationsAllowed
+
+# 查看 Ironic 日誌（BMC 操作詳情）
+kubectl logs -n baremetal-operator-system deployment/baremetal-operator -c ironic
+```
+
+## 常見變體
+
+### 依故障嚴重程度分層修復
+
+```yaml
+# 輕微故障：只重啟（1 分鐘可完成）
+Metal3RemediationTemplate: quick-reboot
+  strategy: Reboot, retryLimit: 2, timeout: 5m
+
+# 嚴重故障（重啟無效）：由上層 MachineHealthCheck 觸發刪除 Machine
+# Metal3Machine 被刪後 BareMetalHost 回到 available
+# MachineSet 自動建立新 Machine，重新 provision
+```
+
+### 搭配 AlertManager 通知
+
+修復失敗（超過 retryLimit 或觸發 Circuit Breaker）時，`Metal3Remediation.status.phase` 會變成 `Failed`，可以用 Prometheus 的自訂 rule 觸發 PagerDuty/Slack 通知，只在無法自動恢復時才告警。
+
+### 多機房統一管理
+
+用 management cluster（在穩定的數據中心）管理所有邊緣 cluster 的 BareMetalHost、MachineHealthCheck 和 Metal3Remediation。每個邊緣機房不需要本地的 management 元件，只需要 Ironic 能連到 BMC。
+
+## 深入閱讀
+
+- [Metal3 Remediation 詳解](/cluster-api-provider-metal3/features/remediation) — 修復策略狀態機與 retryLimit 邏輯
+- [BareMetalHost 生命週期](/cluster-api-provider-metal3/features/bmh-lifecycle) — BMC 操作、PXE boot 流程
+- [IPAM](/cluster-api-provider-metal3/features/ipam) — IP 位址管理與固定 IP 配置
+- [MachineHealthCheck（CAPI）](/cluster-api/features/machine-health-check) — Circuit Breaker 機制

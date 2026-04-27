@@ -27,6 +27,12 @@ export function listFeatureSlugs(project: ProjectId): string[] {
     .map((f: string) => f.replace(/\.mdx$/, ''))
 }
 
+export function loadUseCaseSource(project: ProjectId, slug: string): string {
+  const mdxPath = path.join(CONTENT_ROOT, project, 'usecases', `${slug}.mdx`)
+  if (!existsSync(mdxPath)) return ''
+  return readFileSync(mdxPath, 'utf-8')
+}
+
 export function loadFeatureMap(project: ProjectId): any | null {
   const jsonPath = path.join(CONTENT_ROOT, project, 'feature-map.json')
   if (!existsSync(jsonPath)) return null
