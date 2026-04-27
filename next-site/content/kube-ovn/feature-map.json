@@ -1,0 +1,28 @@
+{
+  "projectId": "kube-ovn",
+  "nodes": [
+    {"id": "architecture", "label": "整體架構", "description": "Kube-OVN 各核心元件的職責與 OVN/OVS 整合層的協作關係", "featureSlug": "architecture", "category": "infra", "position": {"x": 400, "y": 50}},
+    {"id": "vpc-subnet", "label": "VPC & Subnet CRD", "description": "以 VPC 和 Subnet 兩層 CRD 實現多租戶網路隔離的設計邏輯", "featureSlug": "vpc-subnet", "category": "api", "position": {"x": 150, "y": 210}},
+    {"id": "ipam", "label": "IPAM 設計", "description": "Kube-OVN 記憶體內嵌 IPAM 的架構與靜態/動態 IP 分配機制", "featureSlug": "ipam", "category": "api", "position": {"x": 400, "y": 210}},
+    {"id": "ovn-integration", "label": "OVN Northbound DB 同步", "description": "Kube-OVN 如何將 Kubernetes CRD 翻譯成 OVN Logical Switch 與 Logical Router", "featureSlug": "ovn-integration", "category": "infra", "position": {"x": 650, "y": 210}},
+    {"id": "controllers", "label": "核心 Controller", "description": "Subnet、VPC、Node 三個 controller 的 reconcile 流程與關鍵實作細節", "featureSlug": "controllers", "category": "controller", "position": {"x": 400, "y": 370}},
+    {"id": "underlay", "label": "Underlay 網路模式", "description": "ProviderNetwork 與 VLAN CRD 讓 Pod 直接接入實體網路，不需要隧道封裝", "featureSlug": "underlay", "category": "lifecycle", "position": {"x": 150, "y": 370}},
+    {"id": "qos-security", "label": "QoS & Security Group", "description": "Kube-OVN 如何透過 OVS QoS 與 OVN ACL/PortGroup 實現頻寬限速與安全群組", "featureSlug": "qos-security", "category": "addon", "position": {"x": 650, "y": 370}},
+    {"id": "load-balancing", "label": "Service 負載均衡", "description": "Kube-OVN 以 OVN Load Balancer 取代 iptables/IPVS 實現 ClusterIP 與 NodePort", "featureSlug": "load-balancing", "category": "addon", "position": {"x": 150, "y": 530}},
+    {"id": "bgp", "label": "BGP 整合", "description": "Kube-OVN 如何透過 GoBGP 將 Pod IP 與 Subnet CIDR 宣告給外部路由器", "featureSlug": "bgp", "category": "addon", "position": {"x": 400, "y": 530}},
+    {"id": "nat-gateway", "label": "VPC NAT Gateway & EIP", "description": "自訂 VPC 的南北向出口：NAT Gateway Pod、EIP CRD 與 IptablesEIP 的實作原理", "featureSlug": "nat-gateway", "category": "addon", "position": {"x": 650, "y": 530}}
+  ],
+  "edges": [
+    {"id": "e-arch-vpc", "source": "architecture", "target": "vpc-subnet", "label": "defines"},
+    {"id": "e-arch-ipam", "source": "architecture", "target": "ipam", "label": "includes"},
+    {"id": "e-arch-ovn", "source": "architecture", "target": "ovn-integration", "label": "syncs to"},
+    {"id": "e-vpc-ctrl", "source": "vpc-subnet", "target": "controllers", "label": "reconciled by"},
+    {"id": "e-ovn-ctrl", "source": "ovn-integration", "target": "controllers", "label": "driven by", "animated": true},
+    {"id": "e-vpc-underlay", "source": "vpc-subnet", "target": "underlay", "label": "extends via"},
+    {"id": "e-ctrl-qos", "source": "controllers", "target": "qos-security", "label": "enforces"},
+    {"id": "e-ctrl-lb", "source": "controllers", "target": "load-balancing", "label": "programs"},
+    {"id": "e-ctrl-bgp", "source": "controllers", "target": "bgp", "label": "announces"},
+    {"id": "e-ctrl-nat", "source": "controllers", "target": "nat-gateway", "label": "manages"},
+    {"id": "e-ipam-ctrl", "source": "ipam", "target": "controllers", "label": "allocates for", "animated": true}
+  ]
+}
