@@ -1,0 +1,236 @@
+---
+layout: doc
+title: Rook — 為有狀態應用提供持久化存儲
+description: 如何用 Rook 在 Kubernetes 叢集中建立 Ceph 儲存，同時為資料庫提供高效能 Block Storage、為報表系統提供共享 File System、為 AI 訓練提供 S3 Object Storage
+---
+
+# 使用情境：為有狀態應用提供持久化存儲
+
+> **目標效果**：平台工程師部署一套 Rook-Ceph，10 個開發團隊可以直接用 StorageClass 申請不同類型的持久化存儲，無需了解 Ceph 內部細節，磁碟故障時自動修復，無人工介入。
+
+## 你會遇到什麼問題
+
+Kubernetes 本身不提供持久化存儲，在自建機房環境中：
+
+- **存儲種類多**：資料庫需要 Block Storage（低延遲、獨占），報表需要 File System（多 Pod 共寫），AI 訓練需要 S3（大容量、HTTP 存取）
+- **高可用難**：單台儲存伺服器壞了資料就丟了；傳統 NFS 是單點故障
+- **運維複雜**：Ceph 功能強大但配置複雜，需要深度運維知識
+- **動態佈建**：雲端環境用 AWS EBS / GCS，本地環境需要等管理員手動建立 PV
+
+## 哪些元件協作解決這個問題
+
+| 元件 | 職責 |
+|------|------|
+| [CephCluster](/rook/features/ceph-cluster) | 宣告整個 Ceph 叢集的配置（OSD 數量、複製因子、磁碟選擇策略） |
+| [OSD 與 Monitor](/rook/features/osds-monitors) | Monitor 維護 Cluster Map，OSD 負責實際資料讀寫與複製 |
+| [Rook Controllers](/rook/features/ceph-controllers) | Reconcile CephCluster/CephBlockPool/CephFilesystem 等 CRD，驅動 Ceph 組件部署 |
+| [StorageClasses](/rook/features/storage-classes) | 讓開發者透過 PVC 按需申請存儲，Rook CSI Driver 動態建立 Ceph volume |
+| [CSI Driver](/rook/features/csi-driver) | 在 Pod 排程到節點時，自動掛載 Ceph volume 到 Pod 的文件系統 |
+| [S3 Object Store](/rook/features/s3-object-store) | 部署 RGW（Rados Gateway）提供 S3 相容 API |
+
+## 協作流程
+
+```
+平台工程師部署 CephCluster CRD
+        ↓
+Rook Operator 的 ClusterController
+  ├── 自動發現節點上的可用磁碟（符合 storageClassDeviceSets 條件）
+  ├── 部署 3 個 Monitor Pod（提供 Cluster Map 與仲裁）
+  ├── 為每顆磁碟部署 OSD Pod（BlueStore 格式化）
+  └── Ceph 叢集 HEALTH_OK
+
+平台工程師建立 CephBlockPool + StorageClass
+        ↓
+開發者建立 PVC（申請 Block Storage）
+        ↓
+CSI Driver（RBD Provisioner）
+  ├── 呼叫 Ceph RBD API 建立 image
+  ├── 將 PVC 綁定到對應 PV
+  └── 當 Pod 排程時，掛載 RBD image 到節點，bind-mount 到 Pod
+
+開發者（AI 團隊）建立 CephObjectStore + ObjectBucketClaim
+        ↓
+RGW Deployment 部署 S3 endpoint
+  └── AI 應用直接用 boto3 / AWS SDK 存取（endpoint 改成內部位址）
+```
+
+## 最小可行配置
+
+### 第一步：部署 Rook Operator
+
+```bash
+# 使用 Helm（推薦）
+helm repo add rook-release https://charts.rook.io/release
+helm install --create-namespace --namespace rook-ceph rook-ceph rook-release/rook-ceph
+
+# 確認 Operator 就緒
+kubectl -n rook-ceph get pod -l app=rook-ceph-operator
+```
+
+### 第二步：建立 CephCluster
+
+```yaml
+apiVersion: ceph.rook.io/v1
+kind: CephCluster
+metadata:
+  name: rook-ceph
+  namespace: rook-ceph
+spec:
+  cephVersion:
+    image: quay.io/ceph/ceph:v18.2.0    # Reef 版本
+  dataDirHostPath: /var/lib/rook
+  
+  # ★ Monitor 配置（建議奇數，通常 3 個）
+  mon:
+    count: 3
+    allowMultiplePerNode: false  # 每台節點最多 1 個 Monitor
+  
+  # ★ OSD 配置：讓 Rook 自動發現並使用未格式化的磁碟
+  storage:
+    useAllNodes: true
+    useAllDevices: false    # 不自動使用所有裝置，避免誤格式化
+    deviceFilter: "^sd[b-z]"  # ★ 只使用 /dev/sdb 以後的磁碟（避免系統碟）
+    
+  # ★ 複製因子：每份資料存 3 份（推薦生產環境）
+  # （在 CephBlockPool 和 CephFilesystem 中個別設定）
+```
+
+### 第三步：為資料庫建立 Block Storage
+
+```yaml
+# CephBlockPool：資料的複製策略
+apiVersion: ceph.rook.io/v1
+kind: CephBlockPool
+metadata:
+  name: replicapool
+  namespace: rook-ceph
+spec:
+  replicated:
+    size: 3               # 3 份副本
+    requireSafeReplicaSize: true  # 少於 3 個 OSD 時拒絕寫入
+---
+# StorageClass：讓開發者用 PVC 申請 Block Storage
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: rook-ceph-block
+provisioner: rook-ceph.rbd.csi.ceph.com
+parameters:
+  clusterID: rook-ceph
+  pool: replicapool
+  imageFormat: "2"
+  imageFeatures: layering
+  csi.storage.k8s.io/provisioner-secret-name: rook-csi-rbd-provisioner
+  csi.storage.k8s.io/provisioner-secret-namespace: rook-ceph
+  csi.storage.k8s.io/node-stage-secret-name: rook-csi-rbd-node
+  csi.storage.k8s.io/node-stage-secret-namespace: rook-ceph
+reclaimPolicy: Delete
+allowVolumeExpansion: true   # 允許線上擴容
+```
+
+### 第四步：為 AI 訓練建立 S3 Object Store
+
+```yaml
+apiVersion: ceph.rook.io/v1
+kind: CephObjectStore
+metadata:
+  name: my-store
+  namespace: rook-ceph
+spec:
+  metadataPool:
+    replicated:
+      size: 3
+  dataPool:
+    replicated:
+      size: 3
+  gateway:
+    port: 80
+    instances: 2    # 2 個 RGW 實例，高可用
+---
+# 讓 AI 應用申請 S3 bucket（不需要了解 Ceph）
+apiVersion: objectbucket.io/v1alpha1
+kind: ObjectBucketClaim
+metadata:
+  name: training-data-bucket
+  namespace: ai-team
+spec:
+  generateBucketName: training-data
+  storageClassName: rook-ceph-delete-bucket
+```
+
+### 開發者使用 Block Storage（只需這 8 行）
+
+```yaml
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: mysql-data
+spec:
+  storageClassName: rook-ceph-block    # ★ 使用 Rook 建立的 StorageClass
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 50Gi
+```
+
+## 驗證存儲正常運作
+
+```bash
+# 確認 Ceph 叢集健康
+kubectl -n rook-ceph exec deploy/rook-ceph-tools -- ceph status
+# 期望: HEALTH_OK, X pgs active+clean
+
+# 確認 OSD 數量
+kubectl -n rook-ceph exec deploy/rook-ceph-tools -- ceph osd tree
+
+# 測試 PVC 可以正常 bound
+kubectl apply -f test-pvc.yaml
+kubectl get pvc test-pvc   # 應為 Bound
+
+# 確認 S3 endpoint 可以存取
+kubectl -n rook-ceph get service rook-ceph-rgw-my-store
+# 使用 AWS CLI 測試
+aws s3 ls --endpoint-url http://<rgw-svc-ip>
+```
+
+## 常見變體
+
+### 磁碟故障自動修復
+
+當一顆 OSD 磁碟故障，Ceph 自動：
+1. 將該 OSD 標記為 `down`
+2. 觸發 recovery：從其他 OSD 的副本重建資料到健康的 OSD
+3. 整個過程對應用完全透明（讀寫不中斷）
+
+Rook Operator 偵測到 OSD Pod CrashLoop 後，會嘗試重啟；若磁碟確實壞掉，operator 會等待人工替換磁碟後，自動把新磁碟格式化並加入 Ceph。
+
+### 線上容量擴充
+
+```bash
+# 新增磁碟到節點後，Rook 的 OSD 自動發現機制會偵測到新磁碟
+# （前提：deviceFilter 設定符合新磁碟名稱）
+# 無需重啟，Ceph 自動開始 rebalance，把資料分散到新磁碟
+```
+
+### 跨節點高可用（Crush Map）
+
+```yaml
+# 在 CephCluster 中設定 Failure Domain
+storage:
+  deviceSets:
+    - name: set1
+      count: 3
+      placement:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - topologyKey: kubernetes.io/hostname  # 每台節點最多 1 個 OSD set
+```
+
+## 深入閱讀
+
+- [CephCluster 配置詳解](/rook/features/ceph-cluster) — storageClassDeviceSets、Mon 仲裁設定
+- [OSD 與 Monitor](/rook/features/osds-monitors) — BlueStore 格式化流程、Monitor 選舉機制
+- [StorageClasses](/rook/features/storage-classes) — RWO / RWX / ROX 存取模式與 CSI 互動
+- [CSI Driver](/rook/features/csi-driver) — PVC 動態佈建流程與掛載機制
+- [S3 Object Store](/rook/features/s3-object-store) — RGW 部署與 S3 相容性

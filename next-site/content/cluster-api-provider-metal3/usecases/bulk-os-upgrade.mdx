@@ -1,0 +1,186 @@
+---
+layout: doc
+title: Metal3 — 批量裸機 OS 升級
+description: 如何在不重新配置 IP 和 hostname 的情況下，對 100 台裸機節點進行滾動 OS 升級，利用 Node Reuse 讓同一台裸機重新 provision 並自動加回 cluster
+---
+
+# 使用情境：批量裸機 OS 升級
+
+> **目標效果**：把 100 台裸機節點的 OS 從 Ubuntu 22.04 升到 24.04（或更換 K8s 版本），保持同一台機器的 IP 和 hostname 不變，服務不中斷，全程自動化無需人工登入機器。
+
+## 你會遇到什麼問題
+
+裸機的 OS 升級比 VM 困難得多：
+
+- **無 Live Migration**：裸機不能像 VM 一樣在不關機的情況下遷移，必須 drain → decommission → 重裝 → rejoin
+- **IP 和 hostname 要保持**：某些服務（BGP peer、靜態路由、監控 target）是根據 IP 設定的，更換 IP 成本極高
+- **大量操作風險高**：100 台機器手動操作，每台需要 20+ 步驟，容易出錯
+- **新機器不一定可用**：裸機集群大小固定，不像雲端可以先加新機器再刪舊機器
+
+## 哪些元件協作解決這個問題
+
+| 元件 | 職責 |
+|------|------|
+| [Node Reuse](/cluster-api-provider-metal3/features/node-reuse) | 讓已使用的 BareMetalHost 在被釋放後優先重複使用於同一個 MachineDeployment |
+| [Data Templates](/cluster-api-provider-metal3/features/data-templates) | 為每台機器生成個別化的 cloud-init 設定（hostname、網路設定、SSH key）|
+| [BareMetalHost 生命週期](/cluster-api-provider-metal3/features/bmh-lifecycle) | 執行 deprovisioning（擦除磁碟）→ provisioning（安裝新 OS）的完整流程 |
+| [IPAM](/cluster-api-provider-metal3/features/ipam) | 確保同一台機器每次 provision 後拿到相同的 IP |
+
+## Node Reuse 的核心概念
+
+沒有 Node Reuse 時，Metal3 的 MachineDeployment 滾動升級會：
+
+```
+舊 Machine 被刪 → BareMetalHost 進入 available → 
+MachineDeployment 建立新 Machine → 隨機選一台 available 的 BareMetalHost
+```
+
+這意味著「這台機器上的新 Machine」可能使用的是「另一台機器的 BareMetalHost」，IP 和 hostname 全部打亂。
+
+**有了 Node Reuse**：
+
+```
+舊 Machine 被刪 → BareMetalHost 被標記為 "reuse candidate" →
+MachineDeployment 建立新 Machine → 優先選回同一台 BareMetalHost →
+同一台機器重新 provision，保持相同 IP 和 hostname
+```
+
+## 協作流程
+
+```
+1. 更新 Metal3MachineTemplate（指向新 OS image）
+
+2. MachineDeployment Controller 觸發滾動升級
+
+3. 第一批：選取 maxUnavailable 台 worker
+   ├── Kubernetes: drain node（驅逐 Pod）
+   ├── CAPI: 刪除 Machine 物件
+   ├── Metal3: BareMetalHost 進入 deprovisioning
+   │   └── Ironic 擦除磁碟（保證資料安全）
+   └── BareMetalHost 回到 available，
+       貼上 reuse 標籤
+
+4. MachineDeployment 建立新 Machine
+   └── Metal3MachineReconciler 選回同一台 BareMetalHost
+   
+5. 新 provision 流程：
+   ├── Data Template 為這台機器生成 cloud-init
+   │   （包含原來的 hostname、IP 設定）
+   ├── Ironic 透過 PXE boot + image 寫入磁碟
+   └── 機器上線，kubeadm join 加回 cluster
+
+6. node 健康 → 繼續下一批
+```
+
+## 最小可行配置
+
+### 第一步：確認 Node Reuse 設定在 Metal3Machine
+
+```yaml
+apiVersion: infrastructure.cluster.x-k8s.io/v1beta1
+kind: Metal3MachineTemplate
+metadata:
+  name: worker-machine-template-v2   # 新版本的 template
+  namespace: metal3
+spec:
+  template:
+    spec:
+      # ★ 啟用 Node Reuse：優先重用釋放的 BareMetalHost
+      automatedCleaningMode: metadata  # 只清除 metadata，不做全盤擦除（更快）
+      # ★ 新 OS image
+      image:
+        url: http://local-server/ubuntu-24.04-server.qcow2
+        checksum: sha256:def456...
+      # ★ 指定 Data Template
+      dataTemplate:
+        name: worker-data-template
+```
+
+### 第二步：Data Template 確保 hostname 和 IP 一致
+
+```yaml
+apiVersion: infrastructure.cluster.x-k8s.io/v1beta1
+kind: Metal3DataTemplate
+metadata:
+  name: worker-data-template
+  namespace: metal3
+spec:
+  # ★ 從 BareMetalHost 的標籤讀取 hostname
+  metaData:
+    strings:
+      - key: local-hostname
+        object:
+          field: metadata.name     # 使用 BareMetalHost 的名稱作為 hostname
+  # ★ 從 IPAM 分配固定 IP（根據 BareMetalHost 名稱預先分配）
+  networkData:
+    networks:
+      ethernets:
+        - id: eth0
+          ipAddressFromIPPool: worker-ip-pool  # ★ 引用 IPPool
+          link: eth0
+    services:
+      dns:
+        - 8.8.8.8
+```
+
+### 第三步：觸發滾動升級
+
+```bash
+# 建立新的 Metal3MachineTemplate（指向新 OS image）
+kubectl apply -f worker-machine-template-v2.yaml
+
+# 更新 MachineDeployment 引用新 template
+kubectl patch machinedeployment worker-md \
+  -p '{"spec":{"template":{"spec":{"infrastructureRef":{"name":"worker-machine-template-v2"}}}}}' \
+  --type merge
+
+# 設定滾動升級速度（建議一次一台，確保服務不中斷）
+kubectl patch machinedeployment worker-md \
+  -p '{"spec":{"strategy":{"rollingUpdate":{"maxUnavailable":1,"maxSurge":0}}}}' \
+  --type merge
+```
+
+### 監控升級進度
+
+```bash
+# 查看 BareMetalHost 狀態（deprovisioning → provisioning → provisioned）
+watch kubectl get baremetalhost -n metal3
+
+# 查看 Machine 滾動進度
+kubectl rollout status machinedeployment worker-md
+
+# 確認 node 版本（OS 版本）
+kubectl get nodes -o custom-columns=\
+  'NAME:.metadata.name,STATUS:.status.conditions[-1].type,OS:.status.nodeInfo.osImage'
+
+# 如果升級卡住，查看 Ironic 詳情
+kubectl logs -n baremetal-operator-system deployment/baremetal-operator -c ironic | grep ERROR
+```
+
+## 常見變體
+
+### 分批升級（先升測試節點再升生產）
+
+```bash
+# 用 label selector 控制升級範圍
+# 先為測試節點的 BareMetalHost 加標籤
+kubectl label baremetalhost edge-node-01 upgrade-batch=test -n metal3
+
+# 只更新指定的 MachineDeployment（對應測試節點）
+# 確認測試節點正常後，再升其他節點
+```
+
+### 結合 Kubernetes 版本升級
+
+先升級 OS（步驟同上），確認節點穩定後，再透過 [CAPI 的滾動升級](/cluster-api/usecases/cluster-self-healing) 更新 K8s 版本。兩個升級分開進行，方便排查問題。
+
+### 緊急回滾
+
+如果新 OS image 有問題，直接把 MachineDeployment 的 `infrastructureRef` 改回舊的 `Metal3MachineTemplate`，下一輪滾動升級會裝回舊 OS。
+
+## 深入閱讀
+
+- [Node Reuse 詳解](/cluster-api-provider-metal3/features/node-reuse) — BareMetalHost 重用標籤機制與選擇邏輯
+- [Data Templates](/cluster-api-provider-metal3/features/data-templates) — cloud-init 模板生成與 per-machine 差異化
+- [BareMetalHost 生命週期](/cluster-api-provider-metal3/features/bmh-lifecycle) — deprovisioning 流程與磁碟清除策略
+- [IPAM](/cluster-api-provider-metal3/features/ipam) — IP 固定分配與 IPAddressClaim

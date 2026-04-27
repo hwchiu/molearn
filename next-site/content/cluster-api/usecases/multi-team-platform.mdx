@@ -1,0 +1,193 @@
+---
+layout: doc
+title: Cluster API — 多團隊統一 Cluster 管理
+description: 平台工程師如何用 ClusterClass 和 Topology Controller 讓 20 個開發團隊用同一套模板各自建立 cluster，並在一次更新後全部升級
+---
+
+# 使用情境：多團隊統一 Cluster 管理
+
+> **目標效果**：平台團隊維護一份「cluster 藍圖」，各開發團隊只填入差異（版本、規模），cluster 自動建立並保持一致；升級時更新一份設定，所有 cluster 自動跟進。
+
+## 你會遇到什麼問題
+
+當公司有 10 個以上的開發團隊，每個團隊都需要獨立的 Kubernetes cluster 時，沒有標準化工具的情況下你會面臨：
+
+- **重複配置**：每個 cluster 都是 500+ 行 YAML，大量欄位重複，差異只有名稱和規模
+- **配置漂移**：各團隊自行修改，3 個月後已無法保證安全策略一致
+- **升級地獄**：每次 K8s 版本升級，要逐一修改 20 份 YAML，容易遺漏
+- **審計困難**：無法快速知道「現在所有 cluster 用的是哪個版本？」
+
+## 哪些元件協作解決這個問題
+
+| 元件 | 職責 |
+|------|------|
+| [ClusterClass](/cluster-api/features/clusterclass-topology) | 定義 cluster 的「藍圖範本」，包含 ControlPlane、Worker 的模板與可變參數 |
+| [Topology Controller](/cluster-api/features/controller-topology) | 監聽 ClusterClass 變更，自動將更新傳播到所有使用它的 cluster |
+| [MachineDeployment](/cluster-api/features/api-machineset-machinedeployment) | 藍圖中 Worker 節點群組的模板，支援滾動升級 |
+| [KubeadmControlPlane](/cluster-api/features/api-kubeadm-controlplane) | 藍圖中 Control Plane 的模板，管理 etcd 與 API Server |
+
+## 協作流程
+
+```
+平台團隊維護                    開發團隊使用
+─────────────────────           ─────────────────────────────
+ClusterClass (藍圖)  ──────→   Cluster (引用藍圖)
+  ├── ControlPlane Template      ├── topology.class: my-cluster-class
+  ├── Worker Templates           ├── topology.version: v1.29.0
+  └── Variables 定義             └── topology.workers.replicas: 5
+
+當平台團隊更新 ClusterClass
+        ↓
+Topology Controller 偵測到變更
+        ↓
+逐一 reconcile 所有引用此 ClusterClass 的 cluster
+        ↓
+滾動更新 Control Plane → 再滾動更新 Workers
+```
+
+## 最小可行配置
+
+### 第一步：平台團隊定義 ClusterClass
+
+```yaml
+apiVersion: cluster.x-k8s.io/v1beta1
+kind: ClusterClass
+metadata:
+  name: prod-cluster-class
+  namespace: default
+spec:
+  controlPlane:
+    ref:
+      apiVersion: controlplane.cluster.x-k8s.io/v1beta1
+      kind: KubeadmControlPlaneTemplate
+      name: prod-kcp-template
+    machineInfrastructure:
+      ref:
+        apiVersion: infrastructure.cluster.x-k8s.io/v1beta1
+        kind: DockerMachineTemplate   # 換成你的 Provider
+        name: prod-cp-machine-template
+  workers:
+    machineDeployments:
+      - class: default-worker
+        template:
+          bootstrap:
+            ref:
+              apiVersion: bootstrap.cluster.x-k8s.io/v1beta1
+              kind: KubeadmConfigTemplate
+              name: prod-worker-bootstrap-template
+          infrastructure:
+            ref:
+              apiVersion: infrastructure.cluster.x-k8s.io/v1beta1
+              kind: DockerMachineTemplate
+              name: prod-worker-machine-template
+  # ★ 讓使用者可以自訂的參數
+  variables:
+    - name: workerReplicas
+      required: true
+      schema:
+        openAPIV3Schema:
+          type: integer
+          minimum: 1
+          maximum: 20
+    - name: region
+      required: false
+      schema:
+        openAPIV3Schema:
+          type: string
+          default: "us-east-1"
+  # ★ 將參數值注入對應欄位
+  patches:
+    - name: workerReplicas
+      definitions:
+        - selector:
+            apiVersion: cluster.x-k8s.io/v1beta1
+            kind: MachineDeploymentClass
+            matchResources:
+              machineDeploymentClass:
+                names: ["default-worker"]
+          jsonPatches:
+            - op: replace
+              path: /spec/replicas
+              valueFrom:
+                variable: workerReplicas
+```
+
+### 第二步：開發團隊建立 cluster（只需 10 行）
+
+```yaml
+# team-a 的 cluster，只需指定「要什麼」，不需知道「怎麼做」
+apiVersion: cluster.x-k8s.io/v1beta1
+kind: Cluster
+metadata:
+  name: team-a-cluster
+  namespace: team-a
+spec:
+  topology:
+    class: prod-cluster-class       # ★ 引用藍圖
+    version: v1.29.0                # ★ K8s 版本
+    controlPlane:
+      replicas: 3
+    workers:
+      machineDeployments:
+        - class: default-worker
+          name: worker-md
+          variables:
+            overrides:
+              - name: workerReplicas
+                value: 5            # ★ 團隊自訂 worker 數量
+```
+
+### 第三步：升級所有 cluster（只改一個地方）
+
+```yaml
+# 當要把所有 cluster 升到 v1.30.0
+# 方法一：更新 ClusterClass 中的預設版本（影響所有 cluster）
+# 方法二：各 team 自行修改 topology.version（個別控制）
+
+# Topology Controller 會自動計算升級順序：
+# 1. 先升 Control Plane（保持 etcd 仲裁）
+# 2. Control Plane 健康後，升 Worker（滾動替換）
+# 3. 任何步驟失敗立即停止，不影響其他 cluster
+```
+
+## 驗證配置是否生效
+
+```bash
+# 查看所有 cluster 的 topology 狀態
+kubectl get cluster -A -o custom-columns=\
+  'NAMESPACE:.metadata.namespace,NAME:.metadata.name,CLASS:.spec.topology.class,VERSION:.spec.topology.version,READY:.status.conditions[?(@.type=="Ready")].status'
+
+# 查看 ClusterClass 的 rollout 狀態
+kubectl describe clusterclass prod-cluster-class | grep -A5 "Status:"
+
+# 確認 Topology Controller 正在處理哪些 cluster
+kubectl get cluster -A -o json | jq '.items[] | select(.spec.topology != null) | .metadata.name'
+```
+
+## 常見變體
+
+### 多套藍圖（開發 vs 生產環境）
+
+```yaml
+# 開發環境藍圖 — 單 control plane，少量 worker
+ClusterClass: dev-cluster-class
+  variables: workerReplicas (1-3)
+
+# 生產環境藍圖 — HA control plane，強制 Pod Disruption Budget
+ClusterClass: prod-cluster-class
+  variables: workerReplicas (3-20), region
+```
+
+### 加入基礎設施 Provider 特定參數
+
+在 ClusterClass variables 中加入 `instanceType`（AWS/GCP）或 `machineType`（MAAS），讓各 Provider 的差異只在藍圖中定義，開發團隊不需要了解底層細節。
+
+### 與 GitOps 整合
+
+把 ClusterClass 放在 Git 的 `platform/` 目錄，開發團隊的 Cluster YAML 放在各自的 `apps/` 目錄。ClusterClass 的 PR Review 由平台團隊審核，開發團隊的 cluster 變更由各自審核。升級 ClusterClass 就是一個普通的 PR，自動觸發所有 cluster 滾動更新。
+
+## 深入閱讀
+
+- [ClusterClass 與 Topology 詳解](/cluster-api/features/clusterclass-topology) — Variables、Patches 機制原始碼分析
+- [Topology Controller](/cluster-api/features/controller-topology) — 傳播邏輯與 diff 計算
+- [MachineSet 與 MachineDeployment](/cluster-api/features/api-machineset-machinedeployment) — 滾動升級策略

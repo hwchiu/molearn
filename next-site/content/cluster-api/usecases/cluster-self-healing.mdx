@@ -1,0 +1,200 @@
+---
+layout: doc
+title: Cluster API — Cluster 自動修復與版本升級
+description: 當 worker node 持續 NotReady 時如何自動替換，以及如何安全地將 100 個 cluster 從 v1.28 升到 v1.29 而不中斷服務
+---
+
+# 使用情境：Cluster 自動修復與版本升級
+
+> **目標效果**：不健康的 node 自動被刪除並補充新的，K8s 版本升級由 CAPI 按正確順序執行，SRE 團隊不需要在凌晨三點手動處理故障。
+
+## 你會遇到什麼問題
+
+在大規模管理多個 cluster 時，有兩個高頻且高風險的操作：
+
+**問題一：Node 故障**
+某個 worker node 因硬體故障、OS 崩潰、網路中斷而進入 `NotReady` 狀態。沒有自動化的情況下：
+- 需要人工監控每個 cluster 的 node 狀態
+- 手動 drain + delete node，再等待替換
+- 大規模環境下，每天可能發生 3-5 次
+
+**問題二：版本升級**
+要把 50 個 cluster 從 v1.28 升到 v1.29：
+- 必須先升 Control Plane，後升 Worker（順序錯了可能導致 API 不相容）
+- 升級過程中 Control Plane 需要保持仲裁（升一台、等健康、再升下一台）
+- 中途任何失敗都需要人工介入
+
+## 哪些元件協作解決這個問題
+
+| 元件 | 職責 |
+|------|------|
+| [MachineHealthCheck](/cluster-api/features/machine-health-check) | 監控 node 健康狀態，超過閾值自動觸發刪除 + 重建 |
+| [Core Controller](/cluster-api/features/controller-core) | MachineSet Reconciler 偵測到 Machine 被刪後自動補充新 Machine |
+| [KubeadmControlPlane Controller](/cluster-api/features/controller-kcp) | 負責 Control Plane 的有序升級，保持 etcd 仲裁 |
+| [MachineDeployment](/cluster-api/features/api-machineset-machinedeployment) | 負責 Worker 的滾動升級，控制 maxUnavailable 和 maxSurge |
+
+## 協作流程一：自動修復
+
+```
+Kubernetes Node 進入 NotReady 狀態
+        ↓
+MachineHealthCheck Controller 計時
+（預設等待 unhealthyConditions timeout，例如 5 分鐘）
+        ↓
+        ├── 未超過 maxUnhealthy？
+        │   ├── 是 → 刪除對應 Machine 物件
+        │   │        ↓
+        │   │   MachineSet Reconciler 偵測到 replica 不足
+        │   │        ↓
+        │   │   建立新 Machine → Bootstrap → 加入 cluster
+        │   │
+        │   └── 否 → 啟動 Circuit Breaker，停止自動處理
+        │            發出 Condition 警報，等待人工介入
+        │            （防止誤判導致整個 cluster 被刪光）
+        │
+        └── 存在 remediationTemplate？
+            ├── 是 → 交給 Provider（如 Metal3Remediation）處理
+            └── 否 → 預設行為：刪除 Machine
+```
+
+## 協作流程二：版本升級
+
+```
+修改 Cluster.spec.topology.version（或 KubeadmControlPlane.spec.version）
+        ↓
+KCP Controller 開始滾動升級 Control Plane
+  ├── 建立新版本的 Machine（先有後刪）
+  ├── 等待新 Machine 加入 etcd 仲裁
+  ├── 刪除舊版本 Machine
+  └── 重複直到所有 control plane 升完
+        ↓
+KCP 狀態變為 Updated + Ready
+        ↓
+MachineDeployment Controller 開始滾動升級 Workers
+  ├── 根據 maxUnavailable/maxSurge 控制並行數量
+  ├── 新 node 加入並通過 readiness 檢查後才刪舊 node
+  └── 任何步驟失敗自動暫停，保留現有狀態
+```
+
+## 最小可行配置
+
+### 設定 MachineHealthCheck
+
+```yaml
+apiVersion: cluster.x-k8s.io/v1beta1
+kind: MachineHealthCheck
+metadata:
+  name: worker-health-check
+  namespace: default
+spec:
+  clusterName: my-cluster
+  selector:
+    matchLabels:
+      cluster.x-k8s.io/deployment-name: worker-md  # 只監控 worker
+  # ★ 不健康條件：node 有這些 condition 超過 timeout 就觸發
+  unhealthyConditions:
+    - type: Ready
+      status: "False"
+      timeout: 5m      # NotReady 超過 5 分鐘
+    - type: Ready
+      status: Unknown
+      timeout: 10m     # 完全失聯超過 10 分鐘
+  # ★ Circuit Breaker：同時不健康比例超過 40% 就停止自動修復
+  maxUnhealthy: 40%
+  # ★ 可選：指定 Provider 自訂修復方式（如 Metal3 的 BMC 重啟）
+  # remediationTemplate:
+  #   apiVersion: infrastructure.cluster.x-k8s.io/v1beta1
+  #   kind: Metal3RemediationTemplate
+  #   name: worker-remediation-template
+```
+
+### 設定滾動升級策略（在 MachineDeployment）
+
+```yaml
+apiVersion: cluster.x-k8s.io/v1beta1
+kind: MachineDeployment
+metadata:
+  name: worker-md
+  namespace: default
+spec:
+  clusterName: my-cluster
+  replicas: 10
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0   # ★ 升級時不允許任何 node 不可用
+      maxSurge: 2         # ★ 一次最多建立 2 台新 node（控制速度）
+  template:
+    spec:
+      version: v1.29.0    # ★ 修改這裡觸發滾動升級
+      # ...
+```
+
+### 觸發版本升級
+
+```bash
+# 修改 KubeadmControlPlane 觸發 Control Plane 升級
+kubectl patch kubeadmcontrolplane my-cluster-kcp \
+  -p '{"spec":{"version":"v1.29.0"}}' \
+  --type merge
+
+# 監控升級進度
+kubectl get kubeadmcontrolplane my-cluster-kcp -w
+
+# 等 Control Plane 更新完成後，更新 MachineDeployment
+kubectl patch machinedeployment my-cluster-worker-md \
+  -p '{"spec":{"template":{"spec":{"version":"v1.29.0"}}}}' \
+  --type merge
+```
+
+## 驗證自動修復是否運作
+
+```bash
+# 查看 MachineHealthCheck 的狀態
+kubectl describe machinehealthcheck worker-health-check
+# 注意 Status.CurrentHealthy 和 Status.ExpectedMachines
+
+# 模擬 node 故障（測試用）
+kubectl get nodes
+kubectl cordon <node-name>
+kubectl label node <node-name> cluster.x-k8s.io/remediation-requested="true"
+
+# 觀察 Machine 被刪除並重建
+kubectl get machines -w
+
+# 確認 Circuit Breaker 未觸發
+kubectl get machinehealthcheck worker-health-check \
+  -o jsonpath='{.status.conditions}'
+```
+
+## 常見變體
+
+### 區分 Control Plane 和 Worker 的健康檢查
+
+```yaml
+# Control Plane 的 MHC：timeout 更長，避免誤判 etcd leader election
+apiVersion: cluster.x-k8s.io/v1beta1
+kind: MachineHealthCheck
+metadata:
+  name: cp-health-check
+spec:
+  selector:
+    matchLabels:
+      cluster.x-k8s.io/control-plane: ""
+  unhealthyConditions:
+    - type: Ready
+      status: "False"
+      timeout: 10m     # 給 Control Plane 更多時間恢復
+  maxUnhealthy: 1      # Control Plane 只允許 1 台同時不健康
+```
+
+### 搭配 Metal3 實現 BMC 硬重啟
+
+如果 node 是裸機，OS 崩潰後 SSH 不通，預設的 delete Machine 可能無法釋放機器。這時可以透過 `remediationTemplate` 指向 [Metal3RemediationTemplate](/cluster-api-provider-metal3/features/remediation)，讓 Metal3 透過 BMC（iDRAC/iLO）強制重啟。
+
+## 深入閱讀
+
+- [MachineHealthCheck 詳解](/cluster-api/features/machine-health-check) — Circuit Breaker 邏輯與 remediationTemplate Provider 整合
+- [KCP Controller](/cluster-api/features/controller-kcp) — Control Plane 升級的狀態機與邊界條件
+- [MachineSet 與 MachineDeployment](/cluster-api/features/api-machineset-machinedeployment) — 滾動升級策略選擇
+- [Core Controller](/cluster-api/features/controller-core) — Machine Reconcile 與補充邏輯

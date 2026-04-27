@@ -1,0 +1,235 @@
+---
+layout: doc
+title: MAAS Provider — 按需分配實體機給開發測試環境
+description: 如何讓開發團隊透過 Kubernetes YAML 在 MAAS 機房按需申請裸機節點、自動建立 Kubernetes cluster，用完後釋放機器歸還機房，達到與雲端一樣的彈性體驗
+---
+
+# 使用情境：按需分配實體機給開發測試環境
+
+> **目標效果**：開發工程師提交一份 YAML，10 分鐘內獲得一個有 3 台裸機節點的 Kubernetes cluster，測試完成後刪除 cluster，機器自動歸還機房資源池，整個流程不需要找基礎設施工程師介入。
+
+## 你會遇到什麼問題
+
+測試環境管理是很多公司的痛點：
+
+- **申請流程繁瑣**：開發工程師需要填單、等審批、等基礎設施工程師手動設定
+- **機器利用率低**：測試環境機器常常被「保留」但實際上閒置，機房資源浪費
+- **環境不一致**：不同開發者申請的測試環境設定不同，「在我機器上能跑」的問題頻繁出現
+- **釋放不及時**：測試完成後，工程師常常忘記釋放機器，佔用資源
+
+## 哪些元件協作解決這個問題
+
+| 元件 | 職責 |
+|------|------|
+| [MAAS 整合](/cluster-api-provider-maas/features/integration) | MAAS Provider 作為 CAPI 的 Infrastructure Provider，透過 MAAS API 管理裸機的分配與釋放 |
+| [Machine 生命週期](/cluster-api-provider-maas/features/machine-lifecycle) | 追蹤裸機從 Allocate → Deploy → Release 的完整流程 |
+| [MaasCluster / MaasMachine Controller](/cluster-api-provider-maas/features/controllers) | Reconcile Loop 確保 MAAS 狀態與 Kubernetes 宣告狀態一致 |
+| [API Types](/cluster-api-provider-maas/features/api-types) | MaasCluster 和 MaasMachine CRD 定義裸機選擇條件（machineType、tag） |
+
+## 協作流程
+
+```
+開發工程師提交 Cluster + MaasCluster + MachineDeployment YAML
+          ↓
+CAPI Core Controller 開始 Reconcile
+          ↓
+MaasClusterReconciler
+  ├── 向 MAAS API 查詢符合 machineType 的可用裸機
+  ├── 分配虛擬 IP（VIP）給 cluster Control Plane
+  └── 設定 DNS 記錄（cluster endpoint）
+          ↓
+MaasMachineReconciler（每台節點）
+  ├── 呼叫 MAAS API allocate machine（鎖定一台機器）
+  ├── 觸發 MAAS deploy（PXE boot + OS 安裝）
+  ├── 等待機器 Ready（MAAS commissioned 狀態）
+  └── 設定 providerID = "maas://<hostname>"
+          ↓
+CAPI Bootstrap Provider（KubeadmConfig）
+  ├── 產生 cloud-init 腳本（kubeadm init / join）
+  └── 機器自動加入 cluster
+          ↓
+開發工程師：kubectl get cluster → Provisioned
+          ↓
+測試完成：kubectl delete cluster
+          ↓
+MaasCluster/MaasMachine 被刪除
+  └── MAAS API release machine → 機器回到 Ready 狀態等待下次分配
+```
+
+## 最小可行配置
+
+### 第一步：定義 MaasCluster（cluster 網路設定）
+
+```yaml
+apiVersion: infrastructure.cluster.x-k8s.io/v1alpha3
+kind: MaasCluster
+metadata:
+  name: dev-cluster-maas
+  namespace: default
+spec:
+  # ★ MAAS 機房的 DNS domain（MAAS 會自動設定 DNS）
+  dnsDomain: maas.internal
+  # ★ Control Plane 的 VIP（MAAS 會設定 keepalived）
+  controlPlaneEndpoint:
+    host: 192.168.100.10
+    port: 6443
+```
+
+### 第二步：定義 MaasMachine（指定要什麼規格的裸機）
+
+```yaml
+apiVersion: infrastructure.cluster.x-k8s.io/v1alpha3
+kind: MaasMachineTemplate
+metadata:
+  name: dev-worker-template
+  namespace: default
+spec:
+  template:
+    spec:
+      # ★ 透過 MAAS tag 過濾機器（只選有這些 tag 的機器）
+      # 可以是機型、用途、資源規格等任意 tag
+      resourcePool: "dev-pool"      # 開發環境機器池
+      # 可選：指定最小規格
+      minCPU: 4
+      minMemory: 8192   # MB
+```
+
+### 第三步：完整 cluster 宣告（開發工程師使用的 YAML）
+
+```yaml
+# cluster.yaml — 開發工程師只需這一份
+---
+apiVersion: cluster.x-k8s.io/v1beta1
+kind: Cluster
+metadata:
+  name: dev-john-test
+  namespace: default
+  # ★ 加 annotation 方便追蹤是誰申請的
+  annotations:
+    owner: "john@company.com"
+    purpose: "feature-branch-testing"
+spec:
+  clusterNetwork:
+    pods:
+      cidrBlocks: ["10.244.0.0/16"]
+  infrastructureRef:
+    apiVersion: infrastructure.cluster.x-k8s.io/v1alpha3
+    kind: MaasCluster
+    name: dev-john-test-maas
+  controlPlaneRef:
+    apiVersion: controlplane.cluster.x-k8s.io/v1beta1
+    kind: KubeadmControlPlane
+    name: dev-john-test-kcp
+---
+apiVersion: infrastructure.cluster.x-k8s.io/v1alpha3
+kind: MaasCluster
+metadata:
+  name: dev-john-test-maas
+spec:
+  dnsDomain: maas.internal
+  controlPlaneEndpoint:
+    host: ""       # MAAS 會自動分配
+    port: 6443
+---
+apiVersion: controlplane.cluster.x-k8s.io/v1beta1
+kind: KubeadmControlPlane
+metadata:
+  name: dev-john-test-kcp
+spec:
+  replicas: 1    # 測試環境用單 control plane 省資源
+  version: v1.29.0
+  machineTemplate:
+    infrastructureRef:
+      apiVersion: infrastructure.cluster.x-k8s.io/v1alpha3
+      kind: MaasMachineTemplate
+      name: dev-cp-template
+---
+apiVersion: cluster.x-k8s.io/v1beta1
+kind: MachineDeployment
+metadata:
+  name: dev-john-test-workers
+spec:
+  clusterName: dev-john-test
+  replicas: 2
+  template:
+    spec:
+      version: v1.29.0
+      bootstrap:
+        configRef:
+          apiVersion: bootstrap.cluster.x-k8s.io/v1beta1
+          kind: KubeadmConfigTemplate
+          name: dev-worker-bootstrap
+      infrastructureRef:
+        apiVersion: infrastructure.cluster.x-k8s.io/v1alpha3
+        kind: MaasMachineTemplate
+        name: dev-worker-template
+```
+
+### 使用流程
+
+```bash
+# 申請 cluster
+kubectl apply -f cluster.yaml
+
+# 等待 cluster 建立（約 10-15 分鐘，取決於 OS 安裝速度）
+kubectl get cluster dev-john-test -w
+# 等到 PHASE=Provisioned
+
+# 取得 kubeconfig
+clusterctl get kubeconfig dev-john-test > ~/.kube/dev-config
+export KUBECONFIG=~/.kube/dev-config
+
+# 開始測試...
+kubectl get nodes
+
+# 測試完成，釋放資源
+kubectl delete cluster dev-john-test
+# 所有相關資源（MaasCluster、MaasMachine）被自動刪除
+# MAAS 自動釋放裸機，機器回到資源池
+```
+
+## 確認機器被正確釋放
+
+```bash
+# 在 management cluster 確認 CAPI 資源已清理
+kubectl get machine,maasmachine -A | grep dev-john-test
+# 應該為空
+
+# 在 MAAS UI 或 CLI 確認機器狀態
+maas admin machines read | jq '.[] | {hostname: .hostname, status: .status_name}'
+# 機器狀態應回到 "Ready"
+```
+
+## 常見變體
+
+### 自動化申請與回收（使用 TTL 自動刪除）
+
+```yaml
+# 為 cluster 加上 TTL annotation（搭配 Kubernetes Finalizer 或外部 controller）
+metadata:
+  annotations:
+    cluster-ttl: "24h"     # 24 小時後自動刪除
+    owner: "john@company.com"
+```
+
+### 不同環境用不同 MAAS resource pool
+
+```
+maas-resource-pools:
+  dev-pool:      小機型，快速分配，共用  
+  staging-pool:  中等機型，接近生產配置
+  perf-pool:     大機型，I/O 密集，獨占
+```
+
+開發工程師在 `MaasMachineTemplate.spec.resourcePool` 填入對應名稱，MAAS 只會選該 pool 的機器。
+
+### 與 Namespace 隔離整合
+
+每個開發團隊有獨立的 Kubernetes Namespace，用 RBAC 限制只能在自己的 Namespace 建立 cluster。MAAS resource pool 也按團隊分配，避免跨團隊搶資源。
+
+## 深入閱讀
+
+- [MAAS 整合詳解](/cluster-api-provider-maas/features/integration) — MAAS API 呼叫與 CAPI Provider 合約實作
+- [Machine 生命週期](/cluster-api-provider-maas/features/machine-lifecycle) — Allocate → Deploy → Release 狀態機
+- [Controllers](/cluster-api-provider-maas/features/controllers) — Reconcile 邏輯與 MAAS API 錯誤處理
+- [API Types](/cluster-api-provider-maas/features/api-types) — MaasCluster 和 MaasMachine CRD 欄位說明

@@ -38,11 +38,23 @@ const FEATURE_LABELS: Record<string, string> = {
   'advanced-features': '進階功能',
 }
 
+const USECASE_LABELS: Record<string, string> = {
+  'multi-team-platform': '多團隊 Cluster 管理',
+  'cluster-self-healing': '自動修復與版本升級',
+  'on-demand-baremetal': '按需分配裸機環境',
+  'edge-auto-recovery': '邊緣節點自動修復',
+  'bulk-os-upgrade': '批量裸機 OS 升級',
+  'stateful-storage': '有狀態應用持久化存儲',
+  'vm-container-mixed': 'VM 與 Container 混合部署',
+  'multi-tenant-network': '多租戶網路隔離',
+}
+
 export function ProjectSidebar({ project }: Props) {
   const proj = PROJECTS[project]
   const pathname = usePathname()
 
   const isActive = (slug: string) => !!pathname?.endsWith(`/features/${slug}`)
+  const isUseCaseActive = (slug: string) => !!pathname?.endsWith(`/usecases/${slug}`)
   const isFeatureMap = !!pathname?.endsWith('/feature-map')
   const isQuiz = !!pathname?.endsWith('/quiz')
 
@@ -67,6 +79,28 @@ export function ProjectSidebar({ project }: Props) {
           <span>🗺</span>
           <span>功能地圖</span>
         </Link>
+
+        {/* Use Cases */}
+        {proj.usecases.length > 0 && (
+          <div className="pt-4">
+            <p className="px-2 text-[10px] font-semibold uppercase tracking-widest text-[#484f58] mb-1 flex items-center gap-1.5">
+              <span>🎯</span>
+              <span>使用情境</span>
+            </p>
+            <div className="space-y-0.5">
+              {proj.usecases.map(slug => (
+                <Link key={slug} href={`/${project}/usecases/${slug}`}
+                  className={`block px-2 py-1.5 rounded-md text-[0.8rem] transition-colors ${
+                    isUseCaseActive(slug)
+                      ? 'bg-[#2da44e]/15 text-[#2da44e] font-medium border-l-2 border-[#2da44e] pl-[6px]'
+                      : 'text-[#8b949e] hover:bg-[#21262d] hover:text-white'
+                  }`}>
+                  {USECASE_LABELS[slug] || slug}
+                </Link>
+              ))}
+            </div>
+          </div>
+        )}
 
         {/* Grouped features */}
         {proj.featureGroups.map((group) => (
