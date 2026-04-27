@@ -1,0 +1,295 @@
+---
+layout: doc
+title: Cluster API Provider Metal3 — Cluster API 整合契約
+description: 說明 CAPM3 如何實作 CAPI 的 infrastructure provider 契約，包含 Metal3Cluster 與 Metal3Machine 的介面要求與協調機制
+---
+
+# Cluster API 整合契約
+
+<Callout type="info" title="相關章節">
+- [架構總覽](/cluster-api-provider-metal3/features/architecture)
+- [CRD：Metal3Cluster](/cluster-api-provider-metal3/features/crds-cluster)
+- [CRD：Metal3Machine](/cluster-api-provider-metal3/features/crds-machine)
+- [ProviderID 工作流](/cluster-api-provider-metal3/features/provider-id-workflow)
+</Callout>
+
+<Callout type="tip" title="本文適用對象">
+- 🟢 **初學者**：了解 CAPM3 在 CAPI 體系中扮演的角色
+- 🟡 **中階工程師**：理解 CAPI 和 CAPM3 controller 如何分工協作
+- 🔴 **資深工程師**：掌握 ownership reference 機制、pause 傳播邏輯與 failure domain 的實作細節
+</Callout>
+
+> 📦 **類比**：Cluster API 就像是一個「標準化的招募合約」——無論你僱用的是 AWS、Azure 還是 bare-metal 員工（infrastructure provider），他們都必須符合相同的合約要求（介面）。CAPM3 就是 bare-metal 版本的「員工」，遵守 CAPI 規定的合約，讓 CAPI 的上層邏輯可以統一管理所有類型的叢集。
+
+## CAPI Infrastructure Provider 契約
+
+Cluster API 定義了 infrastructure provider 必須實作的介面：
+
+### InfrastructureCluster 介面（Metal3Cluster 實作）
+
+Metal3Cluster 必須在 `status` 中提供：
+
+| 欄位 | 類型 | 說明 |
+|------|------|------|
+| `status.ready` | bool | 基礎設施是否就緒（API server 可達） |
+| `status.failureDomains` | FailureDomains | 可用的 failure domain 清單 |
+| `status.initialization.provisioned` | *bool | v1beta2：provisioning 是否完成 |
+
+```yaml
+# Metal3Cluster status 範例
+status:
+  ready: true
+  failureDomains:
+    zone-a:
+      controlPlane: true
+    zone-b:
+      controlPlane: true
+    zone-c:
+      controlPlane: false
+  initialization:
+    provisioned: true
+  conditions:
+    - type: Ready
+      status: "True"
+      lastTransitionTime: "2024-01-15T10:00:00Z"
+```
+
+### InfrastructureMachine 介面（Metal3Machine 實作）
+
+Metal3Machine 必須在 `status` 中提供：
+
+| 欄位 | 類型 | 說明 |
+|------|------|------|
+| `status.ready` | bool | 機器是否就緒（BMH provisioned，ProviderID 設定完成） |
+| `spec.providerID` | *string | 唯一識別此機器的 ProviderID |
+| `spec.failureDomain` | string | 此機器所在的 failure domain |
+| `status.initialization.provisioned` | *bool | v1beta2：provisioning 是否完成 |
+
+```yaml
+# Metal3Machine status 範例（Ready = true）
+spec:
+  providerID: "metal3://metal3/worker-host-01/worker-machine-0"
+  failureDomain: zone-a
+status:
+  ready: true
+  initialization:
+    provisioned: true
+  conditions:
+    - type: Ready
+      status: "True"
+    - type: AssociateBareMetalHost
+      status: "True"
+      reason: AssociateBareMetalHostSuccess
+```
+
+## Ownership References 與垃圾回收
+
+CAPI 使用 Kubernetes 的 OwnerReference 機制進行資源清理：
+
+```
+Cluster（CAPI）
+  └── ownerRef → Metal3Cluster（CAPM3）
+        └── ownerRef 不直接連結 Machine（透過 ClusterRef）
+
+Machine（CAPI）
+  └── spec.infrastructureRef → Metal3Machine（CAPM3）
+        └── Metal3Machine 的 ownerRef → Machine（CAPI）
+```
+
+### 刪除傳播
+
+```
+刪除 Cluster
+    │
+    ▼
+CAPI 刪除所有 Machine（設定 deletionTimestamp）
+    │
+    ▼
+CAPI Machine controller 刪除 Metal3Machine
+    │
+    ▼
+CAPM3 Metal3Machine controller 執行清理：
+  - 設定 BMH.Spec.Online = false
+  - 清除 BMH.Spec.Image
+  - 清除 BMH.Spec.ConsumerRef
+  - 刪除 Metal3DataClaim
+  - 移除 Metal3Machine finalizer
+    │
+    ▼
+Metal3Machine 物件被刪除
+    │
+    ▼
+CAPI 刪除 Metal3Cluster
+    │
+    ▼
+CAPM3 Metal3Cluster controller 清理 cluster 層級資源
+```
+
+## CAPI Machine Controller 與 Metal3Machine Controller 的分工
+
+### CAPI Machine Controller 負責
+
+1. 等待 bootstrap data（userdata）就緒
+2. 等待 infrastructure（Metal3Machine）就緒（`status.ready = true`）
+3. 等待 Node 出現並與 Machine 關聯（設定 `status.nodeRef`）
+4. 管理 Machine 生命週期（建立、更新、刪除）
+
+### CAPM3 Metal3Machine Controller 負責
+
+1. 選擇 BareMetalHost（`chooseHost()`）
+2. 設定 BMH 的 image、userData、metaData、networkData
+3. 管理 Metal3DataClaim / Metal3Data
+4. 設定 ProviderID
+5. 透過 hostname 找到 Node 並設定 Node.Spec.ProviderID
+6. 更新 `Metal3Machine.Status.Ready`
+
+### 協調流程
+
+```
+CAPI Machine Controller          CAPM3 Metal3Machine Controller
+        │                                   │
+        │ 1. 建立 Metal3Machine              │
+        │──────────────────────────────────►│
+        │                                   │ 2. chooseHost()
+        │                                   │ 3. 設定 BMH spec
+        │                                   │ 4. 建立 DataClaim
+        │                                   │ 5. 等待 BMH provisioned
+        │                                   │
+        │ ◄────── Metal3Machine.Status.Ready = true ──────────────
+        │                                   │
+        │ 6. 等待 Node 出現（有 ProviderID）  │
+        │                                   │ 7. 設定 Node.Spec.ProviderID
+        │                                   │
+        │ ◄────── Node.Spec.ProviderID 設定完成 ─────────────────
+        │                                   │
+        │ 8. 設定 Machine.Status.NodeRef     │
+        │ 9. Machine.Status.Phase = Running  │
+```
+
+## FailureDomain 整合
+
+Metal3Cluster 的 `spec.failureDomains` 定義可用的 failure domain：
+
+```yaml
+apiVersion: infrastructure.cluster.x-k8s.io/v1beta1
+kind: Metal3Cluster
+metadata:
+  name: my-metal3-cluster
+  namespace: default
+spec:
+  controlPlaneEndpoint:
+    host: "192.168.0.100"
+    port: 6443
+  failureDomains:
+    zone-a:
+      controlPlane: true   # 此 zone 可以放 control plane
+    zone-b:
+      controlPlane: true
+    zone-c:
+      controlPlane: false  # 只放 worker
+```
+
+CAPI 的 MachineDeployment 會根據 FailureDomains 均勻分配 Machine：
+
+```yaml
+apiVersion: cluster.x-k8s.io/v1beta1
+kind: MachineDeployment
+metadata:
+  name: worker-md
+spec:
+  failureDomain: zone-a    # 此 MachineDeployment 的 Machine 都在 zone-a
+  replicas: 3
+```
+
+CAPM3 的 `chooseHost()` 在選擇 BareMetalHost 時，會優先選擇帶有對應 failure domain label 的 host：
+
+```bash
+# 為 BareMetalHost 設定 failure domain label
+kubectl label baremetalhost worker-host-01 \
+  topology.kubernetes.io/zone=zone-a -n metal3
+```
+
+## Pause 機制
+
+CAPI 支援「暫停」reconciliation，用於維護操作。Pause 的傳播路徑：
+
+```
+Cluster.Spec.Paused = true
+         │
+         ▼（CAPM3 Metal3Machine controller 偵測到）
+設定 BareMetalHost 的 PausedAnnotation
+         │  metal3.io/capm3-paused annotation
+         ▼
+BMO 停止對此 BMH 的 reconciliation
+（不執行 provisioning、power management 等操作）
+```
+
+### Pause 設定方式
+
+```bash
+# 暫停整個 Cluster
+kubectl patch cluster my-cluster -n default \
+  --type='merge' -p '{"spec":{"paused":true}}'
+
+# 暫停單個 Metal3Machine
+kubectl annotate metal3machine worker-machine-0 \
+  cluster.x-k8s.io/paused="" -n metal3
+
+# 恢復 Cluster
+kubectl patch cluster my-cluster -n default \
+  --type='merge' -p '{"spec":{"paused":false}}'
+```
+
+### Pause 狀態檢查
+
+```bash
+# 查看 Metal3Machine 的 Paused condition
+kubectl get metal3machine -n metal3 \
+  -o custom-columns='NAME:.metadata.name,PAUSED:.status.conditions[?(@.type=="Paused")].status'
+
+# 查看 BMH 是否有 paused annotation
+kubectl get baremetalhosts -n metal3 \
+  -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.metadata.annotations.metal3\.io/capm3-paused}{"\n"}{end}'
+```
+
+## Infrastructure Ready 條件鏈
+
+CAPI 要求所有 infrastructure 元件都就緒後，才允許 Machine 進入下一階段。條件檢查鏈：
+
+```
+Cluster.Status.InfrastructureReady
+    │  依賴
+    ▼
+Metal3Cluster.Status.Ready = true
+    │  需要：controlPlaneEndpoint 設定完成
+
+Machine.Status.InfrastructureReady
+    │  依賴
+    ▼
+Metal3Machine.Status.Ready = true
+    │  需要：
+    │  1. BareMetalHost.Status.Provisioning.State = "provisioned"
+    │  2. Metal3Machine.Spec.ProviderID 已設定
+    │  3. （若有 DataTemplate）Metal3Data.Status.Ready = true
+```
+
+```bash
+# 查看完整的 infrastructure ready 狀態鏈
+kubectl get cluster my-cluster -n default \
+  -o jsonpath='{.status.conditions}' | jq .
+
+kubectl get metal3cluster my-metal3-cluster -n default \
+  -o jsonpath='{.status}' | jq .
+
+kubectl get machine worker-0 -n default \
+  -o jsonpath='{.status.conditions}' | jq .
+```
+
+## 常見整合問題
+
+| 問題 | 症狀 | 根因 | 解決方法 |
+|------|------|------|----------|
+| Machine 卡在 Provisioning | `Machine.Status.Phase = Provisioning` | Metal3Machine.Status.Ready 未設為 true | 查看 BMH state 和 Metal3Machine conditions |
+| Infrastructure 不就緒 | Cluster.Status.InfrastructureReady = false | Metal3Cluster 缺少 controlPlaneEndpoint | 設定 Metal3Cluster.Spec.ControlPlaneEndpoint |
+| NodeRef 未設定 | Machine 沒有 NodeRef | Node 沒有匹配的 ProviderID | 確認 Node.Spec.ProviderID 與 Metal3Machine.Spec.ProviderID 一致 |
+| Pause 未生效 | BMH 仍在執行 provisioning | Pause annotation 未正確設定 | 確認 `metal3.io/capm3-paused` annotation 存在於 BMH |

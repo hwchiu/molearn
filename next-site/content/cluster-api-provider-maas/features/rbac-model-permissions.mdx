@@ -1,0 +1,279 @@
+---
+layout: doc
+title: Cluster API Provider MAAS — RBAC 模型
+description: 解析 CAPM controller 所需的 Kubernetes RBAC 權限設定，包含 ClusterRole、ServiceAccount 與 leader election 設定。
+---
+
+# RBAC 模型
+
+<Callout type="info" title="相關章節">
+- [架構概覽](/cluster-api-provider-maas/features/architecture)
+- [Controllers 運作原理](/cluster-api-provider-maas/features/controllers)
+- [整合方式](/cluster-api-provider-maas/features/integration)
+</Callout>
+
+<Callout type="tip" title="本文適用對象">
+- 🟢 **初學者**：了解為何 CAPM controller 需要特定的 Kubernetes 權限，以及 RBAC 與安全性的關係。
+- 🟡 **中階工程師**：掌握各 ClusterRole 的完整 rules，用於安全審查與故障排除。
+- 🔴 **資深工程師**：分析如何在生產環境實施最小權限原則，以及 leader election 的 RBAC 要求。
+</Callout>
+
+> 📦 **類比**：RBAC 就像公司的門禁卡系統——controller 就像員工，需要申請特定區域的門禁卡（ClusterRole）才能進入對應的系統（存取 Kubernetes resources）。最小權限原則就是「只給員工他工作需要的門禁，不多給」。
+
+## 總覽
+
+CAPM 的 RBAC 設定位於 `config/rbac/` 目錄，透過 `kustomize` 組合。主要包含：
+
+| 資源類型 | 名稱 | 用途 |
+|---------|------|------|
+| `ClusterRole` | `manager-role` | controller 核心操作權限 |
+| `ClusterRoleBinding` | 對應綁定 | 將 manager-role 綁到 ServiceAccount |
+| `Role` | `leader-election-role` | leader election 操作權限（Namespace 層級） |
+| `RoleBinding` | 對應綁定 | 將 leader-election-role 綁到 ServiceAccount |
+| `ClusterRole` | `proxy-role` | metrics proxy 所需權限 |
+| `ClusterRole` | `metrics-reader` | 讀取 /metrics endpoint |
+
+## Manager ClusterRole（核心權限）
+
+`role.yaml` 定義了 controller 運作所需的所有核心 RBAC 規則：
+
+```yaml
+# config/rbac/role.yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: manager-role
+rules:
+  # 事件記錄
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["create", "get", "list", "patch", "update", "watch"]
+
+  # 讀取 bootstrap secret
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get", "list", "watch"]
+
+  # 讀取 CAPI 核心物件
+  - apiGroups: ["cluster.x-k8s.io"]
+    resources: ["clusters", "machines"]
+    verbs: ["get", "list", "watch"]
+
+  # 管理 CAPM 自定義物件
+  - apiGroups: ["infrastructure.cluster.x-k8s.io"]
+    resources: ["maasclusters", "maasmachines"]
+    verbs: ["create", "delete", "get", "list", "patch", "update", "watch"]
+
+  # 更新 CAPM 狀態子資源
+  - apiGroups: ["infrastructure.cluster.x-k8s.io"]
+    resources: ["maasclusters/status", "maasmachines/status"]
+    verbs: ["get", "patch", "update"]
+```
+
+### 每項權限的用途
+
+| Resource | Verbs | 用途說明 |
+|---------|-------|---------|
+| `events` | create/get/list/patch/update/watch | 記錄 reconcile 事件（`kubectl describe` 可見） |
+| `secrets` | get/list/watch | 讀取 bootstrap data secret（kubeadm join token） |
+| `clusters` | get/list/watch | 取得 CAPI Cluster 物件，用於 owner reference 查找 |
+| `machines` | get/list/watch | 取得 CAPI Machine 物件，取得 bootstrap data secret name |
+| `maasclusters` | 完整 CRUD | 管理 MaasCluster 物件的完整生命週期 |
+| `maasmachines` | 完整 CRUD | 管理 MaasMachine 物件的完整生命週期 |
+| `maasclusters/status` | get/patch/update | 更新 MaasCluster Ready、conditions |
+| `maasmachines/status` | get/patch/update | 更新 MaasMachine Ready、state、addresses |
+
+<Callout type="info" title="為何 secrets 只有讀取權限">
+CAPM controller 只需要**讀取** bootstrap secret（由 CAPI bootstrap provider 建立），並不需要建立或刪除 secret。這體現了最小權限原則。
+</Callout>
+
+## Leader Election Role（Namespace 層級）
+
+Leader election 確保在多個 controller 副本中只有一個 active，使用 Kubernetes `configmaps` 和 `leases` 作為鎖：
+
+```yaml
+# config/rbac/leader_election_role.yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: leader-election-role
+rules:
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: [""]
+    resources: ["configmaps/status"]
+    verbs: ["get", "update", "patch"]
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["create"]
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+```
+
+注意：這是 `Role`（Namespace 層級），不是 `ClusterRole`，僅在 `capmaas-system` namespace 生效。
+
+Leader election ID 在 `main.go` 中設定：
+
+```go
+mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), ctrl.Options{
+    LeaderElection:   enableLeaderElection,
+    LeaderElectionID: "controller-leader-election-capmaas",
+    // ...
+})
+```
+
+## Metrics Proxy ClusterRole
+
+CAPM 使用 `kube-rbac-proxy` 保護 `/metrics` endpoint，不讓任何人直接存取：
+
+```yaml
+# config/rbac/auth_proxy_role.yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: proxy-role
+rules:
+  - apiGroups: ["authentication.k8s.io"]
+    resources: ["tokenreviews"]
+    verbs: ["create"]
+  - apiGroups: ["authorization.k8s.io"]
+    resources: ["subjectaccessreviews"]
+    verbs: ["create"]
+```
+
+`kube-rbac-proxy` sidecar 使用這個 ClusterRole 來驗證每個 metrics 請求的身份。
+
+Metrics reader ClusterRole 讓擁有適當 token 的客戶端（如 Prometheus）讀取 metrics：
+
+```yaml
+# config/rbac/auth_proxy_client_clusterrole.yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: metrics-reader
+rules:
+  - nonResourceURLs: ["/metrics"]
+    verbs: ["get"]
+```
+
+## 終端使用者 RBAC（CRD 管理）
+
+除了 controller 本身，CAPM 也為終端使用者提供兩種預設 ClusterRole：
+
+### Editor Role（完整管理）
+
+```yaml
+# maascluster-editor-role（示意，maasmachine 同理）
+rules:
+  - apiGroups: ["infrastructure.cluster.x-k8s.io"]
+    resources: ["maasclusters"]
+    verbs: ["create", "delete", "get", "list", "patch", "update", "watch"]
+  - apiGroups: ["infrastructure.cluster.x-k8s.io"]
+    resources: ["maasclusters/status"]
+    verbs: ["get"]
+```
+
+### Viewer Role（唯讀）
+
+```yaml
+# maascluster-viewer-role（示意）
+rules:
+  - apiGroups: ["infrastructure.cluster.x-k8s.io"]
+    resources: ["maasclusters"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["infrastructure.cluster.x-k8s.io"]
+    resources: ["maasclusters/status"]
+    verbs: ["get"]
+```
+
+完整的角色清單：
+
+| ClusterRole | 適用物件 | 權限等級 |
+|-------------|---------|---------|
+| `maascluster-editor-role` | 基礎設施管理員 | 完整 CRUD |
+| `maascluster-viewer-role` | 唯讀使用者 | get/list/watch |
+| `maasmachine-editor-role` | 基礎設施管理員 | 完整 CRUD |
+| `maasmachine-viewer-role` | 唯讀使用者 | get/list/watch |
+| `maasmachinetemplate-editor-role` | 基礎設施管理員 | 完整 CRUD |
+| `maasmachinetemplate-viewer-role` | 唯讀使用者 | get/list/watch |
+
+## ServiceAccount 設定
+
+預設 ServiceAccount 名稱為 `default`（在 `capmaas-system` namespace），透過 kustomize namespace patch 綁定：
+
+```yaml
+# config/rbac/role_binding.yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: manager-rolebinding
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: manager-role
+subjects:
+  - kind: ServiceAccount
+    name: default
+    namespace: system  # kustomize 替換為 capmaas-system
+```
+
+## 生產環境最小權限建議
+
+在高安全性環境中，可考慮以下調整：
+
+```yaml
+# 縮減 secrets 的存取範圍到特定 namespace
+- apiGroups: [""]
+  resources: ["secrets"]
+  verbs: ["get"]
+  resourceNames: []  # 搭配 ResourceQuota 限制可讀取的 secret 名稱
+
+# 或使用 Role + RoleBinding 替代 ClusterRole，限制在 workload namespace
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  namespace: default  # 只有這個 namespace 的 secrets
+  name: capmaas-secrets-reader
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get", "list", "watch"]
+```
+
+<Callout type="warning" title="注意">
+CAPM 預設使用 ClusterRole 存取 secrets，這代表可以讀取叢集中所有 namespace 的 secrets。在生產環境中應評估是否需要縮小存取範圍。
+</Callout>
+
+## 除錯：RBAC 權限問題排查
+
+```bash
+# 確認 controller ServiceAccount 有正確的 ClusterRole
+kubectl get clusterrolebinding | grep capmaas
+
+# 測試特定操作是否有權限
+kubectl auth can-i get secrets \
+  --as=system:serviceaccount:capmaas-system:default
+
+kubectl auth can-i patch maasmachines/status \
+  --as=system:serviceaccount:capmaas-system:default \
+  -n default
+
+# 查看 RBAC 相關 error
+kubectl logs -n capmaas-system deploy/capmaas-controller-manager \
+  | grep -i "forbidden\|rbac\|unauthorized"
+```
+
+### 常見 RBAC 錯誤
+
+```
+E0101 00:00:00.000000 controller-runtime/controller.go:
+  Reconciler error: failed to list machines:
+  machines.cluster.x-k8s.io is forbidden:
+  User "system:serviceaccount:capmaas-system:default"
+  cannot list resource "machines" in API group "cluster.x-k8s.io"
+  at the cluster scope
+```
+
+**解決方法**：確認 `manager-role` ClusterRoleBinding 存在且正確指向 controller 的 ServiceAccount。

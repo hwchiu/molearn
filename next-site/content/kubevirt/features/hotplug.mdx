@@ -1,0 +1,376 @@
+---
+layout: doc
+title: KubeVirt — Hotplug 磁碟與網路介面
+description: 不重啟 VM 即可動態新增或移除磁碟與網路介面，支援 DataVolume、PVC 及多種 binding 方式的熱插拔操作。
+---
+
+# Hotplug 磁碟與網路介面
+
+<Callout type="info" title="相關章節">
+- [VM Storage](/kubevirt/features/vm-storage)
+- [VM Network](/kubevirt/features/vm-network)
+- [VMI 生命週期](/kubevirt/features/vmi-lifecycle)
+- [virt-handler](/kubevirt/features/virt-handler)
+- [virtctl CLI 完整指南](/kubevirt/features/virtctl)
+</Callout>
+
+<Callout type="tip" title="本文適用對象">
+- 🟢 **初學者**：了解 hotplug 的用途與基本 virtctl 指令
+- 🟡 **中階工程師**：掌握持久化與非持久化 hotplug 的差異，以及支援的 volume 類型
+- 🔴 **資深工程師**：深入 hotplug 的內部實作機制（virt-handler、container attacher、virsh attach-disk 流程）
+</Callout>
+
+> 📦 **類比**：Hotplug 就像電腦的 USB 熱插拔——不需要關機就能插入 USB 隨身碟或拔除外接硬碟。對於雲端 VM 而言，這意味著可以在業務不中斷的情況下擴充儲存或新增網路介面。
+
+## 什麼是 Hotplug
+
+傳統 KubeVirt VM 在啟動後，磁碟與網路介面的配置是固定的。任何變更都需要重啟 VM，造成服務中斷。Hotplug 功能讓管理員可以在 VM 運行期間動態新增或移除：
+
+- **磁碟（Volume Hotplug）**：新增 DataVolume 或 PVC 作為額外磁碟
+- **網路介面（NIC Hotplug）**：新增或移除網路介面
+
+### Feature Gate 需求
+
+| 功能 | Feature Gate | 最低版本 |
+|------|-------------|---------|
+| Volume Hotplug | 預設啟用（KubeVirt >= 0.36）| v0.36 |
+| NIC Hotplug | `HotplugNICs` | v1.1 |
+
+啟用 NIC Hotplug：
+
+```yaml
+apiVersion: kubevirt.io/v1
+kind: KubeVirt
+metadata:
+  name: kubevirt
+  namespace: kubevirt
+spec:
+  configuration:
+    developerConfiguration:
+      featureGates:
+        - HotplugNICs
+```
+
+---
+
+## Volume Hotplug
+
+### 支援的 Volume 類型
+
+| Volume 類型 | 支援 Hotplug | 備註 |
+|------------|------------|------|
+| DataVolume | ✅ | 最常用 |
+| PersistentVolumeClaim | ✅ | 需先存在 |
+| ConfigMap | ✅ | 唯讀掛載 |
+| Secret | ✅ | 唯讀掛載 |
+| ServiceAccount | ✅ | 唯讀掛載 |
+| DownwardAPI | ❌ | 不支援 |
+| HostDisk | ❌ | 不支援 |
+
+### 新增磁碟：virtctl addvolume
+
+```bash
+# 基本語法
+virtctl addvolume <vm-name> --volume-name=<volume-name> [--persist] [--serial=<serial>]
+
+# 範例：熱插入一個 PVC（非持久化）
+virtctl addvolume my-vm --volume-name=extra-data-pvc
+
+# 範例：熱插入一個 DataVolume 並持久化（重啟後仍存在）
+virtctl addvolume my-vm --volume-name=extra-disk-dv --persist
+
+# 範例：指定磁碟序號（用於識別）
+virtctl addvolume my-vm --volume-name=data-disk --serial=DISK001
+```
+
+`--persist` 參數說明：
+
+| 選項 | 行為 |
+|------|------|
+| 不加 `--persist` | 僅對目前運行的 VMI 有效；VM 重啟後磁碟消失 |
+| 加 `--persist` | 同時更新 VM spec；VM 重啟後磁碟仍存在 |
+
+### 移除磁碟：virtctl removevolume
+
+```bash
+# 移除熱插入的磁碟（非持久化）
+virtctl removevolume my-vm --volume-name=extra-data-pvc
+
+# 移除並更新 VM spec（持久化移除）
+virtctl removevolume my-vm --volume-name=extra-disk-dv --persist
+```
+
+### 直接操作 VMI API
+
+除了 virtctl，也可以直接向 VMI 的 subresource API 發送請求：
+
+```bash
+# 新增磁碟（向 VMI subresource 發送）
+kubectl patch virtualmachineinstance my-vm \
+  --type='json' \
+  -p='[{"op":"add","path":"/spec/volumes/-","value":{"name":"hotplug-vol","persistentVolumeClaim":{"claimName":"extra-pvc"}}},{"op":"add","path":"/spec/domain/devices/disks/-","value":{"name":"hotplug-vol","disk":{"bus":"scsi"}}}]'
+```
+
+<Callout type="warning" title="Hotplug 磁碟必須使用 SCSI 匯流排">
+熱插拔的磁碟會以 SCSI 裝置掛載，不支援 virtio-blk 匯流排。在 VM 內部，磁碟會出現為 `/dev/sdX`（SCSI）而非 `/dev/vdX`（virtio）。
+</Callout>
+
+---
+
+## Volume Hotplug 內部機制
+
+了解 hotplug 如何運作，有助於排除問題。
+
+### 架構元件
+
+```
+[使用者] → virtctl addvolume → [kube-apiserver]
+                                      ↓
+                              [virt-controller] 建立 hotplug Pod
+                                      ↓
+                              [virt-handler] 監控 VMI 狀態
+                                      ↓
+                              [hotplug attachment pod] 掛載 PVC
+                                      ↓
+                              [virsh attach-disk] 熱插入到 QEMU
+```
+
+### Hotplug Attachment Pod
+
+KubeVirt 為每個熱插入的磁碟建立一個「attachment pod」：
+
+```bash
+# 查看 hotplug attachment pods
+kubectl get pods -l kubevirt.io=hotplug-disk
+```
+
+```yaml
+# attachment pod 的功能：
+# 1. 掛載目標 PVC
+# 2. 建立 bind mount 或 symlink
+# 3. 通知 virt-handler 磁碟已就緒
+# 4. virt-handler 呼叫 virsh attach-disk 將磁碟熱插入 QEMU
+```
+
+### 熱插入流程詳解
+
+```
+1. 使用者執行 virtctl addvolume my-vm --volume-name=extra-pvc
+2. virtctl 向 API server 發送 PATCH 到 VMI 的 addvolume subresource
+3. virt-controller 偵測到 VMI.spec.volumes 更新
+4. virt-controller 在與 VMI 同一個 node 建立 hotplug attachment Pod
+5. attachment Pod 啟動，掛載 PVC，在 /var/run/kubevirt/hotplug-disks/ 建立 block device 或 file
+6. virt-handler 監控到 attachment Pod Running 且磁碟就緒
+7. virt-handler 更新 QEMU XML：執行 virsh attach-disk --config --live
+8. VMI status 更新：hotplugVolume 狀態變為 Attached
+9. Guest OS 偵測到新的 SCSI 磁碟（或執行 rescan）
+```
+
+### Guest 內偵測新磁碟
+
+```bash
+# 在 Linux guest 內重新掃描 SCSI 總線
+echo "- - -" > /sys/class/scsi_host/host0/scan
+
+# 或使用 lsblk 確認新磁碟
+lsblk
+
+# 格式化並掛載新磁碟
+mkfs.ext4 /dev/sdb
+mount /dev/sdb /mnt/extra-data
+```
+
+---
+
+## 持久化與非持久化 Hotplug
+
+| 特性 | 非持久化（預設）| 持久化（`--persist`）|
+|------|--------------|---------------------|
+| VMI 運行時 | 磁碟可用 | 磁碟可用 |
+| VM 停止後 | 磁碟消失 | 磁碟保留 |
+| VM 重啟後 | 磁碟消失 | 磁碟仍存在 |
+| VM spec 變更 | ❌ | ✅ 更新 VM spec |
+| 適用場景 | 臨時資料傳輸、除錯 | 永久擴充儲存 |
+
+### 查看 Hotplug 狀態
+
+```bash
+# 查看 VMI 中的 hotplug volume 狀態
+kubectl get vmi my-vm -o jsonpath='{.status.volumeStatus}' | jq .
+```
+
+```json
+[
+  {
+    "name": "rootdisk",
+    "target": "vda",
+    "phase": "Ready",
+    "reason": "VolumeReady"
+  },
+  {
+    "name": "extra-pvc",
+    "target": "sda",
+    "phase": "Ready",
+    "reason": "VolumeReady",
+    "hotplugVolume": {
+      "attachPodName": "hp-volume-extra-pvc-abc123",
+      "attachPodUID": "550e8400-e29b-41d4-a716-446655440000"
+    }
+  }
+]
+```
+
+---
+
+## NIC Hotplug（網路介面熱插拔）
+
+### 前提條件
+
+NIC hotplug 需要：
+1. `HotplugNICs` feature gate 啟用
+2. 支援的網路 binding 方式（非所有 binding 都支援）
+3. Multus CNI（若使用 secondary network）
+
+### 支援的 Binding 方式
+
+| Binding 方式 | 支援 Hotplug | 備註 |
+|------------|------------|------|
+| Bridge（pod network）| ❌ | 不支援 hotplug |
+| Masquerade | ❌ | 不支援 hotplug |
+| SR-IOV | ✅ | 需要 SR-IOV device plugin |
+| Passt | ✅ | 使用 user-space 網路堆疊 |
+| Tap | ✅ | 直接使用 tap 裝置 |
+| Macvtap | ✅ | 需要 Multus |
+
+### 新增網路介面：virtctl addinterface
+
+```bash
+# 新增 SR-IOV 網路介面（需要先定義 NetworkAttachmentDefinition）
+virtctl addinterface my-vm \
+  --network-attachment-definition-name=sriov-net \
+  --name=eth1
+
+# 新增並持久化
+virtctl addinterface my-vm \
+  --network-attachment-definition-name=sriov-net \
+  --name=eth1 \
+  --persist
+```
+
+### 移除網路介面：virtctl removeinterface
+
+```bash
+# 移除熱插入的網路介面
+virtctl removeinterface my-vm --name=eth1
+
+# 持久化移除
+virtctl removeinterface my-vm --name=eth1 --persist
+```
+
+### NIC Hotplug YAML 範例
+
+```yaml
+# NetworkAttachmentDefinition（使用 Multus）
+apiVersion: k8s.cni.cncf.io/v1
+kind: NetworkAttachmentDefinition
+metadata:
+  name: additional-net
+  namespace: default
+spec:
+  config: |
+    {
+      "cniVersion": "0.3.1",
+      "name": "additional-net",
+      "type": "bridge",
+      "bridge": "br1",
+      "ipam": {
+        "type": "dhcp"
+      }
+    }
+```
+
+```bash
+# 熱插入使用上述 NetworkAttachmentDefinition
+virtctl addinterface my-vm \
+  --network-attachment-definition-name=additional-net \
+  --name=secondary-nic
+```
+
+---
+
+## 完整操作範例
+
+### 場景：為資料庫 VM 擴充儲存
+
+```bash
+# 1. 建立新的 PVC
+kubectl apply -f - << 'EOF'
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: db-extra-storage
+  namespace: default
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 100Gi
+  storageClassName: rook-ceph-block
+EOF
+
+# 2. 等待 PVC 就緒
+kubectl wait pvc db-extra-storage --for=condition=Bound --timeout=2m
+
+# 3. 熱插入磁碟並持久化
+virtctl addvolume postgres-vm \
+  --volume-name=db-extra-storage \
+  --persist
+
+# 4. 確認磁碟已掛載
+virtctl ssh postgres-vm -- lsblk
+
+# 5. 在 guest 內格式化並掛載
+virtctl ssh postgres-vm -- bash -c "
+  mkfs.ext4 /dev/sdb
+  mkdir -p /var/lib/postgresql/extra
+  mount /dev/sdb /var/lib/postgresql/extra
+  echo '/dev/sdb /var/lib/postgresql/extra ext4 defaults 0 0' >> /etc/fstab
+"
+```
+
+### 場景：臨時掛載設定檔 ConfigMap
+
+```bash
+# 1. 建立 ConfigMap
+kubectl create configmap app-config \
+  --from-file=config.yaml=./my-config.yaml
+
+# 2. 熱插入（不持久化，臨時用）
+virtctl addvolume my-app-vm \
+  --volume-name=app-config \
+  --volume-type=configmap
+
+# 3. 在 guest 內讀取
+virtctl ssh my-app-vm -- cat /mnt/app-config/config.yaml
+
+# 4. 完成後移除
+virtctl removevolume my-app-vm --volume-name=app-config
+```
+
+---
+
+## 限制與注意事項
+
+| 限制 | 說明 |
+|------|------|
+| SCSI 限制 | Hotplug 磁碟只能使用 SCSI 匯流排，不支援 virtio |
+| 最大磁碟數 | QEMU SCSI 控制器通常限制 256 個裝置 |
+| Live Migration | 含 hotplug 磁碟的 VM 在 live migration 後，hotplug 狀態可能需要重新確認 |
+| Windows Guest | Windows 需要 virtio-scsi 驅動程式才能識別 hotplug 磁碟 |
+| RWO PVC | ReadWriteOnce PVC 一次只能掛載到一個 node，確保無其他 Pod 使用 |
+| NIC Hotplug | 並非所有 binding 方式都支援；masquerade/bridge 不支援 |
+
+<Callout type="info" title="virtio-scsi vs SCSI">
+KubeVirt hotplug 使用的是 virtio-scsi 控制器（效能優於傳統 SCSI），但從 guest OS 的角度看，磁碟仍以 SCSI 裝置（`/dev/sdX`）出現。virtio-scsi 是 QEMU 的 SCSI 控制器實作方式，提供 virtio 的效能優勢，同時保持 SCSI 介面相容性。
+</Callout>

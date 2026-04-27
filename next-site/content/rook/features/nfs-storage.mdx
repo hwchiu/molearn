@@ -1,0 +1,322 @@
+---
+layout: doc
+title: Rook — CephNFS 與 NFS 儲存
+description: 解析 CephNFS CRD 如何透過 NFS-Ganesha server 將 CephFS 或 RGW 以 NFS 協定對外暴露，支援傳統 NFS 客戶端工作負載。
+---
+
+# CephNFS 與 NFS 儲存
+
+<Callout type="info" title="相關章節">
+- [架構總覽](/rook/features/architecture)
+- [CephFilesystem 共享儲存](/rook/features/ceph-filesystem)
+- [StorageClass 設定](/rook/features/storage-classes)
+- [CSI Driver](/rook/features/csi-driver)
+</Callout>
+
+<Callout type="tip" title="本文適用對象">
+- 🟢 **初學者**：了解 CephNFS 的應用場景與基本設定。
+- 🟡 **中階工程師**：建立 CephNFS server，設定 Kubernetes NFS StorageClass。
+- 🔴 **資深工程師**：設計 HA NFS 架構、export 管理、以及 Windows workload 整合。
+</Callout>
+
+> 📦 **類比**：CephNFS 就像在 CephFS 分散式儲存前加裝一個 NFS 轉接頭，讓不懂 CephFS 的老設備（Windows 電腦、傳統 Linux 伺服器）也能直接掛載使用。
+
+## 什麼是 CephNFS
+
+CephNFS 是 Rook 提供的 CRD，用於部署 **NFS-Ganesha** server。NFS-Ganesha 是一個 userspace 的 NFS server，可以將 CephFS 或 RGW（S3 Object Store）以標準 NFS 協定（NFSv3 / NFSv4.1）對外暴露。
+
+### 架構概覽
+
+```
+NFS Client (Windows/Linux)
+    │ NFS v4.1
+    ▼
+NFS-Ganesha Pod (CephNFS)
+    │ FSAL（Filesystem Abstraction Layer）
+    ├──▶ CephFS FSAL → CephFS MDS → OSD
+    └──▶ RGW FSAL   → RGW → OSD
+```
+
+### CephNFS vs 直接使用 CephFS CSI
+
+| 特性 | CephFS CSI | CephNFS |
+|------|------------|---------|
+| 協定 | 原生 CephFS | NFSv4.1 |
+| 客戶端需求 | Kubernetes CSI | 標準 NFS client |
+| Windows 支援 | ❌ | ✅ |
+| 效能 | 較高（原生協定）| 略低（多一層 NFS）|
+| 部署複雜度 | 簡單 | 需管理 Ganesha server |
+| 適用場景 | 純 K8s 環境 | 混合環境、舊式系統 |
+
+## CephNFS CRD Spec
+
+```yaml
+apiVersion: ceph.rook.io/v1
+kind: CephNFS
+metadata:
+  name: my-nfs
+  namespace: rook-ceph
+spec:
+  rados:
+    pool: nfs-ganesha          # NFS 設定儲存的 pool
+    namespace: nfs-ns          # RADOS namespace
+  server:
+    active: 1                  # 同時 active 的 Ganesha server 數量
+    logLevel: "NIV_INFO"       # NIV_NULL | NIV_FATAL | NIV_CRIT | NIV_WARN | NIV_INFO | NIV_DEBUG
+    resources:
+      limits:
+        cpu: "2"
+        memory: "4Gi"
+      requests:
+        cpu: "500m"
+        memory: "1Gi"
+    priorityClassName: system-node-critical
+```
+
+### 關鍵欄位說明
+
+| 欄位 | 說明 |
+|------|------|
+| `rados.pool` | 存放 NFS-Ganesha 設定的 Ceph pool（需預先建立）|
+| `rados.namespace` | RADOS namespace，用於隔離多個 NFS server 的設定 |
+| `server.active` | 同時運行的 Ganesha instance 數量（HA 設定）|
+
+## 前置準備：建立 NFS Pool
+
+NFS-Ganesha 需要一個 replicated pool 來儲存其設定（grace 資訊、export 設定等）：
+
+```yaml
+apiVersion: ceph.rook.io/v1
+kind: CephBlockPool
+metadata:
+  name: nfs-ganesha
+  namespace: rook-ceph
+spec:
+  replicated:
+    size: 3
+  failureDomain: host
+```
+
+此外，CephNFS 通常搭配 CephFilesystem 使用，需確保 CephFS 已建立完成（參考 [CephFilesystem](/rook/features/ceph-filesystem)）。
+
+## NFS Export 管理
+
+建立 CephNFS 後，透過 `CephNFSServerExport` 或直接設定 Ganesha config 來定義 export：
+
+### 使用 Rook CephNFS Export（v1.12+）
+
+從 Rook v1.12 開始，可以直接在 Kubernetes 中管理 NFS export：
+
+```yaml
+# NFS export 透過 Rook 的 CephFilesystemSubVolumeGroup 管理
+apiVersion: ceph.rook.io/v1
+kind: CephFilesystemSubVolumeGroup
+metadata:
+  name: nfs-group
+  namespace: rook-ceph
+spec:
+  filesystemName: myfs
+  name: nfs
+  pinning:
+    distributed: 1
+```
+
+### Ganesha Export 設定（RADOS 方式）
+
+NFS-Ganesha 的 export 設定存放在 RADOS pool 中：
+
+```bash
+# 進入 toolbox 手動建立 export
+kubectl -n rook-ceph exec -it deploy/rook-ceph-tools -- bash
+
+# 建立 export 設定（存入 RADOS）
+cat > /tmp/export.conf << 'EOF'
+EXPORT {
+    Export_Id = 1;
+    Transports = TCP;
+    Path = /;
+    Pseudo = /cephfs/data;
+    Protocols = 4;
+    Access_Type = RW;
+    Attr_Expiration_Time = 0;
+    Squash = No_Root_Squash;
+    FSAL {
+        Name = CEPH;
+        Filesystem = myfs;
+        User_Id = nfs.ganesha.client;
+        Secret_Access_Key = AQBxxx==;
+    }
+}
+EOF
+
+# 將 export 設定存入 RADOS
+rados -p nfs-ganesha -N nfs-ns put conf-nfs.my-nfs /tmp/export.conf
+```
+
+## Kubernetes NFS StorageClass
+
+Rook v1.12+ 提供完整的 NFS CSI StorageClass 支援：
+
+```yaml
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: rook-nfs
+provisioner: rook-ceph.nfs.csi.ceph.com
+parameters:
+  clusterID: rook-ceph
+  fsName: myfs                # CephFS 名稱
+  nfsCluster: my-nfs          # CephNFS 名稱
+  server: my-nfs              # Ganesha server 名稱
+  csi.storage.k8s.io/provisioner-secret-name: rook-csi-nfs-provisioner
+  csi.storage.k8s.io/provisioner-secret-namespace: rook-ceph
+  csi.storage.k8s.io/node-stage-secret-name: rook-csi-nfs-node
+  csi.storage.k8s.io/node-stage-secret-namespace: rook-ceph
+reclaimPolicy: Delete
+allowVolumeExpansion: true
+mountOptions:
+  - hard
+  - nfsvers=4.1
+```
+
+### NFS PVC
+
+```yaml
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: nfs-pvc
+spec:
+  accessModes:
+    - ReadWriteMany           # NFS 支援 RWX
+  resources:
+    requests:
+      storage: 100Gi
+  storageClassName: rook-nfs
+```
+
+## HA NFS 設定
+
+生產環境建議配置多個 Ganesha instance 實現 HA：
+
+```yaml
+spec:
+  server:
+    active: 3                 # 3 個 active Ganesha instances
+```
+
+NFS-Ganesha 的 HA 機制透過 RADOS 共享狀態（grace 資料）實現：
+
+```
+Client A ──→ NFS-Ganesha Pod-1 ┐
+                                ├── RADOS Pool（共享 grace/lock 狀態）
+Client B ──→ NFS-Ganesha Pod-2 ┘
+                │
+                └──→ CephFS（實際資料）
+```
+
+當某個 Ganesha Pod 故障時，client 需要執行 **NFS Grace 期重新建立 lock**，通常在 90 秒內完成自動恢復。
+
+### HA LoadBalancer Service
+
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: rook-ceph-nfs-my-nfs
+  namespace: rook-ceph
+spec:
+  type: LoadBalancer            # 或 NodePort
+  selector:
+    app: rook-ceph-nfs
+    ceph_nfs: my-nfs
+  ports:
+    - name: nfs
+      port: 2049
+      targetPort: 2049
+```
+
+## 從叢集外部掛載 NFS
+
+### Linux 客戶端
+
+```bash
+# 取得 NFS service IP
+NFS_IP=$(kubectl -n rook-ceph get svc rook-ceph-nfs-my-nfs -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
+
+# 掛載 NFS
+mount -t nfs4 -o nfsvers=4.1 ${NFS_IP}:/cephfs/data /mnt/ceph-nfs
+
+# 確認掛載
+df -h /mnt/ceph-nfs
+```
+
+### Windows 客戶端
+
+```powershell
+# Windows 啟用 NFS Client
+Enable-WindowsOptionalFeature -Online -FeatureName ServicesForNFS-ClientOnly
+
+# 掛載 NFS share（Windows NFS client 需指定 UID/GID 映射）
+mount -o anon \192.168.1.100\cephfs\data Z:
+```
+
+### 永久掛載（/etc/fstab）
+
+```
+# /etc/fstab 永久掛載設定
+192.168.1.100:/cephfs/data /mnt/ceph-nfs nfs4 nfsvers=4.1,rsize=1048576,wsize=1048576,hard,timeo=600,retrans=2 0 0
+```
+
+## 效能調校
+
+### Ganesha 效能參數
+
+```yaml
+spec:
+  server:
+    active: 3
+    logLevel: "NIV_WARN"      # 降低 log 等級提升效能
+    resources:
+      limits:
+        cpu: "4"              # 高 CPU 限制（Ganesha 是 CPU 密集型）
+        memory: "8Gi"
+```
+
+### NFS mount 效能選項
+
+```bash
+# 最佳效能掛載選項
+mount -t nfs4   -o nfsvers=4.1,rsize=1048576,wsize=1048576,hard,timeo=600   ${NFS_IP}:/cephfs/data /mnt/data
+```
+
+| Mount 選項 | 說明 | 建議值 |
+|-----------|------|--------|
+| `rsize` | 讀取 block size | 1048576（1MB）|
+| `wsize` | 寫入 block size | 1048576（1MB）|
+| `hard` | 網路中斷時保持掛載 | 建議（`soft` 可能資料損毀）|
+| `timeo` | NFS 操作超時（1/10 秒）| 600（60 秒）|
+| `nfsvers` | NFS 版本 | 4.1（效能最佳）|
+
+## 使用場景
+
+| 場景 | 為什麼選 CephNFS |
+|------|----------------|
+| Windows 工作負載 | Windows 不支援 CephFS native client |
+| 傳統 Linux 伺服器 | 不在 Kubernetes 內的伺服器需要訪問 |
+| ERP/SAP 整合 | 企業系統通常只支援 NFS |
+| 開發環境共享 | 開發者 workstation 直接掛載開發用的儲存 |
+| CI/CD artifact | Build server（非 K8s）存取編譯產物 |
+
+## 常見問題排查
+
+| 問題 | 原因 | 解法 |
+|------|------|------|
+| Ganesha Pod CrashLoop | RADOS pool 不存在 | 確認 `nfs-ganesha` pool 已建立 |
+| NFS 掛載 Permission Denied | Squash 設定或 CephFS 權限問題 | 確認 export 的 Access_Type 與 Squash 設定 |
+| 高延遲 | NFS 經過兩層（Ganesha + CephFS） | 增加 Ganesha CPU，調整 rsize/wsize |
+| Grace period 過長 | Ganesha Pod 異常重啟 | 檢查 RADOS pool 連通性 |
+
+## 小結
+
+CephNFS 透過 NFS-Ganesha 將 CephFS 的能力延伸到傳統 NFS 客戶端，是連接 Kubernetes 儲存與傳統基礎設施的重要橋梁。在純 Kubernetes 環境中，優先使用 [CephFilesystem CSI](/rook/features/ceph-filesystem) 以獲得更好的效能；當需要支援 Windows 或非 K8s 系統時，CephNFS 是最合適的選擇。

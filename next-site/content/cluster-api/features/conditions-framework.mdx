@@ -1,0 +1,346 @@
+---
+layout: doc
+title: Cluster API — Conditions Framework
+description: 深入解析 CAPI 的 Conditions 框架，涵蓋 condition 類型、util/conditions 套件 API、v1beta1 到 v1beta2 的 condition 模型演進，以及如何透過 conditions 診斷問題。
+---
+
+# Conditions Framework
+
+<Callout type="info" title="相關章節">
+- [架構總覽](/cluster-api/features/architecture)
+- [API Cluster & Machine](/cluster-api/features/api-cluster-machine)
+- [Machine Health Check](/cluster-api/features/machine-health-check)
+- [API 版本轉換系統](/cluster-api/features/api-conversion)
+- [Controller Core](/cluster-api/features/controller-core)
+</Callout>
+
+<Callout type="tip" title="本文適用對象">
+- 🟢 **初學者**：了解 condition 的基本概念，以及如何透過 `kubectl` 讀取 cluster/machine 的健康狀態
+- 🟡 **中階工程師**：掌握 `util/conditions` 套件的 API，學習如何在 controller 中正確設定和讀取 conditions
+- 🔴 **資深工程師**：深入理解 v1beta1 自訂 condition 與 v1beta2 標準 metav1.Condition 的差異、condition aggregation 機制，以及如何實作 condition mirror
+</Callout>
+
+> 📦 **類比**：Conditions 就像機器的儀表板。每個儀表（condition type）顯示特定系統的狀態（Ready、Available、Paused）。儀表板可以聚合多個子系統的指示燈（condition aggregation），當任何一個子系統出現問題，主儀表板的警示燈就會亮起。
+
+## 什麼是 Conditions
+
+Kubernetes 的 `status.conditions` 是記錄物件觀測狀態的標準方式。每個 condition 包含：
+
+```yaml
+conditions:
+- type: Ready           # condition 類型（唯一 key）
+  status: "True"        # True / False / Unknown
+  reason: "ClusterReady"  # 機器可讀的狀態原因
+  message: "Cluster is ready"  # 人類可讀的訊息
+  observedGeneration: 5   # 觀測到的 spec generation
+  lastTransitionTime: "2024-01-01T00:00:00Z"
+```
+
+## v1beta1 vs v1beta2 Condition 模型
+
+CAPI 歷史上使用自訂的 condition 格式（v1beta1），現在已遷移到 Kubernetes 標準的 `metav1.Condition`（v1beta2）：
+
+| 面向 | v1beta1 自訂 Condition | v1beta2 標準 metav1.Condition |
+|------|----------------------|------------------------------|
+| 型別定義 | `clusterv1.Condition` | `metav1.Condition`（標準） |
+| severity | ✅ 有（Info/Warning/Error） | ❌ 無 |
+| observedGeneration | ❌ 無 | ✅ 有 |
+| 標準化程度 | CAPI 自訂 | Kubernetes 官方標準 |
+| 最終狀態 | 逐步廢棄 | 新 API 採用此格式 |
+
+```go
+// v1beta1 自訂 Condition（舊）
+type Condition struct {
+    Type               ConditionType `json:"type"`
+    Status             corev1.ConditionStatus `json:"status"`
+    Severity           ConditionSeverity `json:"severity,omitempty"` // 額外欄位
+    LastTransitionTime metav1.Time `json:"lastTransitionTime"`
+    Reason             string `json:"reason,omitempty"`
+    Message            string `json:"message,omitempty"`
+}
+
+// v1beta2 標準 metav1.Condition（新）
+type Condition struct {
+    Type               string `json:"type"`
+    Status             ConditionStatus `json:"status"`  // True/False/Unknown
+    ObservedGeneration int64 `json:"observedGeneration,omitempty"` // 新增
+    LastTransitionTime metav1.Time `json:"lastTransitionTime"`
+    Reason             string `json:"reason"`
+    Message            string `json:"message"`
+}
+```
+
+## 常見 Condition 類型
+
+### 跨資源通用 Conditions
+
+| Condition Type | 說明 |
+|----------------|------|
+| `Ready` | 資源已就緒，可以服務請求 |
+| `Available` | 資源可用（v1beta2 新增，與 Ready 語義略有不同） |
+| `Paused` | 資源已暫停 reconcile（`spec.paused = true`） |
+| `Deleting` | 資源正在刪除流程中 |
+
+### Cluster 特有 Conditions
+
+| Condition Type | 說明 |
+|----------------|------|
+| `ControlPlaneInitialized` | Control plane 已完成初始化 |
+| `ControlPlaneReady` | Control plane 目前健康 |
+| `InfrastructureReady` | Infrastructure 已就緒 |
+| `WorkersAvailable` | Worker node 已達到期望數量 |
+
+### Machine 特有 Conditions
+
+| Condition Type | 說明 |
+|----------------|------|
+| `BootstrapReady` | Bootstrap 設定已就緒 |
+| `InfrastructureReady` | Infrastructure Machine 已就緒 |
+| `NodeHealthy` | 對應的 Kubernetes node 健康 |
+| `Draining` | Machine 正在進行 drain |
+
+## util/conditions 套件
+
+`util/conditions` 套件提供操作 conditions 的標準 API。
+
+### Getter Interface
+
+```go
+// 來源：util/conditions/getter.go
+type Getter interface {
+    GetConditions() []metav1.Condition
+}
+
+// 讀取 condition
+func Get(sourceObj Getter, conditionType string) *metav1.Condition
+func Has(from Getter, conditionType string) bool
+func IsTrue(from Getter, conditionType string) bool
+func IsFalse(from Getter, conditionType string) bool
+func IsUnknown(from Getter, conditionType string) bool
+```
+
+使用範例：
+
+```go
+// 檢查 Cluster 是否 Ready
+if conditions.IsTrue(cluster, clusterv1.ReadyCondition) {
+    // cluster 已就緒
+}
+
+// 取得 condition 詳細資訊
+cond := conditions.Get(cluster, clusterv1.ReadyCondition)
+if cond != nil {
+    log.Info("Ready condition", "status", cond.Status, "reason", cond.Reason)
+}
+```
+
+### Setter Interface
+
+```go
+// 來源：util/conditions/setter.go
+type Setter interface {
+    Getter
+    SetConditions([]metav1.Condition)
+}
+
+// 設定 condition
+func Set(to Setter, condition metav1.Condition)
+func MarkTrue(to Setter, conditionType string, reason, message string)
+func MarkFalse(to Setter, conditionType string, reason, message string)
+func MarkUnknown(to Setter, conditionType string, reason, message string)
+```
+
+使用範例：
+
+```go
+// 在 controller 中設定 condition
+conditions.MarkTrue(cluster, clusterv1.InfrastructureReadyCondition,
+    "InfrastructureReady", "Infrastructure is ready")
+
+conditions.MarkFalse(machine, clusterv1.BootstrapReadyCondition,
+    "BootstrapDataNotReady", "Waiting for bootstrap data secret")
+
+conditions.MarkUnknown(machine, clusterv1.NodeHealthyCondition,
+    "NodeNotFound", "Node not yet found in workload cluster")
+```
+
+### Condition Aggregation
+
+`util/conditions` 支援將多個物件的 condition **聚合**到上層物件：
+
+```go
+// 來源：util/conditions/aggregate.go
+
+// 將 MachineSet 中所有 Machine 的 Ready condition 聚合
+// 若任何 Machine 不 Ready，MachineSet 也標記為不 Ready
+conditions.Aggregate(machineSet, clusterv1.ReadyCondition, machineList.Items,
+    func(m *clusterv1.Machine) *metav1.Condition {
+        return conditions.Get(m, clusterv1.ReadyCondition)
+    },
+    conditions.AggregateOptions{
+        MergeStrategy: conditions.DefaultMergeStrategy(),
+    },
+)
+```
+
+### Condition Mirror
+
+Mirror 是一種特殊的聚合，將**子資源**的 condition 直接複製到**父資源**：
+
+```go
+// 來源：util/conditions/mirror.go
+
+// 將 Infrastructure Machine 的 Ready condition 映射到 CAPI Machine
+conditions.Mirror(machine, clusterv1.InfrastructureReadyCondition,
+    infraMachine,
+    clusterv1.ReadyCondition)
+```
+
+### PatchHelper 整合
+
+在 controller 結束時，使用 `PatchHelper` 只 patch 有變更的 conditions：
+
+```go
+// 來源：util/conditions/patch.go
+
+patchHelper, err := patch.NewHelper(cluster, r.Client)
+// ... reconcile 邏輯 ...
+conditions.MarkTrue(cluster, clusterv1.ReadyCondition, "Ready", "")
+
+// 只 patch 有變更的 conditions（減少 API server 壓力）
+if err := patchHelper.Patch(ctx, cluster,
+    patch.WithOwnedConditions{Conditions: []string{
+        clusterv1.ReadyCondition,
+        clusterv1.InfrastructureReadyCondition,
+    }},
+); err != nil {
+    return err
+}
+```
+
+## Condition 聚合流程
+
+```
+Machine 1: Ready=True
+Machine 2: Ready=True
+Machine 3: Ready=False (reason: NodeUnhealthy)
+        │
+        ▼ MachineSet Reconciler 聚合
+MachineSet: Ready=False
+  reason: "1 of 3 machines are not ready"
+  message: "Machine machine-3 is not Ready: NodeUnhealthy"
+        │
+        ▼ MachineDeployment Reconciler 聚合
+MachineDeployment: Ready=False
+  reason: "MachineSet is not Ready"
+        │
+        ▼ Cluster Reconciler 聚合
+Cluster: Ready=False
+  reason: "workers not ready"
+```
+
+## v1beta2 改進的 Conditions
+
+在 v1beta2 中，CAPI 對 condition 系統做了以下改進：
+
+1. **採用標準 `metav1.Condition`**：移除 CAPI 自訂的 Severity 欄位
+2. **新增 `observedGeneration`**：可以判斷 condition 是否針對目前 spec
+3. **條件語義更清晰**：`Available` 與 `Ready` 分離，分別表示「最近是否有服務」與「目前是否健康」
+
+```go
+// v1beta2 使用標準 condition
+type ClusterStatus struct {
+    // 採用 metav1.Condition slice
+    Conditions []metav1.Condition `json:"conditions,omitempty"`
+
+    // 保留 v1beta1 格式於 deprecated 欄位
+    Deprecated *ClusterDeprecatedStatus `json:"deprecated,omitempty"`
+}
+```
+
+### 舊版 v1beta1 Conditions 過渡期
+
+在過渡期間，CAPI 同時維護兩套 conditions：
+
+```yaml
+# v1beta2 Cluster 的 status
+status:
+  # 新標準 conditions
+  conditions:
+  - type: Ready
+    status: "True"
+    observedGeneration: 5
+
+  # 舊版 v1beta1 conditions（放在 deprecated 底下）
+  deprecated:
+    v1beta1:
+      conditions:
+      - type: Ready
+        status: "True"
+        severity: ""    # v1beta1 特有欄位
+```
+
+## 實際診斷案例
+
+### 診斷 Cluster 不健康
+
+```bash
+# 1. 查看 Cluster 的所有 conditions
+kubectl get cluster my-cluster -o jsonpath='{.status.conditions}' | jq .
+
+# 輸出範例
+[
+  {"type":"Ready","status":"False","reason":"WorkersNotReady",
+   "message":"MachineDeployment workers is not ready"},
+  {"type":"ControlPlaneReady","status":"True","reason":""},
+  {"type":"InfrastructureReady","status":"True","reason":""}
+]
+```
+
+```bash
+# 2. 追蹤問題到 MachineDeployment
+kubectl get machinedeployment workers -o jsonpath='{.status.conditions}' | jq .
+
+# 3. 進一步查看 MachineSet
+kubectl get machineset -l cluster.x-k8s.io/cluster-name=my-cluster \
+  -o jsonpath='{range .items[*]}{.metadata.name}{": "}{.status.conditions}{"\n"}{end}' | jq .
+
+# 4. 找出問題 Machine
+kubectl get machine -l cluster.x-k8s.io/cluster-name=my-cluster \
+  -o jsonpath='{range .items[*]}{.metadata.name}{": "}{.status.conditions}{"\n"}{end}'
+```
+
+### 使用 clusterctl 診斷
+
+```bash
+# clusterctl describe cluster 提供完整的 condition 樹狀視圖
+clusterctl describe cluster my-cluster
+
+# 輸出範例
+NAME          READY  SEVERITY  REASON          SINCE  MESSAGE
+Cluster/my-cluster  False  Warning  WorkersNotReady  5m
+├─MachineDeployment/workers  False  Warning  MachineSetNotReady  5m
+│ └─MachineSet/workers-7d9fb  False  Warning  UnhealthyMachines  5m
+│   └─Machine/workers-7d9fb-xyz  False  Warning  NodeUnhealthy  5m
+└─KubeadmControlPlane/my-cluster-cp  True  ...
+```
+
+詳細的 clusterctl 使用說明請參考 [clusterctl 指令](/cluster-api/features/clusterctl)。
+
+## 為自訂 Provider 實作 Conditions
+
+```go
+// 實作 Getter interface
+func (m *MyMachine) GetConditions() []metav1.Condition {
+    return m.Status.Conditions
+}
+
+// 實作 Setter interface
+func (m *MyMachine) SetConditions(conditions []metav1.Condition) {
+    m.Status.Conditions = conditions
+}
+
+// 在 reconciler 中使用
+conditions.MarkTrue(myMachine, clusterv1.ReadyCondition,
+    "MyMachineReady", "Machine is ready")
+```

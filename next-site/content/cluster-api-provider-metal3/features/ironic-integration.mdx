@@ -1,0 +1,338 @@
+---
+layout: doc
+title: Cluster API Provider Metal3 — Ironic 整合原理
+description: 說明 CAPM3 如何透過 BareMetalHost CR 間接驅動 Ironic 完成實體機器的 provisioning 流程
+---
+
+# Ironic 整合原理
+
+<Callout type="info" title="相關章節">
+- [BareMetalHost 生命週期](/cluster-api-provider-metal3/features/bmh-lifecycle)
+- [映像與部署配置](/cluster-api-provider-metal3/features/image-deployment-config)
+- [磁碟清理策略](/cluster-api-provider-metal3/features/disk-cleaning-strategy)
+- [架構總覽](/cluster-api-provider-metal3/features/architecture)
+</Callout>
+
+<Callout type="tip" title="本文適用對象">
+- 🟢 **初學者**：了解 CAPM3、BMO（BareMetalOperator）、Ironic 三層架構的分工
+- 🟡 **中階工程師**：理解每一層傳遞的資料內容與狀態同步機制
+- 🔴 **資深工程師**：掌握 Ironic deploy ramdisk 流程與常見錯誤的根因分析
+</Callout>
+
+> 📦 **類比**：CAPM3 是「工程師填工單」，BareMetalHost CR 是「工單本身」，BMO（BareMetalOperator）是「工程師助理」，Ironic 是「實際執行安裝的技術人員」。工程師不需要直接跟技術人員溝通，只需要填好工單，其餘由助理轉達。
+
+## 三層架構概覽
+
+Metal3 的 provisioning 架構是間接整合設計：
+
+```
+CAPM3（本專案）
+    │  寫入 image URL、userData、networkData
+    │  更新 BareMetalHost.Spec
+    ▼
+BareMetalHost CR（kubernetes 物件）
+    │  BMO（BareMetalOperator）監控此 CR
+    │  翻譯 CR 內容為 Ironic API 呼叫
+    ▼
+BMO（BareMetalOperator）
+    │  呼叫 Ironic REST API
+    │  處理 power management（IPMI/Redfish）
+    ▼
+Ironic
+    │  透過 DHCP/PXE 啟動 deploy ramdisk
+    │  寫入 OS image 到目標磁碟
+    │  重啟機器進入正式 OS
+    ▼
+實體機器（Bare-Metal Server）
+```
+
+**CAPM3 從不直接呼叫 Ironic API**。這個設計的好處是：
+- CAPM3 不需要知道 Ironic 的網路位址或認證資訊
+- BMO 可以獨立處理 Ironic 的重試、錯誤恢復邏輯
+- CAPM3 透過 BareMetalHost CR 的狀態欄位得知 provisioning 進度
+
+## CAPM3 寫入 BareMetalHost 的內容
+
+當 Metal3Machine controller 選定一台 BareMetalHost 後，它會更新 BMH 的以下欄位：
+
+### 基本 Provisioning 設定
+
+```yaml
+apiVersion: metal3.io/v1alpha1
+kind: BareMetalHost
+metadata:
+  name: worker-host-01
+  namespace: metal3
+spec:
+  # CAPM3 設定這些欄位 ↓
+  online: true                    # 要求開機
+  consumerRef:                    # 聲明此 BMH 已被佔用
+    name: worker-machine-0
+    namespace: metal3
+    kind: Metal3Machine
+    apiVersion: infrastructure.cluster.x-k8s.io/v1beta1
+
+  image:
+    url: "http://192.168.0.1/images/ubuntu-22.04.qcow2"
+    checksum: "sha256:abc123def456..."
+    checksumType: sha256
+    format: qcow2
+
+  userData:
+    name: worker-machine-0-user-data
+    namespace: metal3
+
+  # 來自 Metal3Data（若有設定 DataTemplate）
+  metaData:
+    name: worker-machine-0-meta-data
+    namespace: metal3
+
+  networkData:
+    name: worker-machine-0-network-data
+    namespace: metal3
+
+  # 來自 Metal3Machine.Spec.AutomatedCleaningMode
+  automatedCleaningMode: metadata  # 或 disabled
+```
+
+### userData 的內容
+
+userData 是一個 Kubernetes Secret，內容是 base64 編碼的 cloud-init 設定：
+
+```yaml
+apiVersion: v1
+kind: Secret
+metadata:
+  name: worker-machine-0-user-data
+  namespace: metal3
+type: Opaque
+data:
+  value: |
+    # base64 encoded cloud-init config
+    # 範例（解碼後）：
+    # #cloud-config
+    # users:
+    #   - name: ubuntu
+    #     sudo: ALL=(ALL) NOPASSWD:ALL
+    # runcmd:
+    #   - kubeadm join 192.168.0.100:6443 --token ...
+```
+
+<Callout type="warning" title="userData Secret 命名規則">
+CAPI 的 bootstrap provider（如 kubeadm）會建立 bootstrap data Secret，CAPM3 會將其引用到 BMH 的 `userData` 欄位。這個 Secret 包含 kubeadm join 指令，是讓 Node 加入 cluster 的關鍵。
+</Callout>
+
+## BMO 如何翻譯 BMH 為 Ironic API 呼叫
+
+BMO 在偵測到 BareMetalHost 需要 provisioning 後，會執行以下步驟：
+
+### 步驟一：Hardware Inspection（Introspection）
+
+BMO 指示 Ironic 對機器進行 introspection（hardware inspection）：
+
+```
+BMO → Ironic API: POST /v1/nodes/{node}/provision (action: inspect)
+Ironic → 機器: 透過 PXE/DHCP 啟動 IPA（Ironic Python Agent）ramdisk
+IPA → 機器: 收集 CPU、記憶體、磁碟、網路介面資訊
+IPA → Ironic API: 回報硬體資訊
+BMO ← Ironic API: 硬體資訊更新到 BMH.Status.HardwareDetails
+```
+
+```yaml
+# Inspection 完成後的 BMH Status 範例
+status:
+  hardwareDetails:
+    cpu:
+      arch: x86_64
+      count: 32
+      model: Intel(R) Xeon(R) Gold 6248R
+    nics:
+      - ip: "192.168.0.10"
+        mac: "00:11:22:33:44:55"
+        model: "0x8086 0x1521"
+        name: eno1
+    storage:
+      - hctl: "0:0:0:0"
+        model: "SAMSUNG MZ7LH960HAJR"
+        name: /dev/sda
+        sizeBytes: 1024209543168
+        type: HDD
+    systemVendor:
+      manufacturer: Dell Inc.
+      productName: PowerEdge R640
+```
+
+### 步驟二：Automated Cleaning（若啟用）
+
+```
+BMO → Ironic API: 觸發 cleaning
+Ironic → 機器: 啟動 IPA ramdisk（再次）
+IPA → 磁碟: 執行 shred/ATA secure erase（依設定）
+```
+
+每個磁碟的清理時間：
+- SSD：5-10 分鐘（ATA secure erase）
+- HDD：30-120 分鐘（依容量）
+- NVMe：10-30 分鐘（cryptographic erase）
+
+### 步驟三：OS Image 部署
+
+這是最核心的步驟：
+
+```
+BMO → Ironic API: POST /v1/nodes/{node}/provision (action: active)
+      body: {
+        "target": "active",
+        "configdrive": {
+          "user_data": "<cloud-init base64>",
+          "meta_data": {"hostname": "worker-host-01", ...},
+          "network_data": {"links": [...], "networks": [...]}
+        }
+      }
+
+Ironic → 機器:
+  1. 透過 IPMI/Redfish 開機
+  2. DHCP 分配 IP，PXE 啟動 deploy ramdisk
+  3. ramdisk 回呼 Ironic，確認準備就緒
+  4. Ironic 下令 ramdisk 從 URL 下載 OS image
+  5. ramdisk 將 image 寫入磁碟（如 /dev/sda）
+  6. 建立 configdrive 分割區（含 user_data、meta_data、network_data）
+  7. 設定開機順序（改為從硬碟啟動）
+  8. Ironic 透過 IPMI/Redfish 重啟機器
+  9. 機器從硬碟啟動，cloud-init 執行 kubeadm join
+```
+
+## Power Management 流程
+
+Metal3/Ironic 支援多種 BMC（Baseboard Management Controller）協定：
+
+| 協定 | 描述 | BMC 位址格式 |
+|------|------|-------------|
+| IPMI | 傳統 BMC 協定 | `ipmi://192.168.1.100` |
+| Redfish | 現代 REST API 協定 | `redfish://192.168.1.100/redfish/v1/Systems/1` |
+| iDRAC（Dell）| Redfish 擴展 | `idrac-redfish://192.168.1.100` |
+| iLO（HPE）| Redfish 擴展 | `ilo5-redfish://192.168.1.100` |
+| iRMC（Fujitsu）| Redfish 擴展 | `irmc://192.168.1.100` |
+
+```yaml
+# BareMetalHost BMC 設定範例
+spec:
+  bmc:
+    address: redfish://192.168.1.100/redfish/v1/Systems/1
+    credentialsName: worker-host-01-bmc-secret
+    disableCertificateVerification: false
+
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: worker-host-01-bmc-secret
+  namespace: metal3
+type: Opaque
+data:
+  username: YWRtaW4=   # admin (base64)
+  password: cGFzc3dvcmQ=  # password (base64)
+```
+
+Power management 操作流程：
+
+```
+開機流程：
+BMO 設定 BMH.Spec.Online = true
+  → BMO 呼叫 Ironic power on API
+  → Ironic 透過 IPMI/Redfish 送開機指令給 BMC
+  → BMC 觸發機器開機
+  → BMH.Status.PoweredOn = true
+
+關機流程（Deprovisioning）：
+Metal3Machine 刪除時
+  → CAPM3 設定 BMH.Spec.Online = false
+  → CAPM3 清除 BMH.Spec.ConsumerRef
+  → BMO 呼叫 Ironic deprovision API
+  → Ironic 清除機器，執行 cleaning（若啟用）
+  → 機器回到 Available 狀態
+```
+
+## 錯誤如何反映在 Metal3Machine
+
+當 Ironic 或 BMO 遇到問題，錯誤訊息會透過以下路徑傳遞：
+
+```
+Ironic 錯誤
+    │
+    ▼
+BMO 更新 BareMetalHost.Status.ErrorMessage
+BMO 更新 BareMetalHost.Status.ErrorType
+    │
+    ▼
+CAPM3 偵測到 BMH.Status.ErrorMessage 非空
+    │
+    ▼
+Metal3Machine.Status.FailureMessage = BMH.Status.ErrorMessage
+Metal3Machine.Status.FailureReason = InfrastructureProviderFailed
+```
+
+### 常見 Ironic 錯誤訊息
+
+| 錯誤訊息 | 原因 | 解決方法 |
+|----------|------|----------|
+| `Failed to connect to endpoint` | BMC 網路不通或憑證錯誤 | 確認 BMC IP 可達，Secret 內容正確 |
+| `Image checksum verification failed` | image 下載損毀或 checksum 錯誤 | 重新確認 checksum 值，或重新上傳 image |
+| `Deploy step deploy.deploy failed` | deploy ramdisk 寫入磁碟失敗 | 確認磁碟可寫入，查看 Ironic 日誌 |
+| `Timeout waiting for callback` | deploy ramdisk 啟動但未回呼 | 確認機器可透過 PXE 啟動，網路可達 |
+| `Failed to allocate port` | Neutron/DHCP 無法分配 IP | 確認 Ironic 的 DHCP 設定正確 |
+| `Node is locked` | 另一個操作尚未完成 | 等待 Ironic 完成當前操作 |
+
+```bash
+# 查看 BMH 的錯誤訊息
+kubectl get baremetalhosts -n metal3 \
+  -o custom-columns='NAME:.metadata.name,STATE:.status.provisioning.state,ERROR:.status.errorMessage'
+
+# 範例輸出
+NAME             STATE          ERROR
+worker-host-01   provisioning   <none>
+worker-host-02   available      <none>
+worker-host-03   available      Deploy step deploy.deploy failed
+```
+
+## Redfish vs IPMI：選擇建議
+
+| 特性 | IPMI | Redfish |
+|------|------|---------|
+| 成熟度 | 高（20+ 年） | 較新（2015+） |
+| 功能豐富度 | 基本 | 豐富（BIOS 設定、firmware 更新等） |
+| 安全性 | 較弱 | 強（HTTPS，支援 TLS） |
+| 速度 | 慢 | 快（REST API） |
+| 建議使用場景 | 舊設備相容 | 新設備首選 |
+
+<Callout type="tip" title="建議">
+新採購的伺服器建議使用 Redfish 協定。Dell iDRAC 9+、HPE iLO 5+、Lenovo XCC 均完整支援 Redfish，與 Ironic 的相容性更好。
+</Callout>
+
+## 查看 Ironic 日誌排查問題
+
+若需要深入排查 provisioning 問題，可以直接查看 Ironic 和 BMO 的日誌：
+
+```bash
+# 查看 BMO 日誌（BareMetalOperator）
+kubectl logs -n baremetal-operator-system \
+  deploy/baremetal-operator-controller-manager -c manager | tail -100
+
+# 查看 Ironic 日誌（若 Ironic 部署在 kubernetes）
+kubectl logs -n baremetal-operator-system \
+  $(kubectl get pods -n baremetal-operator-system -o name | grep ironic) \
+  -c ironic | tail -100
+
+# 查看特定 BMH 的完整事件
+kubectl describe baremetalhost worker-host-03 -n metal3
+```
+
+關鍵日誌關鍵字：
+
+| 關鍵字 | 含義 |
+|--------|------|
+| `deploy step deploy.deploy` | Ironic 正在執行 OS 寫入 |
+| `clean step` | Ironic 正在執行 disk cleaning |
+| `introspection` | Ironic 正在收集硬體資訊 |
+| `power on` / `power off` | BMC 電源操作 |
+| `callback` | deploy ramdisk 回呼確認 |

@@ -1,0 +1,298 @@
+---
+layout: doc
+title: Cluster API Provider Metal3 — MachineHealthCheck 整合
+description: 說明 CAPM3 如何搭配 CAPI 的 MachineHealthCheck 機制，以及 Metal3Remediation 的 Reboot 策略如何取代標準刪除行為
+---
+
+# MachineHealthCheck 整合
+
+<Callout type="info" title="相關章節">
+- [故障修復機制（Remediation）](/cluster-api-provider-metal3/features/remediation)
+- [BareMetalHost 生命週期](/cluster-api-provider-metal3/features/bmh-lifecycle)
+- [ProviderID 工作流](/cluster-api-provider-metal3/features/provider-id-workflow)
+</Callout>
+
+<Callout type="tip" title="本文適用對象">
+- 🟢 **初學者**：了解 MachineHealthCheck 是什麼，以及為何 bare-metal 需要特別的 remediation 策略
+- 🟡 **中階工程師**：學習如何設定 MHC 與 Metal3RemediationTemplate，以及兩者如何協作
+- 🔴 **資深工程師**：深入了解 unhealthy annotation 機制、備份/還原 Node annotations/labels 的流程
+</Callout>
+
+> 📦 **類比**：MachineHealthCheck 是「醫院的護士巡房」，負責定期檢查每個病人（Node）的狀態。當發現病人異常時，護士（MHC controller）會通知醫師（CAPI remediation）。對 bare-metal 病人，醫師不會立刻「換一個病床」（刪除 Machine），而是先嘗試「電擊急救」（reboot），因為換床的成本（重新 provisioning）太高且耗時。
+
+## 什麼是 MachineHealthCheck
+
+MachineHealthCheck（MHC）是 Cluster API 提供的 CRD，用來定期監控 Machine 的健康狀態，並在機器不健康時觸發修復動作。
+
+```yaml
+apiVersion: cluster.x-k8s.io/v1beta1
+kind: MachineHealthCheck
+metadata:
+  name: worker-mhc
+  namespace: default
+spec:
+  clusterName: my-cluster
+  selector:
+    matchLabels:
+      cluster.x-k8s.io/deployment-name: worker
+
+  # 不健康條件定義
+  unhealthyConditions:
+    - type: Ready
+      status: "False"
+      timeout: 300s     # Node Ready = False 持續超過 5 分鐘
+    - type: Ready
+      status: Unknown
+      timeout: 300s     # Node Ready = Unknown 持續超過 5 分鐘（Node 消失）
+
+  # 最多允許同時 remediate 的機器數量（百分比或絕對值）
+  maxUnhealthy: "33%"
+
+  # 指定使用 Metal3RemediationTemplate（而非預設的刪除）
+  remediationTemplate:
+    apiVersion: infrastructure.cluster.x-k8s.io/v1beta1
+    kind: Metal3RemediationTemplate
+    name: worker-remediation-template
+    namespace: default
+```
+
+<Callout type="tip" title="bare-metal 的 timeout 要設更長">
+雲端環境通常設 60-120 秒的 timeout，但 bare-metal 機器的重啟和 provisioning 可能需要 5-30 分鐘。建議將 `timeout` 設為至少 300-600 秒，避免正在 provisioning 的機器被誤判為不健康。
+</Callout>
+
+## 不健康條件偵測
+
+### NodeNotReady（Node Ready = False）
+
+Node 的 Ready condition 變為 False，通常表示：
+- kubelet 無法與 kube-apiserver 通訊
+- 系統資源（CPU、記憶體、磁碟）耗盡
+- 核心元件（如 containerd）崩潰
+
+### NodeNotFound（Node 消失）
+
+Node 物件從 Kubernetes API 消失，或 Node.Status.Conditions 中沒有 Ready condition：
+- 機器電源故障
+- 作業系統崩潰導致 kubelet 無法啟動
+- 網路分區（network partition）
+
+### 自定義不健康條件
+
+```yaml
+unhealthyConditions:
+  - type: Ready
+    status: "False"
+    timeout: 300s
+  - type: Ready
+    status: Unknown
+    timeout: 300s
+  # 自定義：磁碟壓力持續超過 10 分鐘
+  - type: DiskPressure
+    status: "True"
+    timeout: 600s
+```
+
+## Metal3Remediation vs 標準 CAPI 刪除
+
+### 標準 CAPI 刪除（不推薦用於 bare-metal）
+
+```
+MHC 偵測到不健康
+    → CAPI 刪除 Machine 物件
+    → CAPM3 釋放 BareMetalHost（deprovisioning）
+    → BareMetalHost 重新 cleaning（5-30 分鐘）
+    → 新的 Machine 被建立
+    → BareMetalHost 重新 provisioning（10-30 分鐘）
+    
+總計：20-60 分鐘
+```
+
+### Metal3Remediation Reboot 策略（推薦）
+
+```
+MHC 偵測到不健康
+    → MHC 建立 Metal3Remediation 物件
+    → CAPM3 設定 UnhealthyAnnotation 在 BareMetalHost 上
+    → CAPM3 對機器執行 Reboot（BMC power cycle）
+    → 機器重啟，kubelet 重新啟動
+    → Node 恢復 Ready 狀態
+    → Metal3Remediation 物件被刪除
+    
+總計：3-10 分鐘
+```
+
+## Metal3RemediationTemplate 設定
+
+```yaml
+apiVersion: infrastructure.cluster.x-k8s.io/v1beta1
+kind: Metal3RemediationTemplate
+metadata:
+  name: worker-remediation-template
+  namespace: default
+spec:
+  template:
+    spec:
+      strategy:
+        # 目前唯一支援的策略類型
+        type: Reboot
+
+        # 嘗試次數上限（超過後會觸發 Machine 刪除）
+        retryLimit: 3
+
+        # 每次 reboot 之間的等待時間
+        timeout: 5m
+```
+
+| 欄位 | 說明 | 建議值 |
+|------|------|--------|
+| `type` | 修復策略類型（目前只有 Reboot） | `Reboot` |
+| `retryLimit` | 最大重試次數 | 3-5（超過後刪除 Machine） |
+| `timeout` | 兩次 reboot 之間的等待時間 | 5-10 分鐘 |
+
+## Metal3Remediation 物件生命週期
+
+MHC 觸發後，會建立一個 Metal3Remediation 物件：
+
+```yaml
+apiVersion: infrastructure.cluster.x-k8s.io/v1beta1
+kind: Metal3Remediation
+metadata:
+  name: worker-machine-0-remediation
+  namespace: default
+  # 由 MHC 建立，ownerReference 指向 Machine
+  ownerReferences:
+    - apiVersion: cluster.x-k8s.io/v1beta1
+      kind: Machine
+      name: worker-machine-0
+spec:
+  strategy:
+    type: Reboot
+    retryLimit: 3
+    timeout: 5m
+status:
+  phase: Running     # Running / Waiting / Deleting machine / Failed
+  retryCount: 1      # 已嘗試次數
+  lastRemediated: "2024-01-15T10:30:00Z"
+```
+
+### Phase 狀態機
+
+| Phase | 說明 | 下一步 |
+|-------|------|--------|
+| `Running` | 正在執行 reboot 操作 | → `Waiting` |
+| `Waiting` | 等待機器重啟完成（timeout 期間） | → `Running`（若再次不健康）或刪除（若恢復健康） |
+| `Deleting machine` | reboot 無效，準備刪除 Machine | → Machine 被刪除，重新 provisioning |
+| `Failed` | BMH 被管理員設為 `online: false`，無法 remediate | 需要人工介入 |
+
+## UnhealthyAnnotation 機制
+
+Metal3Remediation controller 會在相關 BareMetalHost 上設定 annotation：
+
+```
+annotation key: capi.metal3.io/unhealthy
+```
+
+此 annotation 的作用：
+1. **防止 `chooseHost()` 選擇此 host**：確保不健康的機器不會被分配給新的 Metal3Machine
+2. **標記 remediation 進行中**：讓管理員和其他 controller 知道此機器正在修復
+
+```bash
+# 手動查看不健康的 BMH
+kubectl get baremetalhosts -n metal3 \
+  -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.metadata.annotations.capi\.metal3\.io/unhealthy}{"\n"}{end}'
+
+# 手動移除 unhealthy annotation（慎用，應讓 remediation controller 自動處理）
+kubectl annotate baremetalhost worker-host-01 \
+  capi.metal3.io/unhealthy- -n metal3
+```
+
+<Callout type="warning" title="棄用的舊版 annotation">
+舊版使用 `metal3.io/unhealthy`（`UnhealthyAnnotationDeprecated`），新版改為 `capi.metal3.io/unhealthy`。CAPM3 會對帶有舊版 annotation 的 BMH 記錄警告，請盡快遷移。
+</Callout>
+
+## Node Annotations 和 Labels 備份
+
+在執行 Reboot remediation 前，Metal3Remediation controller 會備份 Node 的 annotations 和 labels，防止重啟後 Node 重新加入時遺失重要的 scheduler 資訊：
+
+```go
+// baremetal/metal3remediation_manager.go
+const (
+    nodeAnnotationsBackupAnnotation = "remediation.metal3.io/node-annotations-backup"
+    nodeLabelsBackupAnnotation      = "remediation.metal3.io/node-labels-backup"
+)
+```
+
+備份流程：
+1. Remediation controller 讀取當前 Node 的所有 annotations 和 labels
+2. 將它們序列化為 JSON，存在 Metal3Machine 的 annotation 中
+3. Reboot 完成，Node 重新就緒後，controller 還原這些 annotations 和 labels
+
+這確保了如 `node-role.kubernetes.io/control-plane`、`topology.kubernetes.io/zone` 等重要 label 在 reboot 後不會遺失。
+
+## 完整設定範例
+
+```yaml
+# 1. Metal3RemediationTemplate（定義 reboot 策略）
+apiVersion: infrastructure.cluster.x-k8s.io/v1beta1
+kind: Metal3RemediationTemplate
+metadata:
+  name: worker-remediation-template
+  namespace: default
+spec:
+  template:
+    spec:
+      strategy:
+        type: Reboot
+        retryLimit: 3
+        timeout: 5m
+
+---
+# 2. MachineHealthCheck（監控並觸發 remediation）
+apiVersion: cluster.x-k8s.io/v1beta1
+kind: MachineHealthCheck
+metadata:
+  name: worker-mhc
+  namespace: default
+spec:
+  clusterName: my-metal3-cluster
+  selector:
+    matchLabels:
+      cluster.x-k8s.io/deployment-name: worker-md
+  unhealthyConditions:
+    - type: Ready
+      status: "False"
+      timeout: 300s   # 5 分鐘（bare-metal 重啟需要時間）
+    - type: Ready
+      status: Unknown
+      timeout: 300s
+  maxUnhealthy: "33%"  # 避免批量 remediation 導致服務中斷
+  remediationTemplate:
+    apiVersion: infrastructure.cluster.x-k8s.io/v1beta1
+    kind: Metal3RemediationTemplate
+    name: worker-remediation-template
+    namespace: default
+```
+
+## 監控 Remediation 狀態
+
+```bash
+# 查看所有 Metal3Remediation 物件
+kubectl get metal3remediations -A
+
+# 查看 MHC 狀態
+kubectl get machinehealthchecks -n default
+
+# 詳細查看 MHC 狀態
+kubectl describe machinehealthcheck worker-mhc -n default
+
+# 查看特定 remediation 的詳細資訊
+kubectl describe metal3remediation worker-machine-0-remediation -n default
+```
+
+MachineHealthCheck 的 `status` 會顯示：
+
+| 欄位 | 說明 |
+|------|------|
+| `expectedMachines` | 預期受監控的 Machine 數量 |
+| `currentHealthy` | 目前健康的 Machine 數量 |
+| `remediationsAllowed` | 還允許觸發的 remediation 數量（受 maxUnhealthy 限制） |

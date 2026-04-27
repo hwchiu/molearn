@@ -1,0 +1,272 @@
+---
+layout: doc
+title: Kube-OVN — ACL 與 Network Policy
+description: 透過 OVN ACL 實作高效能 NetworkPolicy，並以 Subnet 層級 ACL 提供更細粒度的存取控制
+---
+
+# ACL 與 Network Policy
+
+<Callout type="info" title="相關章節">
+- [VPC 與 Subnet 設計](/kube-ovn/features/vpc-subnet)
+- [整體架構](/kube-ovn/features/architecture)
+- [OVN 整合原理](/kube-ovn/features/ovn-integration)
+- [Controllers 設計](/kube-ovn/features/controllers)
+</Callout>
+
+<Callout type="tip" title="本文適用對象">
+- 🟢 **初學者**：理解 NetworkPolicy 在 Kube-OVN 中如何運作，與 iptables 方案的差異
+- 🟡 **中階工程師**：掌握 Subnet Private Mode 與 ACL Rule 的設定
+- 🔴 **資深工程師**：深入理解 OVN ACL 優先級、Stateful/Stateless 模式、與 NetworkPolicy 的交互
+</Callout>
+
+> 📦 **類比**：Kube-OVN 的雙層存取控制就像門禁系統——NetworkPolicy 是「辦公室門鎖」（以 Pod 為單位），Subnet ACL 是「大樓門禁」（以整個 Subnet 為單位）。兩層規則同時生效，封包需通過兩道檢查才能進出。
+
+## 雙層存取控制架構
+
+Kube-OVN 提供兩個獨立層級的存取控制：
+
+| 層級 | 機制 | 設定方式 | 適用範圍 |
+|------|------|---------|---------|
+| Layer 1 | Kubernetes NetworkPolicy | `NetworkPolicy` 資源 | Pod 選擇器粒度 |
+| Layer 2 | Subnet ACL | Subnet `spec.acls` | 整個 Subnet |
+
+兩層都透過 **OVN ACL** 實作，底層共用相同的 Logical Flow 機制，但優先級範圍不同。
+
+## Layer 1：OVN 實作 NetworkPolicy
+
+### 為何 OVN ACL 比 iptables 更好
+
+傳統 CNI（如 Calico 使用 iptables 模式）在節點上維護大量 iptables 規則。當 Pod 數量增加，iptables 規則呈線性增長，查詢複雜度為 O(n)。OVN ACL 的優勢：
+
+| 比較項目 | iptables NetworkPolicy | OVN ACL NetworkPolicy |
+|---------|----------------------|----------------------|
+| 規則儲存位置 | 每個 Node 的 iptables | OVN SB DB Logical Flow |
+| 查詢複雜度 | O(n)（線性掃描）| O(1)（flow 精確匹配）|
+| Stateful 連線追蹤 | 需要 conntrack 模組 | OVN 內建 conntrack |
+| 硬體 Offload | 不支援 | 支援（SmartNIC）|
+| 規則更新 | 全量重寫（有鎖）| 增量更新（OVSDB 事務）|
+| Windows 支援 | 有限 | 支援（OVS for Windows）|
+
+### NetworkPolicy 轉換為 OVN ACL 的過程
+
+當 `kube-ovn-controller` 偵測到 NetworkPolicy 建立時：
+
+1. 解析 `podSelector`、`namespaceSelector`、`ingress`、`egress` 規則
+2. 計算受影響 Pod 的 IP 集合，建立 OVN **Address Set**（`AS`）物件
+3. 在對應的 Logical Switch 上建立 ACL 條目，引用 Address Set
+
+```bash
+# 查看 OVN 中 NetworkPolicy 產生的 Address Set
+ovn-nbctl list address_set | grep "networkpolicy"
+
+# 查看 ACL 規則
+ovn-nbctl list acl | grep "NetworkPolicy"
+```
+
+### NetworkPolicy 範例
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-frontend-to-backend
+  namespace: production
+spec:
+  podSelector:
+    matchLabels:
+      app: backend
+  policyTypes:
+  - Ingress
+  ingress:
+  - from:
+    - podSelector:
+        matchLabels:
+          app: frontend
+    - namespaceSelector:
+        matchLabels:
+          env: monitoring
+    ports:
+    - protocol: TCP
+      port: 8080
+```
+
+此 NetworkPolicy 在 OVN 中產生的 ACL 大致如下（偽代碼）：
+
+```
+# ingress allow: from frontend pods or monitoring namespace, port 8080
+priority=1000 direction=to-lport match="ip4.src == $np_ingress_allow_set && tcp.dst == 8080" action=allow-related
+
+# ingress default deny（所有其他 ingress 流量）
+priority=0 direction=to-lport match="ip4" action=drop
+```
+
+## Layer 2：Subnet ACL
+
+Subnet 層級的 ACL 讓你在整個 Subnet 範圍設定進出規則，不依賴 Pod label。
+
+### Subnet Private Mode
+
+最簡單的 Subnet 存取控制是開啟 `private` 模式：
+
+```yaml
+apiVersion: kubeovn.io/v1
+kind: Subnet
+metadata:
+  name: secure-subnet
+spec:
+  cidrBlock: "10.16.20.0/24"
+  private: true                       # 啟用隔離模式：預設拒絕所有跨 Subnet 流量
+  allowSubnets:
+  - 10.16.0.0/24                      # 允許此 Subnet 進入
+  - 10.16.1.0/24
+```
+
+`private: true` 效果：
+- 同 Subnet 內部 Pod 間互通（L2 直通）
+- 跨 Subnet 流量預設 **drop**
+- `allowSubnets` 列出的 CIDR 可以進入此 Subnet
+
+<Callout type="info" title="private 模式與 NetworkPolicy 的關係">
+`private: true` 是 Subnet 層級的 default-deny，作用在 Logical Switch 入口。NetworkPolicy 是 Pod 層級的 default-deny。兩者可同時使用，流量必須同時通過兩道關卡。
+</Callout>
+
+### 精細 ACL 規則（spec.acls）
+
+若需要更細粒度的控制，可以直接在 Subnet 中定義 ACL 規則列表：
+
+```yaml
+apiVersion: kubeovn.io/v1
+kind: Subnet
+metadata:
+  name: app-subnet
+spec:
+  cidrBlock: "10.16.30.0/24"
+  acls:
+  - direction: ingress              # to-lport：進入此 Subnet
+    priority: 2000
+    action: allow-related           # 允許且追蹤連線狀態
+    match: "ip4.src == 10.16.0.0/24 && tcp.dst == 443"
+  - direction: ingress
+    priority: 1500
+    action: drop
+    match: "ip4.src == 192.168.100.0/24"   # 封鎖特定來源
+  - direction: egress               # from-lport：離開此 Subnet
+    priority: 1000
+    action: allow
+    match: "ip4.dst == 10.0.0.0/8"         # 允許訪問內網
+  - direction: egress
+    priority: 500
+    action: reject                  # 回送 TCP RST / ICMP Unreachable
+    match: "ip4"
+```
+
+### ACL 欄位說明
+
+| 欄位 | 值 | 說明 |
+|------|---|------|
+| `direction` | `ingress` | 進入 Logical Switch Port 的流量（from-lport 的相反方向）|
+| `direction` | `egress` | 離開 Logical Switch Port 的流量 |
+| `priority` | 0–32767 | 數字越大優先級越高，Kube-OVN 保留 0-999 給系統規則 |
+| `action` | `allow` | 允許，不追蹤連線狀態 |
+| `action` | `allow-related` | 允許，**啟用** conntrack（建議用於 TCP/UDP）|
+| `action` | `drop` | 靜默丟棄 |
+| `action` | `reject` | 主動拒絕（TCP RST 或 ICMP Port Unreachable）|
+| `match` | OVN 表達式 | 支援 `ip4`、`ip6`、`tcp`、`udp`、`icmp`、`ip4.src`、`ip4.dst`、`tcp.dst` 等 |
+
+### OVN ACL Match 表達式
+
+OVN 的 match 語法基於布林邏輯，支援豐富的匹配條件：
+
+```
+# 匹配特定來源 IP
+ip4.src == 10.16.0.100
+
+# 匹配 CIDR
+ip4.dst == 10.0.0.0/8
+
+# 匹配 TCP 目標埠
+tcp.dst == 8080
+
+# 匹配埠範圍（需 OVN 22.06+）
+tcp.dst >= 8080 && tcp.dst <= 8090
+
+# 匹配 Address Set（跨多個 IP）
+ip4.src == $my_address_set
+
+# 組合條件
+ip4.src == 10.16.0.0/24 && tcp.dst == 443 && ip4.dst != 10.16.0.1
+```
+
+<Callout type="tip" title="OVN ACL 除錯工具">
+使用 `ovn-trace` 模擬封包路徑，驗證 ACL 規則是否符合預期：
+
+```bash
+ovn-trace <logical-switch> 'inport == "pod-port" && ip4 && ip4.src == 10.16.0.5 && tcp.dst == 80'
+```
+</Callout>
+
+## Subnet ACL 與 NetworkPolicy 的優先級
+
+OVN 中所有 ACL 統一以 `priority` 排序，數字越大越優先匹配：
+
+| 規則類型 | 優先級範圍 | 說明 |
+|---------|-----------|------|
+| Kube-OVN 系統規則 | 0–999 | 預設放通同 Subnet 流量、ARP 等 |
+| Subnet ACL（`spec.acls`）| 自定義（建議 1000+）| Subnet 層級控制 |
+| NetworkPolicy（ingress allow）| ~1000–3000 | Pod 層級允許規則 |
+| NetworkPolicy（egress allow）| ~1000–3000 | Pod 層級允許規則 |
+| NetworkPolicy（default deny）| ~0–100 | Pod 層級預設拒絕 |
+
+當多條 ACL 匹配同一封包時，**最高優先級的規則生效**，其餘規則被跳過。
+
+## allowSubnets：快速白名單
+
+`spec.allowSubnets` 是 `private: true` 的補充，提供簡潔的 Subnet 白名單語法，避免手動撰寫複雜 ACL：
+
+```yaml
+spec:
+  private: true
+  allowSubnets:
+  - ovn-default           # 允許 ovn-default Subnet
+  - 10.16.1.0/24          # 允許特定 CIDR
+  - monitoring            # 允許名為 monitoring 的 Subnet
+```
+
+Kube-OVN controller 會自動將 `allowSubnets` 轉換為對應的 ACL `allow-related` 規則。
+
+## 效能比較：OVN ACL vs kube-proxy iptables
+
+以下為在 1000 個 Pod + 100 個 NetworkPolicy 的環境下的典型效能差異：
+
+| 指標 | iptables 方案 | OVN ACL 方案 |
+|------|-------------|-------------|
+| 規則數量（每節點）| ~50,000+ 條 iptables 規則 | ~200 條 ACL（集中在 OVN）|
+| 首次規則下發時間 | ~30s（iptables-restore）| ~2s（OVSDB 增量）|
+| 增量更新時間 | ~5-10s（需鎖定重寫）| <1s（事務式更新）|
+| CPU 開銷（穩態）| 中等（conntrack 表掃描）| 低（OVS 流表直接匹配）|
+
+## 查詢與排查
+
+```bash
+# 查看某個 Subnet 的 ACL 規則
+kubectl get subnet app-subnet -o jsonpath='{.spec.acls}' | jq .
+
+# 在 OVN 中查看所有 ACL
+ovn-nbctl list acl
+
+# 查看特定 Logical Switch 的 ACL
+ovn-nbctl acl-list <logical-switch-name>
+
+# 追蹤封包是否被 ACL drop
+ovn-trace <ls-name> 'inport == "<port>" && ip4 && ip4.src == <src> && tcp.dst == <port>'
+
+# 監控 ACL 匹配統計（需 OVS statistics）
+ovs-ofctl dump-flows br-int | grep -i "drop\|reject"
+```
+
+<Callout type="warning" title="ACL 規則衝突排查">
+若流量被意外 drop，先以 `ovn-trace` 確認哪條 ACL 命中。常見原因：
+1. Subnet private 模式開啟但未加入 `allowSubnets`
+2. NetworkPolicy 的 `podSelector` 選到了不預期的 Pod
+3. ACL priority 衝突，低優先級的 drop 規則被更高優先級的 allow 蓋過
+</Callout>

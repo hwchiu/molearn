@@ -1,0 +1,335 @@
+---
+layout: doc
+title: Rook — CephFilesystem 與 CephFS 共享儲存
+description: 深入解析 CephFilesystem CRD、MDS Metadata Server 的運作原理，以及如何實現 ReadWriteMany 共享存取。
+---
+
+# CephFilesystem 與 CephFS 共享儲存
+
+<Callout type="info" title="相關章節">
+- [架構總覽](/rook/features/architecture)
+- [CSI Driver](/rook/features/csi-driver)
+- [CephBlockPool 與 RBD](/rook/features/ceph-block-pool)
+- [StorageClass 設定](/rook/features/storage-classes)
+</Callout>
+
+<Callout type="tip" title="本文適用對象">
+- 🟢 **初學者**：了解 CephFS 與 RBD 的核心差異，何時該選擇 CephFS。
+- 🟡 **中階工程師**：掌握 MDS 配置、metadataPool 與 dataPool 的分離設計。
+- 🔴 **資深工程師**：深入 CephFS subvolume group、quota 機制、snapshot 策略與效能調校。
+</Callout>
+
+> 📦 **類比**：CephFilesystem 就像在資料中心建立一個 NAS 共用磁碟，多台電腦可以同時掛載同一個目錄，共同讀寫同一份檔案。
+
+## 什麼是 CephFilesystem
+
+CephFilesystem（CephFS）是 Ceph 提供的 **POSIX 相容分散式檔案系統**。與 RBD Block Storage 只支援 ReadWriteOnce 不同，CephFS 支援 **ReadWriteMany（RWX）**，讓多個 Pod 同時掛載同一個 volume 並進行讀寫。
+
+CephFS 架構上由兩個核心元件組成：
+
+| 元件 | 角色 |
+|------|------|
+| **MDS（Metadata Server）** | 管理目錄結構、檔案 metadata（inode, dentry） |
+| **OSD Pool** | 實際儲存檔案資料與 metadata |
+
+### CephFS 與 RBD 的核心差異
+
+| 特性 | CephFS | RBD |
+|------|--------|-----|
+| AccessMode | ReadWriteMany ✅ | ReadWriteOnce |
+| POSIX 相容 | 完整支援 | 不適用 |
+| 適用場景 | 共享檔案 | 資料庫、OS disk |
+| 效能特性 | 高並行讀取 | 低延遲寫入 |
+| Snapshot | 支援（CephFS snapshot） | 支援（RBD snapshot） |
+
+## CephFilesystem CRD Spec
+
+```yaml
+apiVersion: ceph.rook.io/v1
+kind: CephFilesystem
+metadata:
+  name: myfs
+  namespace: rook-ceph
+spec:
+  metadataPool:
+    replicated:
+      size: 3
+  dataPools:
+    - name: replicated
+      failureDomain: host
+      replicated:
+        size: 3
+  preserveFilesystemOnDelete: true
+  metadataServer:
+    activeCount: 1
+    activeStandby: true
+    resources:
+      limits:
+        memory: "4Gi"
+      requests:
+        cpu: "500m"
+        memory: "4Gi"
+    priorityClassName: system-cluster-critical
+```
+
+### 關鍵欄位說明
+
+| 欄位 | 說明 | 建議值 |
+|------|------|--------|
+| `metadataPool` | 儲存 MDS journal 與 inode 資料的 pool | `replicated size: 3` |
+| `dataPools` | 儲存實際檔案內容的 pool（可多個） | 依需求選 replicated 或 EC |
+| `metadataServer.activeCount` | 同時 active 的 MDS 數量 | 1（一般），2-3（大量小檔案） |
+| `metadataServer.activeStandby` | 是否保留 standby MDS | `true`（熱備援） |
+| `preserveFilesystemOnDelete` | 刪除 CRD 時是否保留底層 pool | `true`（防誤刪） |
+
+## MDS（Metadata Server）深度解析
+
+MDS 是 CephFS 的核心，負責管理整個檔案系統的 namespace。
+
+### Active 與 Standby MDS
+
+```
+Client ──→ Active MDS 1 (管理 /data, /logs)
+               ↑
+           Standby MDS  (隨時準備接手)
+```
+
+當 active MDS 故障，standby MDS 會接管，failover 時間通常在 30-60 秒內。
+
+### 多 Active MDS（Multiple Active）
+
+當 `activeCount > 1` 時，CephFS 會進行目錄樹的動態分區（Dynamic Subtree Partitioning）：
+
+```
+Active MDS 1 → 負責 /data/project-a/*
+Active MDS 2 → 負責 /data/project-b/*
+```
+
+這樣可以水平擴展 metadata 處理能力，適合大量小檔案場景（如 ML training data）。
+
+<Callout type="warning" title="多 Active MDS 注意事項">
+多 Active MDS 場景下，某些 POSIX 操作（如跨目錄 rename）會變慢，因為需要協調多個 MDS。一般場景建議 `activeCount: 1`，僅在 metadata 成為瓶頸時才增加。
+</Callout>
+
+### MDS 資源規劃
+
+| 工作負載類型 | CPU | Memory |
+|-------------|-----|--------|
+| 小型叢集（< 1M inodes） | 500m | 4Gi |
+| 中型叢集（1M-10M inodes） | 2 | 8Gi |
+| 大型叢集（> 10M inodes） | 4 | 16Gi+ |
+
+## Data Pool 設計
+
+CephFilesystem 支援多個 dataPools，可以為不同的資料類型指定不同的儲存策略：
+
+```yaml
+spec:
+  dataPools:
+    - name: replicated          # 熱資料：replicated pool
+      failureDomain: host
+      replicated:
+        size: 3
+    - name: ec-cold             # 冷資料：erasure-coded pool（省空間）
+      failureDomain: host
+      erasureCoded:
+        dataChunks: 4
+        codingChunks: 2
+```
+
+客戶端可以透過設定 file layout 決定每個目錄使用哪個 data pool：
+
+```bash
+# 在 toolbox 中設定目錄的 data pool
+setfattr -n ceph.dir.layout.pool -v ec-cold /mnt/cephfs/cold-archive/
+```
+
+## CephFS CSI StorageClass
+
+```yaml
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: rook-cephfs
+provisioner: rook-ceph.cephfs.csi.ceph.com
+parameters:
+  clusterID: rook-ceph
+  fsName: myfs
+  pool: myfs-replicated        # 對應 dataPools 中的 name
+  csi.storage.k8s.io/provisioner-secret-name: rook-csi-cephfs-provisioner
+  csi.storage.k8s.io/provisioner-secret-namespace: rook-ceph
+  csi.storage.k8s.io/controller-expand-secret-name: rook-csi-cephfs-provisioner
+  csi.storage.k8s.io/controller-expand-secret-namespace: rook-ceph
+  csi.storage.k8s.io/node-stage-secret-name: rook-csi-cephfs-node
+  csi.storage.k8s.io/node-stage-secret-namespace: rook-ceph
+reclaimPolicy: Delete
+allowVolumeExpansion: true
+```
+
+## ReadWriteMany PVC
+
+CephFS 的最大優勢是支援多個 Pod 同時讀寫同一個 volume：
+
+```yaml
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: shared-training-data
+spec:
+  accessModes:
+    - ReadWriteMany        # 多 Pod 同時讀寫
+  resources:
+    requests:
+      storage: 500Gi
+  storageClassName: rook-cephfs
+```
+
+```yaml
+# ML training job 中多個 worker 共享同一個 PVC
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: training-worker
+spec:
+  replicas: 8             # 8 個 worker 同時掛載
+  template:
+    spec:
+      volumes:
+        - name: training-data
+          persistentVolumeClaim:
+            claimName: shared-training-data
+      containers:
+        - name: worker
+          image: ml-training:latest
+          volumeMounts:
+            - name: training-data
+              mountPath: /data
+```
+
+## CephFS Snapshot 支援
+
+Rook 透過 CSI Snapshot 機制支援 CephFS volume snapshot：
+
+```yaml
+# 建立 VolumeSnapshotClass
+apiVersion: snapshot.storage.k8s.io/v1
+kind: VolumeSnapshotClass
+metadata:
+  name: csi-cephfsplugin-snapclass
+driver: rook-ceph.cephfs.csi.ceph.com
+deletionPolicy: Delete
+parameters:
+  clusterID: rook-ceph
+  csi.storage.k8s.io/snapshotter-secret-name: rook-csi-cephfs-provisioner
+  csi.storage.k8s.io/snapshotter-secret-namespace: rook-ceph
+
+---
+# 建立 Snapshot
+apiVersion: snapshot.storage.k8s.io/v1
+kind: VolumeSnapshot
+metadata:
+  name: cephfs-pvc-snapshot
+spec:
+  volumeSnapshotClassName: csi-cephfsplugin-snapclass
+  source:
+    persistentVolumeClaimName: shared-training-data
+```
+
+CephFS snapshot 是底層 directory 的 instant snapshot（`.snap` 目錄），效能影響極小。
+
+## Quota 配額管理
+
+CephFS 支援在 subvolume 層級設定容量與 inode 配額：
+
+```bash
+# 進入 toolbox
+kubectl -n rook-ceph exec -it deploy/rook-ceph-tools -- bash
+
+# 設定目錄容量配額（bytes）
+setfattr -n ceph.quota.max_bytes -v 10737418240 /mnt/cephfs/project-a
+
+# 設定 inode 數量配額
+setfattr -n ceph.quota.max_files -v 100000 /mnt/cephfs/project-a
+
+# 查詢配額設定
+getfattr -n ceph.quota.max_bytes /mnt/cephfs/project-a
+```
+
+Rook v1.10+ 也支援透過 `CephFilesystemSubVolumeGroup` CRD 管理 subvolume group：
+
+```yaml
+apiVersion: ceph.rook.io/v1
+kind: CephFilesystemSubVolumeGroup
+metadata:
+  name: group1
+  namespace: rook-ceph
+spec:
+  filesystemName: myfs
+  name: group1
+  quota:
+    maxBytes: 10737418240    # 10 GiB
+    maxFiles: 100000
+```
+
+## SubVolumeGroup 與 CSI
+
+CephFS CSI 在建立每個 PV 時，實際上是在 CephFS 裡建立一個 **subvolume**。所有 CSI 建立的 subvolume 預設放在 `/volumes/csi` subvolume group 下：
+
+```
+CephFS root /
+└── volumes/
+    └── csi/                    ← 預設 subvolume group
+        ├── pvc-abc123/         ← PVC 對應的 subvolume
+        ├── pvc-def456/
+        └── ...
+```
+
+透過 StorageClass 的 `subvolumeGroup` 參數可以指定不同的 group，實現資源隔離：
+
+```yaml
+parameters:
+  subvolumeGroup: ml-team      # 指定 subvolume group
+```
+
+## 適用場景
+
+| 場景 | 為什麼選 CephFS |
+|------|----------------|
+| ML 訓練資料集 | 多個 worker Pod 並行讀取同一份資料 |
+| CI/CD artifact 共享 | build 與 test job 共享編譯產物 |
+| Web 靜態內容 | 多個 web server replica 讀取同一份靜態檔案 |
+| 共享設定檔 | 多個服務讀取同一份設定目錄 |
+| 影片/媒體處理 | 轉碼任務共享原始媒體檔案 |
+
+## 完整部署流程
+
+```bash
+# 1. 部署 CephFilesystem
+kubectl apply -f filesystem.yaml
+
+# 2. 確認 MDS Pod 啟動
+kubectl -n rook-ceph get pod -l app=rook-ceph-mds
+
+# 3. 確認 filesystem 狀態
+kubectl -n rook-ceph exec -it deploy/rook-ceph-tools -- ceph fs status myfs
+
+# 4. 部署 StorageClass
+kubectl apply -f storageclass-cephfs.yaml
+
+# 5. 建立 PVC 測試
+kubectl apply -f pvc-rwx.yaml
+kubectl get pvc shared-training-data
+```
+
+## 常見問題排查
+
+| 問題 | 原因 | 解法 |
+|------|------|------|
+| MDS 無法啟動 | `metadataPool` 設定錯誤 | 確認 pool 存在且可寫入 |
+| PVC Pending | subvolumeGroup 不存在 | 確認 CephFilesystemSubVolumeGroup 已建立 |
+| RWX Pod 掛載失敗 | cephfs CSI driver 未安裝 | 確認 `rook-ceph-csi-cephfs-plugin` DaemonSet |
+| 寫入速度慢 | 單一 MDS 成為瓶頸 | 增加 `activeCount`，或增加 MDS 記憶體 |
+
+## 小結
+
+CephFilesystem 透過 MDS 提供完整的 POSIX 檔案系統語意，是 Kubernetes 上實現 ReadWriteMany 共享儲存的最佳選擇。合理設計 metadata pool 與 data pool 的分離、配置適當的 MDS 資源，以及善用 subvolume group 實現資源隔離，是穩定運行 CephFS 的關鍵。需要了解 S3 Object Storage 的方案，請參考 [S3 Object Store](/rook/features/s3-object-store)。

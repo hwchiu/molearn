@@ -1,0 +1,360 @@
+---
+layout: doc
+title: Rook — Prometheus 監控整合
+description: 解析 Rook 如何整合 Prometheus 監控 Ceph 叢集健康狀態，包含 ServiceMonitor、PrometheusRule 告警規則與 Grafana Dashboard 設定。
+---
+
+# Prometheus 監控整合
+
+<Callout type="info" title="相關章節">
+- [架構總覽](/rook/features/architecture)
+- [Ceph Cluster 設定](/rook/features/ceph-cluster)
+- [OSD 與 Monitor](/rook/features/osds-monitors)
+- [升級流程](/rook/features/upgrade-workflow)
+</Callout>
+
+<Callout type="tip" title="本文適用對象">
+- 🟢 **初學者**：了解 Rook 如何暴露 Ceph metrics，以及如何開啟監控功能。
+- 🟡 **中階工程師**：配置 ServiceMonitor、設定 PrometheusRule 告警，整合既有 Prometheus stack。
+- 🔴 **資深工程師**：深入各關鍵 metrics 的意義，設計完整的 alerting 策略與 SLO 指標。
+</Callout>
+
+> 📦 **類比**：Prometheus 監控 Ceph 就像在機房裡安裝溫度感測器與電力監控，讓你在問題發生前就收到告警，而不是等到機器當機才發現。
+
+## Rook 監控架構概覽
+
+Rook 提供兩種 metrics 來源機制，根據 Rook 版本選擇適合的方式：
+
+| 機制 | Rook 版本 | 說明 |
+|------|----------|------|
+| **Ceph MGR Prometheus Module** | 全版本支援 | 由 ceph-mgr 直接暴露 `/metrics` endpoint |
+| **Ceph Exporter（Sidecar）** | v1.11+ 推薦 | 每個 Ceph daemon 旁跑一個 exporter sidecar |
+
+### Ceph MGR Prometheus Module
+
+MGR（Manager）是 Ceph 的管理 daemon，內建 Prometheus module 可直接匯出叢集層級的 metrics：
+
+```
+Prometheus ─────scrape────▶ ceph-mgr:9283/metrics
+                              │
+                              ├── ceph_health_status
+                              ├── ceph_osd_*
+                              ├── ceph_pool_*
+                              └── ceph_pg_*
+```
+
+### Ceph Exporter（v1.11+）
+
+從 Rook v1.11 起，每個 Ceph daemon（OSD、MDS、RGW 等）的 Pod 旁會多一個 `ceph-exporter` sidecar container，提供 per-daemon 的細粒度 metrics：
+
+```
+Pod: osd-0
+  ├── container: osd          (實際 OSD daemon)
+  └── container: ceph-exporter ──▶ :9926/metrics
+                                    ├── ceph_osd_op_r
+                                    ├── ceph_osd_op_w
+                                    └── ceph_osd_latency_*
+```
+
+## 在 CephCluster 中開啟監控
+
+```yaml
+apiVersion: ceph.rook.io/v1
+kind: CephCluster
+metadata:
+  name: rook-ceph
+  namespace: rook-ceph
+spec:
+  monitoring:
+    enabled: true                         # 開啟監控
+    metricsDisabled: false                # 暴露 metrics endpoint
+    externalMgrEndpoints:                 # 若使用外部 MGR
+      - ip: "192.168.1.10"
+    externalMgrPrometheusPort: 9283       # 外部 MGR Prometheus port
+    interval: 10s                         # metrics 收集間隔
+```
+
+開啟後，Rook operator 會自動建立：
+- `ServiceMonitor`（若 Prometheus Operator 已安裝）
+- `Service` 用於 metrics endpoint
+- `PrometheusRule`（預設告警規則）
+
+## ServiceMonitor 設定
+
+若叢集中已安裝 [kube-prometheus-stack](https://github.com/prometheus-community/helm-charts)，Rook 會自動建立 `ServiceMonitor`：
+
+```yaml
+# Rook 自動建立的 ServiceMonitor（可自行調整）
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: rook-ceph-mgr
+  namespace: rook-ceph
+  labels:
+    team: rook
+spec:
+  namespaceSelector:
+    matchNames:
+      - rook-ceph
+  selector:
+    matchLabels:
+      app: rook-ceph-mgr
+      rook_cluster: rook-ceph
+  endpoints:
+    - port: http-metrics
+      path: /metrics
+      interval: 5s
+      honorLabels: true
+```
+
+### 自訂 ServiceMonitor Labels
+
+若 Prometheus 使用特定 `serviceMonitorSelector`，需在 ServiceMonitor 加上對應 labels：
+
+```yaml
+# Prometheus Operator 設定（監控哪些 ServiceMonitor）
+spec:
+  serviceMonitorSelector:
+    matchLabels:
+      release: prometheus     # 需要 ServiceMonitor 有此 label
+```
+
+在 CephCluster 中設定：
+
+```yaml
+spec:
+  monitoring:
+    enabled: true
+    labels:
+      release: prometheus     # 自動加到建立的 ServiceMonitor
+```
+
+## 核心 Ceph Metrics
+
+### 叢集健康
+
+| Metric | 說明 | 正常值 |
+|--------|------|--------|
+| `ceph_health_status` | 0=OK, 1=WARN, 2=ERROR | `0` |
+| `ceph_mon_quorum_status` | Monitor quorum 狀態 | `1`（in quorum）|
+| `ceph_cluster_total_bytes` | 叢集總容量（bytes） | — |
+| `ceph_cluster_total_used_bytes` | 已使用容量 | — |
+| `ceph_cluster_total_used_raw_bytes` | 實際佔用原始空間（含副本） | — |
+
+### OSD 狀態
+
+| Metric | 說明 | 正常值 |
+|--------|------|--------|
+| `ceph_osd_up` | OSD 是否在線（1=up, 0=down） | `1` |
+| `ceph_osd_in` | OSD 是否參與資料分佈（1=in, 0=out） | `1` |
+| `ceph_osd_weight` | OSD 在 CRUSH 中的權重 | > 0 |
+| `ceph_osd_apply_latency_ms` | 寫入延遲（毫秒） | < 10ms |
+| `ceph_osd_commit_latency_ms` | Commit 延遲（毫秒） | < 10ms |
+
+### Placement Group（PG）狀態
+
+| Metric | 說明 | 正常值 |
+|--------|------|--------|
+| `ceph_pg_active` | Active PG 數量 | = 總 PG 數 |
+| `ceph_pg_clean` | Clean PG 數量 | = 總 PG 數 |
+| `ceph_pg_degraded` | Degraded PG 數量 | `0` |
+| `ceph_pg_peering` | Peering 中的 PG 數量 | `0`（穩定後）|
+| `ceph_pg_undersized` | 副本數不足的 PG | `0` |
+
+### Pool 使用量
+
+| Metric | 說明 |
+|--------|------|
+| `ceph_pool_bytes_used` | Pool 使用容量（bytes） |
+| `ceph_pool_raw_bytes_used` | Pool 原始使用量（含副本）|
+| `ceph_pool_max_avail` | Pool 可用容量 |
+| `ceph_pool_rd_bytes` | 累計讀取 bytes |
+| `ceph_pool_wr_bytes` | 累計寫入 bytes |
+| `ceph_pool_rd` | 讀取 IOPS |
+| `ceph_pool_wr` | 寫入 IOPS |
+
+## PrometheusRule 告警規則
+
+Rook 內建一套完整的告警規則，開啟 `monitoring.enabled` 後自動部署：
+
+```yaml
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: prometheus-ceph-rules
+  namespace: rook-ceph
+  labels:
+    prometheus: rook-prometheus
+    role: alert-rules
+spec:
+  groups:
+    - name: cluster health
+      rules:
+        - alert: CephHealthError
+          expr: ceph_health_status == 2
+          for: 5m
+          labels:
+            severity: critical
+          annotations:
+            summary: "Ceph cluster is in ERROR state"
+            description: "Ceph cluster {{ $labels.namespace }} health is ERROR for more than 5 minutes"
+
+        - alert: CephHealthWarning
+          expr: ceph_health_status == 1
+          for: 15m
+          labels:
+            severity: warning
+          annotations:
+            summary: "Ceph cluster is in WARNING state"
+```
+
+### 關鍵告警規則一覽
+
+| Alert Name | 條件 | Severity | 說明 |
+|------------|------|----------|------|
+| `CephHealthError` | `ceph_health_status == 2` for 5m | critical | 叢集進入 ERROR 狀態 |
+| `CephHealthWarning` | `ceph_health_status == 1` for 15m | warning | 叢集持續 WARNING |
+| `CephOSDDown` | `ceph_osd_up == 0` | critical | OSD 下線 |
+| `CephOSDNearFull` | OSD 使用率 > 75% | warning | OSD 快滿 |
+| `CephOSDFull` | OSD 使用率 > 85% | critical | OSD 已滿（寫入停止）|
+| `CephPGsDegraded` | `ceph_pg_degraded > 0` for 5m | warning | PG 副本不足 |
+| `CephPGsInactive` | PG inactive for 5m | critical | PG 無法服務 |
+| `CephMonQuorumAtRisk` | monitor 數量 <= 1 | critical | Quorum 危機 |
+
+### 自訂告警規則
+
+```yaml
+spec:
+  groups:
+    - name: custom-rook-alerts
+      rules:
+        # 容量使用率告警（80% threshold）
+        - alert: CephClusterNearFull
+          expr: |
+            (ceph_cluster_total_used_bytes / ceph_cluster_total_bytes) > 0.80
+          for: 10m
+          labels:
+            severity: warning
+          annotations:
+            summary: "Ceph cluster usage above 80%"
+            description: "Cluster is {{ $value | humanizePercentage }} full"
+
+        # 單個 Pool 高 IOPS 告警
+        - alert: CephPoolHighWriteIOPS
+          expr: |
+            rate(ceph_pool_wr[5m]) > 10000
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: "High write IOPS on pool {{ $labels.name }}"
+```
+
+## Grafana Dashboard 整合
+
+Rook 官方提供多個預建的 Grafana dashboard，可直接匯入使用：
+
+| Dashboard | ID | 說明 |
+|-----------|-----|------|
+| Ceph - Cluster | 2842 | 叢集整體概覽 |
+| Ceph - OSD | 5336 | 每個 OSD 的詳細資訊 |
+| Ceph - Pools | 5342 | Pool 使用量與 IOPS |
+| Ceph - RBD | 15356 | RBD volume 效能 |
+| Ceph - CephFS | 15357 | CephFS 效能 |
+
+### 匯入 Dashboard
+
+```bash
+# 使用 curl 自動匯入 dashboard（透過 Grafana API）
+GRAFANA_URL="http://grafana.monitoring.svc:3000"
+GRAFANA_TOKEN="your-api-token"
+
+# 下載 Rook 官方 dashboard
+curl -O https://raw.githubusercontent.com/rook/rook/master/deploy/examples/monitoring/grafana/ceph-cluster.json
+
+# 匯入 Grafana
+curl -X POST   -H "Authorization: Bearer ${GRAFANA_TOKEN}"   -H "Content-Type: application/json"   -d @ceph-cluster.json   ${GRAFANA_URL}/api/dashboards/import
+```
+
+### kube-prometheus-stack 整合
+
+若使用 `kube-prometheus-stack` Helm chart，可透過 ConfigMap 自動掛載 dashboard：
+
+```yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ceph-cluster-dashboard
+  namespace: monitoring
+  labels:
+    grafana_dashboard: "1"   # 讓 grafana sidecar 自動載入
+data:
+  ceph-cluster.json: |
+    { ... }   # dashboard JSON 內容
+```
+
+## Ceph Dashboard（MGR 內建）
+
+除了 Prometheus/Grafana 外，Ceph 內建一個 Web UI（Ceph Dashboard），可直接在瀏覽器查看叢集狀態：
+
+```yaml
+# 在 CephCluster 中開啟 Dashboard
+spec:
+  dashboard:
+    enabled: true
+    ssl: true
+    port: 8443
+    urlPrefix: /ceph-dashboard
+```
+
+```bash
+# 取得 Dashboard 管理員密碼
+kubectl -n rook-ceph get secret rook-ceph-dashboard-password   -o jsonpath="{['data']['password']}" | base64 -d
+
+# 透過 port-forward 訪問
+kubectl -n rook-ceph port-forward svc/rook-ceph-mgr-dashboard 8443:8443
+```
+
+### Ceph Dashboard vs Prometheus/Grafana 對比
+
+| 功能 | Ceph Dashboard | Prometheus + Grafana |
+|------|---------------|---------------------|
+| 即時健康狀態 | ✅ | ✅ |
+| 歷史資料 | ❌ | ✅（依 retention 設定）|
+| 告警通知 | ❌ | ✅（AlertManager）|
+| 自訂 Dashboard | ❌ | ✅ |
+| OSD 管理操作 | ✅ | ❌ |
+| 需額外元件 | 僅 MGR module | Prometheus Operator |
+
+## 監控最佳實踐
+
+### 關鍵 SLO 建議
+
+| SLO | 目標 | Prometheus Query |
+|-----|------|-----------------|
+| 叢集健康率 | 99.9% | `avg_over_time(ceph_health_status[30d]) < 0.001` |
+| OSD 可用率 | 99.5% | `avg(ceph_osd_up) > 0.995` |
+| 容量使用率 | < 75% | `ceph_cluster_total_used_bytes / ceph_cluster_total_bytes < 0.75` |
+| 寫入延遲 P99 | < 10ms | `histogram_quantile(0.99, ceph_osd_op_w_latency_sum)` |
+
+### 告警分級建議
+
+```
+P1 (Critical) → PagerDuty/電話
+  - CephHealthError
+  - CephOSDFull（> 85%）
+  - CephMonQuorumAtRisk
+
+P2 (Warning) → Slack/Email
+  - CephHealthWarning（持續 > 15m）
+  - CephOSDNearFull（> 75%）
+  - CephPGsDegraded
+
+P3 (Info) → Ticket
+  - Capacity趨勢預測（7天後將滿）
+  - IOPS 異常（非立即影響）
+```
+
+## 小結
+
+Rook 的 Prometheus 監控整合提供了從叢集健康、OSD 狀態到 Pool I/O 的全面可觀測性。善用 ServiceMonitor 自動抓取、PrometheusRule 主動告警，搭配 Grafana dashboard 視覺化，可以在問題影響業務前及早發現並處理。建議將 `CephHealthError` 和 `CephOSDFull` 列為 P1 告警，確保 24x7 的儲存服務可靠性。

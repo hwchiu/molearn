@@ -1,0 +1,308 @@
+---
+layout: doc
+title: Rook — 外部 Ceph Cluster 接入
+description: 解析如何將既有的 Ceph 叢集以外部模式接入 Kubernetes，讓 Rook 作為 CSI proxy 提供 StorageClass，而無需遷移資料。
+---
+
+# 外部 Ceph Cluster 接入
+
+<Callout type="info" title="相關章節">
+- [架構總覽](/rook/features/architecture)
+- [Ceph Cluster 設定](/rook/features/ceph-cluster)
+- [CSI Driver](/rook/features/csi-driver)
+- [StorageClass 設定](/rook/features/storage-classes)
+</Callout>
+
+<Callout type="tip" title="本文適用對象">
+- 🟢 **初學者**：了解外部 Ceph 模式的使用場景與限制。
+- 🟡 **中階工程師**：完整執行外部 Ceph 叢集的接入流程，設定 StorageClass 供 Pod 使用。
+- 🔴 **資深工程師**：深入了解 external mode 的認證機制、network 考量，以及混合模式的邊界管理。
+</Callout>
+
+> 📦 **類比**：外部 Ceph 接入就像把自家舊車庫（既有 Ceph）與新公寓（Kubernetes）打通——你不需要搬移所有東西，只需要安裝一扇門（Rook external mode）讓兩邊可以互通。
+
+## 什麼是外部 Ceph 模式
+
+在標準部署中，Rook operator 會在 Kubernetes cluster 內部創建並管理所有 Ceph daemon（MON、MGR、OSD）。但在以下場景，你可能希望 **連接到一個已存在的 Ceph 叢集**，而不是讓 Rook 建立新的：
+
+| 場景 | 說明 |
+|------|------|
+| 既有 Ceph 叢集 | 機房裡已有 Ceph，不想重建 |
+| 資料不可遷移 | 原有 Ceph 上有大量資料，遷移成本過高 |
+| 多 Kubernetes 叢集 | 多個 K8s cluster 共用同一個 Ceph backend |
+| 獨立管理 Ceph | Ceph 由獨立的儲存團隊管理，K8s 只是使用者 |
+
+在 External 模式下，Rook 扮演的角色是：
+- **CSI proxy**：提供 Kubernetes StorageClass 和 CSI 動態佈建
+- **監控橋接**（可選）：轉發 Ceph metrics 給 Prometheus
+- **不管理** Ceph daemon 的生命週期
+
+## 兩種外部接入模式
+
+| 模式 | 說明 | 適用場景 |
+|------|------|---------|
+| **CSI Only** | 只使用 Ceph CSI，直接設定 secret | 最簡單，完全自管 |
+| **External CephCluster** | 透過 Rook external mode | 需要 Rook 監控整合 |
+
+## External CephCluster 架構
+
+```
+┌─────────────────────────────────────┐    ┌──────────────────────────┐
+│  Kubernetes Cluster                  │    │  External Ceph Cluster   │
+│                                     │    │                          │
+│  ┌─────────────────┐                │    │  ┌─────────┐             │
+│  │  Rook Operator  │◀── 監控/查詢 ──┼────┼─▶│ MON/MGR │             │
+│  └─────────────────┘                │    │  └─────────┘             │
+│                                     │    │                          │
+│  ┌──────────┐  ┌────────────────┐   │    │  ┌─────────┐             │
+│  │CSI Driver│──▶ StorageClass   │   │    │  │  OSD    │             │
+│  └──────────┘  └────────────────┘   │    │  └─────────┘             │
+│       │                             │    │                          │
+│  ┌────▼──────────────────────────┐  │    │  ┌─────────┐             │
+│  │  Pod (mounts PVC directly)    │──┼────┼─▶│  RBD/   │             │
+│  └───────────────────────────────┘  │    │  │ CephFS  │             │
+└─────────────────────────────────────┘    └──────────────────────────┘
+```
+
+## 準備工作：在外部 Ceph 上執行
+
+### 1. 使用官方腳本匯出設定
+
+Rook 提供官方腳本 `create-external-cluster-resources.py`，在 **外部 Ceph 叢集** 上執行，自動建立所需的 Ceph users 和 pools，並輸出 Kubernetes secret 設定：
+
+```bash
+# 下載腳本（在外部 Ceph 機器上執行）
+ROOK_VERSION=v1.14.0
+curl -O https://raw.githubusercontent.com/rook/rook/${ROOK_VERSION}/deploy/examples/create-external-cluster-resources.py
+
+# 基本執行（RBD 模式）
+python3 create-external-cluster-resources.py \
+  --rbd-data-pool-name replicapool \
+  --namespace rook-ceph-external \
+  --format bash
+
+# 完整執行（包含 CephFS 和 RGW）
+python3 create-external-cluster-resources.py \
+  --rbd-data-pool-name replicapool \
+  --cephfs-filesystem-name myfs \
+  --rgw-endpoint "http://192.168.1.100:80" \
+  --namespace rook-ceph-external \
+  --format bash \
+  --output-file external-cluster-config.sh
+```
+
+腳本會建立以下 Ceph users：
+
+| Ceph User | 用途 |
+|-----------|------|
+| `client.csi-rbd-provisioner` | RBD PV 動態佈建 |
+| `client.csi-rbd-node` | RBD volume 掛載 |
+| `client.csi-cephfs-provisioner` | CephFS PV 動態佈建 |
+| `client.csi-cephfs-node` | CephFS volume 掛載 |
+| `client.rook-ceph-mgr` | 監控用（可選）|
+
+### 2. 匯出設定內容範例
+
+```bash
+# external-cluster-config.sh 輸出範例
+export ROOK_EXTERNAL_FSID=a1b2c3d4-xxxx-xxxx-xxxx-xxxxxx
+export ROOK_EXTERNAL_USERNAME=client.healthchecker
+export ROOK_EXTERNAL_CEPH_MON_DATA=a=192.168.1.10:6789,b=192.168.1.11:6789,c=192.168.1.12:6789
+export ROOK_EXTERNAL_USER_SECRET=AQBxxxxxxxxxxxxxxxxxxxxxx==
+export CSI_RBD_NODE_SECRET_NAME=csi-rbd-node
+export CSI_RBD_PROVISIONER_SECRET_NAME=csi-rbd-provisioner
+# ... 更多變數
+```
+
+## 在 Kubernetes 中部署 External Mode
+
+### Step 1：執行匯入腳本
+
+```bash
+# 在 Kubernetes 叢集上執行
+source external-cluster-config.sh
+
+# 使用 Rook 提供的匯入腳本建立所有 secret
+curl -O https://raw.githubusercontent.com/rook/rook/v1.14.0/deploy/examples/import-external-cluster.sh
+chmod +x import-external-cluster.sh
+./import-external-cluster.sh
+```
+
+腳本會在 `rook-ceph-external` namespace 建立所需的 Kubernetes secret。
+
+### Step 2：建立 External CephCluster CRD
+
+```yaml
+apiVersion: ceph.rook.io/v1
+kind: CephCluster
+metadata:
+  name: rook-ceph-external
+  namespace: rook-ceph-external
+spec:
+  external:
+    enable: true               # 啟用 external 模式
+  crashCollector:
+    disable: true              # 外部模式不需要 crash collector
+  healthCheck:
+    daemonHealth:
+      mon:
+        disabled: false
+        interval: 45s
+    livenessProbe:
+      mon:
+        disabled: true         # 外部 MON 無法透過 K8s probe 檢查
+```
+
+### Step 3：手動建立必要的 Secrets
+
+若不使用腳本，可以手動建立 secrets：
+
+```yaml
+# MON endpoints 和 admin key
+apiVersion: v1
+kind: Secret
+metadata:
+  name: rook-ceph-mon
+  namespace: rook-ceph-external
+data:
+  # base64 encoded
+  cluster-name: cm9vay1jZXBoLWV4dGVybmFs   # rook-ceph-external
+  fsid: <base64 encoded FSID>
+  mon-secret: <base64 encoded mon secret>
+  admin-secret: <base64 encoded admin keyring>
+  ceph-username: <base64 encoded username>
+  ceph-secret: <base64 encoded user secret>
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: rook-ceph-mon-endpoints
+  namespace: rook-ceph-external
+data:
+  data: "a=192.168.1.10:6789,b=192.168.1.11:6789,c=192.168.1.12:6789"
+  mapping: "{}"
+  maxMonId: "2"
+```
+
+## StorageClass 設定（External Mode）
+
+外部模式的 StorageClass 設定與內建模式幾乎相同，只需確認 namespace 和 clusterID 正確：
+
+### RBD StorageClass
+
+```yaml
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: rook-ceph-block-external
+provisioner: rook-ceph.rbd.csi.ceph.com
+parameters:
+  clusterID: rook-ceph-external        # 必須與 CephCluster namespace 一致
+  pool: replicapool                     # 外部 Ceph 上已存在的 pool
+  imageFormat: "2"
+  imageFeatures: layering
+  csi.storage.k8s.io/provisioner-secret-name: rook-csi-rbd-provisioner
+  csi.storage.k8s.io/provisioner-secret-namespace: rook-ceph-external
+  csi.storage.k8s.io/controller-expand-secret-name: rook-csi-rbd-provisioner
+  csi.storage.k8s.io/controller-expand-secret-namespace: rook-ceph-external
+  csi.storage.k8s.io/node-stage-secret-name: rook-csi-rbd-node
+  csi.storage.k8s.io/node-stage-secret-namespace: rook-ceph-external
+reclaimPolicy: Delete
+allowVolumeExpansion: true
+```
+
+### CephFS StorageClass
+
+```yaml
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: rook-cephfs-external
+provisioner: rook-ceph.cephfs.csi.ceph.com
+parameters:
+  clusterID: rook-ceph-external
+  fsName: myfs                          # 外部 Ceph 上已存在的 filesystem
+  pool: myfs-data0
+  csi.storage.k8s.io/provisioner-secret-name: rook-csi-cephfs-provisioner
+  csi.storage.k8s.io/provisioner-secret-namespace: rook-ceph-external
+  csi.storage.k8s.io/controller-expand-secret-name: rook-csi-cephfs-provisioner
+  csi.storage.k8s.io/controller-expand-secret-namespace: rook-ceph-external
+  csi.storage.k8s.io/node-stage-secret-name: rook-csi-cephfs-node
+  csi.storage.k8s.io/node-stage-secret-namespace: rook-ceph-external
+reclaimPolicy: Delete
+allowVolumeExpansion: true
+```
+
+## External Mode 的功能範圍
+
+| 功能 | 支援情況 | 說明 |
+|------|---------|------|
+| RBD Block Storage | ✅ | 完整支援，透過 CSI |
+| CephFS 共享儲存 | ✅ | 完整支援，透過 CSI |
+| RGW S3 Object Store | ✅ | 支援（需額外設定 endpoint）|
+| Prometheus Monitoring | ✅ | 需要 healthchecker user |
+| OSD 生命週期管理 | ❌ | Operator 不管理外部 OSD |
+| Pool 建立（透過 CRD）| ❌ | Pool 需在外部 Ceph 手動建立 |
+| CephBlockPool CRD | ❌ | External mode 不適用 |
+| Ceph Dashboard | ❌ | 需直接訪問外部 Ceph |
+| Crash Collector | ❌ | 不適用 |
+
+## 多 Kubernetes 叢集共用 Ceph
+
+外部 Ceph 模式特別適合多個 Kubernetes 叢集共用同一個 Ceph：
+
+```
+External Ceph Cluster
+├── K8s Cluster A (namespace: rook-ceph-external)
+│     └── pool: cluster-a-rbd
+├── K8s Cluster B (namespace: rook-ceph-external)
+│     └── pool: cluster-b-rbd
+└── K8s Cluster C (namespace: rook-ceph-external)
+      └── pool: cluster-c-cephfs
+```
+
+每個 K8s 叢集使用不同的 Ceph user（權限隔離），存取不同的 pool。
+
+## 網路連通性需求
+
+外部 Ceph 模式需要 Kubernetes node 能直接連到 Ceph 的 public network：
+
+| 連接需求 | Port | 說明 |
+|---------|------|------|
+| MON endpoints | 6789 (v1) / 3300 (v2) | CSI driver 連接 MON |
+| OSD ports | 6800-7300 | 實際資料傳輸 |
+| MGR (metrics) | 9283 | Prometheus scrape（可選）|
+
+<Callout type="warning" title="網路延遲影響效能">
+外部 Ceph 模式下，Pod 的 I/O 需要通過網路連接到外部 Ceph OSD。若網路延遲高（> 1ms RTT），會顯著影響儲存效能。建議外部 Ceph 與 Kubernetes cluster 在同一個機房或透過低延遲網路連接。
+</Callout>
+
+## 驗證外部連接
+
+```bash
+# 在 K8s 叢集中確認 CephCluster 狀態
+kubectl -n rook-ceph-external get cephcluster
+# NAME                 DATADIRHOSTPATH   MONCOUNT   AGE   PHASE       MESSAGE   HEALTH
+# rook-ceph-external                                2h    Connected             HEALTH_OK
+
+# 測試 StorageClass 是否可用
+kubectl apply -f test-pvc.yaml
+kubectl get pvc test-pvc
+
+# 進入 toolbox 確認外部 Ceph 連線
+kubectl -n rook-ceph-external exec -it deploy/rook-ceph-tools -- ceph status
+```
+
+## 常見問題排查
+
+| 問題 | 原因 | 解法 |
+|------|------|------|
+| CephCluster 停在 Connecting | MON endpoint 不可達 | 確認 firewall rules 與 MON ports |
+| Secret 認證失敗 | keyring 格式錯誤 | 確認 base64 編碼正確，無換行符 |
+| PVC Pending | pool 不存在或無寫入權限 | 在外部 Ceph 手動建立 pool |
+| 掛載 PVC 超時 | K8s node 無法連到 OSD | 檢查 OSD 網路連通性（port 6800-7300）|
+
+## 小結
+
+外部 Ceph 模式讓 Rook 作為輕量級的 CSI proxy，無縫整合既有的 Ceph 基礎設施，是多叢集、大型組織或漸進式 Kubernetes 採用的理想方案。透過官方的 `create-external-cluster-resources.py` 腳本，可以安全地在外部 Ceph 上建立最小權限的認證，確保 Kubernetes 側的存取安全性。

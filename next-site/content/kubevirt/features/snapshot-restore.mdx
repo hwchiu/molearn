@@ -1,0 +1,420 @@
+---
+layout: doc
+title: KubeVirt — Snapshot 與 Restore
+description: 透過 VirtualMachineSnapshot 與 VirtualMachineRestore CRD，對 VM 進行即時備份與還原，支援線上與離線兩種模式。
+---
+
+# Snapshot 與 Restore
+
+<Callout type="info" title="相關章節">
+- [VMI 生命週期](/kubevirt/features/vmi-lifecycle)
+- [VM Storage](/kubevirt/features/vm-storage)
+- [CDI 與 DataVolume](/kubevirt/features/cdi-datavolume)
+- [Live Migration](/kubevirt/features/live-migration)
+</Callout>
+
+<Callout type="tip" title="本文適用對象">
+- 🟢 **初學者**：了解 Snapshot 的用途與基本操作流程
+- 🟡 **中階工程師**：掌握線上/離線 snapshot 差異，以及 CSI VolumeSnapshot 的先決條件
+- 🔴 **資深工程師**：深入 VirtualMachineSnapshotContent 結構、還原流程與 webhook 行為
+</Callout>
+
+> 📦 **類比**：VM Snapshot 就像「系統還原點」——在重大變更前建立快照，萬一出問題可以回到已知良好的狀態。與傳統備份不同，snapshot 通常是增量的，依賴 CSI 儲存層的 copy-on-write 機制，速度快且空間效率高。
+
+## 什麼是 VM Snapshot
+
+KubeVirt VM Snapshot 功能透過三個 CRD 實現完整的 snapshot 管理：
+
+| CRD | 用途 |
+|-----|------|
+| `VirtualMachineSnapshot` | 觸發 snapshot 建立；使用者操作的主要物件 |
+| `VirtualMachineSnapshotContent` | 儲存 snapshot 的實際內容（自動建立，勿直接修改）|
+| `VirtualMachineRestore` | 觸發從 snapshot 還原 |
+
+### 先決條件
+
+KubeVirt Snapshot 功能依賴 CSI 儲存驅動程式的 **VolumeSnapshot** 能力：
+
+```bash
+# 確認叢集已安裝 VolumeSnapshot CRD
+kubectl get crd volumesnapshots.snapshot.storage.k8s.io
+kubectl get crd volumesnapshotclasses.snapshot.storage.k8s.io
+
+# 確認 StorageClass 支援 snapshot
+kubectl get storageclass -o json | jq '.items[] | {name: .metadata.name, provisioner: .provisioner}'
+
+# 確認有對應的 VolumeSnapshotClass
+kubectl get volumesnapshotclass
+```
+
+<Callout type="warning" title="不支援 hostPath 與 local StorageClass">
+使用 `hostPath` 或 `local` 類型的 StorageClass 無法支援 VolumeSnapshot，因為這些類型沒有 CSI 驅動程式。生產環境建議使用 Ceph RBD（rook-ceph）、Longhorn、或雲端供應商 CSI 驅動程式。
+</Callout>
+
+---
+
+## Snapshot 建立流程
+
+### 離線 Snapshot（VM 已停止）
+
+離線 snapshot 是最簡單的情境，VM 停止後磁碟資料靜止，無需 guest 配合即可取得一致性快照。
+
+```yaml
+apiVersion: snapshot.kubevirt.io/v1beta1
+kind: VirtualMachineSnapshot
+metadata:
+  name: my-vm-snapshot-v1
+  namespace: default
+spec:
+  source:
+    apiGroup: kubevirt.io
+    kind: VirtualMachine
+    name: my-vm            # 目標 VM 名稱（必須在同一命名空間）
+```
+
+```bash
+# 建立 snapshot
+kubectl apply -f vm-snapshot.yaml
+
+# 觀察 snapshot 狀態
+kubectl get virtualmachinesnapshot my-vm-snapshot-v1 -w
+```
+
+Snapshot 狀態演進：
+
+```
+READY STATUS
+  Pending → InProgress → Ready (readyToUse: true)
+```
+
+### 線上 Snapshot（VM 運行中）
+
+VM 運行時建立 snapshot，KubeVirt 會嘗試凍結（freeze）guest 的檔案系統以確保一致性。
+
+**先決條件（線上 snapshot）**：
+- Guest 需安裝 `qemu-guest-agent`
+- 使用 `virtio-serial` 或 `unix socket` channel 與 guest agent 通訊
+
+```yaml
+apiVersion: snapshot.kubevirt.io/v1beta1
+kind: VirtualMachineSnapshot
+metadata:
+  name: my-vm-online-snap
+  namespace: default
+spec:
+  source:
+    apiGroup: kubevirt.io
+    kind: VirtualMachine
+    name: my-running-vm
+  failureDeadline: "5m"    # 如果 5 分鐘內無法完成，標記為失敗
+```
+
+線上 snapshot 流程：
+
+```
+1. KubeVirt 發送 freeze 指令給 qemu-guest-agent
+2. Guest FS 凍結（I/O 暫停）
+3. CSI 對所有磁碟觸發 VolumeSnapshot
+4. KubeVirt 發送 thaw 指令給 qemu-guest-agent
+5. Guest FS 解凍，VM 恢復正常運作
+6. VolumeSnapshot 在背景完成 copy-on-write
+```
+
+<Callout type="info" title="無 Guest Agent 的線上 Snapshot">
+若 VM 沒有安裝 guest agent，KubeVirt 仍會嘗試建立 snapshot，但不進行 FS freeze。這稱為「crash-consistent snapshot」（崩潰一致性快照）——與突然斷電的狀態相同。對支援 journaling 的檔案系統（ext4、xfs）通常可以恢復，但資料庫可能需要恢復程序。
+</Callout>
+
+---
+
+## VirtualMachineSnapshotContent 結構
+
+當 snapshot 建立完成後，KubeVirt 自動建立一個 `VirtualMachineSnapshotContent` 物件：
+
+```yaml
+apiVersion: snapshot.kubevirt.io/v1beta1
+kind: VirtualMachineSnapshotContent
+metadata:
+  name: vmsnapshot-content-my-vm-snapshot-v1
+  namespace: default
+spec:
+  virtualMachineSnapshotName: my-vm-snapshot-v1
+  source:
+    virtualMachine:
+      apiVersion: kubevirt.io/v1
+      kind: VirtualMachine
+      metadata:
+        name: my-vm
+        namespace: default
+      spec:                          # 完整的 VM spec 快照
+        instancetype:
+          name: u1.medium
+        template:
+          spec:
+            domain:
+              devices:
+                disks:
+                  - name: rootdisk
+                    disk:
+                      bus: virtio
+            volumes:
+              - name: rootdisk
+                dataVolume:
+                  name: my-vm-root
+  volumeBackups:
+    - volumeName: rootdisk
+      persistentVolumeClaim:
+        name: my-vm-root
+        spec:
+          accessModes:
+            - ReadWriteOnce
+          resources:
+            requests:
+              storage: 30Gi
+      volumeSnapshotName: vmsnapshot-volume-rootdisk-abc123  # CSI VolumeSnapshot 名稱
+status:
+  creationTime: "2024-01-15T10:30:00Z"
+  readyToUse: true
+  error: null
+```
+
+### 儲存的資訊類型
+
+| 資訊類型 | 說明 |
+|---------|------|
+| VM spec | 完整的 VirtualMachine 定義（CPU、記憶體、裝置配置）|
+| VolumeSnapshot 參照 | 每個磁碟的 CSI VolumeSnapshot 名稱 |
+| PVC 規格 | 各磁碟的大小、access mode、StorageClass |
+| Instancetype 快照 | 引用的 instancetype 在快照時的版本（ControllerRevision）|
+
+---
+
+## 還原流程
+
+### 情境一：還原現有 VM（In-place Restore）
+
+```yaml
+apiVersion: snapshot.kubevirt.io/v1beta1
+kind: VirtualMachineRestore
+metadata:
+  name: restore-my-vm
+  namespace: default
+spec:
+  target:
+    apiGroup: kubevirt.io
+    kind: VirtualMachine
+    name: my-vm              # 還原目標：現有的 VM
+  virtualMachineSnapshotName: my-vm-snapshot-v1
+```
+
+<Callout type="warning" title="In-place Restore 前須停止 VM">
+KubeVirt 在執行 in-place restore 前，會自動停止目標 VM（若正在運行）。還原完成後 VM 不會自動啟動，需手動啟動。
+</Callout>
+
+In-place restore 步驟：
+
+```
+1. 確認目標 VM 已停止（若未停止則自動停止）
+2. 刪除目前 VM 的 PVC
+3. 從 VolumeSnapshot 還原新 PVC
+4. 更新 VM spec 為快照時的版本
+5. VirtualMachineRestore 狀態變為 Complete
+```
+
+### 情境二：還原為新 VM
+
+目前 KubeVirt 不直接支援「還原為新 VM 名稱」的操作，但可以透過以下方式實現：
+
+```bash
+# 1. 從 snapshot 手動建立 PVC（使用 VolumeSnapshot 作為來源）
+kubectl apply -f - << 'EOF'
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: my-vm-restored-root
+  namespace: default
+spec:
+  dataSource:
+    name: vmsnapshot-volume-rootdisk-abc123
+    kind: VolumeSnapshot
+    apiGroup: snapshot.storage.k8s.io
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 30Gi
+EOF
+
+# 2. 建立新 VM 使用還原的 PVC
+```
+
+### 還原狀態查詢
+
+```bash
+# 查看還原進度
+kubectl get virtualmachinerestore restore-my-vm -w
+
+# 查看詳細狀態
+kubectl describe virtualmachinerestore restore-my-vm
+```
+
+還原狀態欄位：
+
+| 欄位 | 說明 |
+|------|------|
+| `status.complete` | 是否完成 |
+| `status.restoreTime` | 完成時間 |
+| `status.restores[].volumeName` | 各磁碟的還原狀態 |
+| `status.restores[].persistentVolumeClaim` | 還原後的 PVC 名稱 |
+
+---
+
+## Snapshot TTL 與刪除策略
+
+### 設定自動刪除（TTL）
+
+```yaml
+apiVersion: snapshot.kubevirt.io/v1beta1
+kind: VirtualMachineSnapshot
+metadata:
+  name: my-vm-daily-snap
+spec:
+  source:
+    apiGroup: kubevirt.io
+    kind: VirtualMachine
+    name: my-vm
+  deletionPolicy: delete    # 刪除 snapshot 時，同時刪除 VolumeSnapshot（預設）
+                             # 或 retain：保留底層 VolumeSnapshot
+```
+
+| `deletionPolicy` | 行為 |
+|-----------------|------|
+| `delete`（預設）| 刪除 VirtualMachineSnapshot 時，同時刪除所有 VolumeSnapshot |
+| `retain` | 刪除 VirtualMachineSnapshot 時，保留底層 VolumeSnapshot |
+
+### 手動刪除 Snapshot
+
+```bash
+# 刪除 snapshot（會同時刪除 VolumeSnapshot，若 deletionPolicy=delete）
+kubectl delete virtualmachinesnapshot my-vm-snapshot-v1
+
+# 查看剩餘的 VolumeSnapshot（若使用 retain 策略）
+kubectl get volumesnapshot -n default
+```
+
+---
+
+## 儲存類型需求
+
+| 儲存類型 | 支援 Snapshot | 備註 |
+|---------|--------------|------|
+| Ceph RBD（rook-ceph）| ✅ 支援 | 需要 `VolumeSnapshotClass` |
+| Longhorn | ✅ 支援 | Longhorn >= 1.2 |
+| AWS EBS CSI | ✅ 支援 | 需要 `VolumeSnapshotClass` |
+| GCE Persistent Disk CSI | ✅ 支援 | |
+| Azure Disk CSI | ✅ 支援 | |
+| NFS（無 CSI）| ❌ 不支援 | 無 snapshot 能力 |
+| hostPath | ❌ 不支援 | 無 CSI 驅動程式 |
+| local | ❌ 不支援 | 無 CSI 驅動程式 |
+
+### 設定 VolumeSnapshotClass
+
+以 rook-ceph 為例：
+
+```yaml
+apiVersion: snapshot.storage.k8s.io/v1
+kind: VolumeSnapshotClass
+metadata:
+  name: csi-rbdplugin-snapclass
+  annotations:
+    snapshot.storage.kubernetes.io/is-default-class: "true"   # 設為預設
+driver: rook-ceph.rbd.csi.ceph.com
+deletionPolicy: Delete
+parameters:
+  clusterID: rook-ceph
+  csi.storage.k8s.io/snapshotter-secret-name: rook-csi-rbd-provisioner
+  csi.storage.k8s.io/snapshotter-secret-namespace: rook-ceph
+```
+
+---
+
+## 完整操作範例
+
+### 建立 Snapshot 並驗證
+
+```bash
+# 1. 確認 VM 狀態
+kubectl get vm my-vm
+kubectl get vmi my-vm  # 查看 VMI（若有）
+
+# 2. 建立 snapshot
+kubectl apply -f - << 'EOF'
+apiVersion: snapshot.kubevirt.io/v1beta1
+kind: VirtualMachineSnapshot
+metadata:
+  name: pre-upgrade-snap
+  namespace: default
+spec:
+  source:
+    apiGroup: kubevirt.io
+    kind: VirtualMachine
+    name: my-vm
+EOF
+
+# 3. 等待 snapshot 就緒
+kubectl wait virtualmachinesnapshot pre-upgrade-snap \
+  --for=condition=Ready --timeout=5m
+
+# 4. 確認 snapshot 內容
+kubectl get virtualmachinesnapshotcontent \
+  -l "snapshot.kubevirt.io/vm-snapshot-name=pre-upgrade-snap"
+
+# 5. 確認底層 VolumeSnapshot 已建立
+kubectl get volumesnapshot
+```
+
+### 執行 Restore
+
+```bash
+# 1. 停止 VM（若正在運行）
+virtctl stop my-vm
+kubectl wait vmi my-vm --for=delete --timeout=3m
+
+# 2. 建立 Restore
+kubectl apply -f - << 'EOF'
+apiVersion: snapshot.kubevirt.io/v1beta1
+kind: VirtualMachineRestore
+metadata:
+  name: restore-pre-upgrade
+  namespace: default
+spec:
+  target:
+    apiGroup: kubevirt.io
+    kind: VirtualMachine
+    name: my-vm
+  virtualMachineSnapshotName: pre-upgrade-snap
+EOF
+
+# 3. 等待還原完成
+kubectl wait virtualmachinerestore restore-pre-upgrade \
+  --for=condition=Ready --timeout=10m
+
+# 4. 啟動 VM
+virtctl start my-vm
+```
+
+---
+
+## 注意事項與最佳實踐
+
+| 項目 | 建議 |
+|------|------|
+| Snapshot 頻率 | 配合 CronJob 定期建立，避免手動操作遺漏 |
+| 線上 snapshot | 盡量安裝 qemu-guest-agent，確保 FS 一致性 |
+| 資料庫 VM | 在應用層先取得一致備份，再建立 snapshot |
+| 保留策略 | 定期清理舊 snapshot，避免儲存空間耗盡 |
+| 跨命名空間 | Snapshot 與 VM 必須在同一命名空間 |
+| 測試還原 | 定期測試還原流程，確保備份可用 |
+
+<Callout type="warning" title="Snapshot 不等於異地備份">
+VirtualMachineSnapshot 依賴 VolumeSnapshot，資料仍儲存在同一個儲存系統。若儲存系統發生災難性故障，snapshot 可能也一起遺失。如需真正的災難備份，應搭配 Velero、Kasten K10 等跨區域備份解決方案。
+</Callout>

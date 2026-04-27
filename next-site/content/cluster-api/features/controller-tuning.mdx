@@ -1,0 +1,338 @@
+---
+layout: doc
+title: Cluster API — Controller 效能調校
+description: 全面解析 CAPI controller-manager 的效能調校參數，包含各 controller 的並發數設定、Kubernetes API 的 QPS/Burst 限制、Leader Election、Watch Filter，以及不同叢集規模的建議設定。
+---
+
+# Controller 效能調校
+
+<Callout type="info" title="相關章節">
+- [架構總覽](/cluster-api/features/architecture)
+- [ClusterCache 架構](/cluster-api/features/clustercache)
+- [Feature Gates](/cluster-api/features/feature-gates)
+- [Controller Core](/cluster-api/features/controller-core)
+</Callout>
+
+<Callout type="tip" title="本文適用對象">
+- 🟡 **中階工程師**：了解影響 CAPI 效能的主要參數，以及預設值的含義
+- 🔴 **資深工程師**：掌握不同規模管理叢集的調校策略，理解 QPS/Burst 對 API server 的影響，以及 ReconcilerRateLimiting + PriorityQueue 的互動關係
+</Callout>
+
+> 📦 **類比**：CAPI controller-manager 就像一個工廠的排程系統。並發數是生產線數量，QPS/Burst 是進貨速率，SyncPeriod 是定期盤點頻率。調校的目標是在不壓垮 API server（倉庫）的前提下，最大化生產效率。
+
+## 設定方式
+
+所有調校參數均可透過 controller-manager 啟動參數設定：
+
+```bash
+# 部署為 Deployment 時的範例
+kubectl -n capi-system edit deployment capi-controller-manager
+
+# 在 spec.containers[0].args 加入參數
+args:
+- --cluster-concurrency=100
+- --machine-concurrency=200
+- --kube-api-qps=150
+- --kube-api-burst=300
+```
+
+亦可透過 `clusterctl` 在安裝時設定：
+
+```bash
+# clusterctl init 透過 configmap 注入環境變數（取決於 provider）
+# 直接修改 manager deployment 是最可靠的做法
+```
+
+## Controller 並發數（Concurrency）
+
+每個 controller 都有獨立的並發數設定，控制同時 reconcile 的 CR 數量。
+
+### 各 Controller 預設並發數
+
+| Flag | 預設值 | 說明 |
+|------|--------|------|
+| `--cluster-concurrency` | 50 | Cluster controller 並發數 |
+| `--clustercache-concurrency` | 100 | ClusterCache controller 並發數 |
+| `--clustertopology-concurrency` | 50 | ClusterTopology controller 並發數 |
+| `--clusterclass-concurrency` | 10 | ClusterClass controller 並發數 |
+| `--extensionconfig-concurrency` | 10 | ExtensionConfig controller 並發數 |
+| `--machine-concurrency` | 100 | Machine controller 並發數 |
+| `--machineset-concurrency` | 50 | MachineSet controller 並發數 |
+| `--machinedeployment-concurrency` | 50 | MachineDeployment controller 並發數 |
+| `--machinepool-concurrency` | 50 | MachinePool controller 並發數（需 MachinePool feature gate）|
+| `--machinehealthcheck-concurrency` | 50 | MachineHealthCheck controller 並發數 |
+| `--clusterresourceset-concurrency` | 10 | ClusterResourceSet controller 並發數 |
+| CRDMigrator | **固定 1** | 硬編碼，避免大量 patch 壓垮 API server |
+
+<Callout type="info" title="Machine 並發數最高">
+Machine controller 的預設並發數（100）高於 MachineSet（50）和 MachineDeployment（50），這是因為 Machine 是最底層資源，通常數量最多，需要最高的並發處理能力。
+</Callout>
+
+### 並發數對 API Server 的影響
+
+每個並發的 reconcile worker 都會對 API server 發出請求。實際的 API server QPS 約為：
+
+```
+實際 QPS ≈ 並發數 × 每次 reconcile 平均 API 呼叫次數
+```
+
+一次 Machine reconcile 約需 5-10 次 API 呼叫。因此 100 並發的 Machine controller 在最壞情況下每秒可能產生 1000 次 API 請求。
+
+### 並發數設定指南
+
+```go
+// 來源：main.go
+func concurrency(c int) controller.Options {
+    return controller.Options{MaxConcurrentReconciles: c}
+}
+```
+
+| 叢集規模 | Cluster 數量 | 建議調整方向 |
+|----------|-------------|-------------|
+| 小型 | < 50 | 使用預設值即可 |
+| 中型 | 50-500 | 適當提高 machine-concurrency 到 200 |
+| 大型 | > 500 | 提高所有主要 controller 並發數，同步調高 QPS/Burst |
+
+## API Server QPS/Burst 限制
+
+CAPI 對 Kubernetes API server 的連線有兩個層面：
+
+1. **Management Cluster Client**：controller-manager 本身與 management cluster 的通訊
+2. **ClusterCache Client**：透過 ClusterCache 與各 workload cluster 的通訊
+
+### Management Cluster Client
+
+```bash
+# 控制 controller-manager 與 management cluster API server 的速率
+--kube-api-qps    # 預設：100（每秒允許的平均請求數）
+--kube-api-burst  # 預設：200（允許的瞬時請求峰值）
+```
+
+```go
+// 來源：main.go
+restConfig.QPS = restConfigQPS   // 100
+restConfig.Burst = restConfigBurst  // 200
+```
+
+### ClusterCache Client
+
+```bash
+# 控制每個 workload cluster 的 ClusterCache client 速率
+--clustercache-client-qps    # 預設：20（per workload cluster）
+--clustercache-client-burst  # 預設：30（per workload cluster）
+```
+
+<Callout type="warning" title="ClusterCache 的乘數效應">
+ClusterCache client QPS/Burst 是**每個 workload cluster** 的設定。若管理 100 個 workload cluster，總 QPS 上限為 100 × 20 = 2000 QPS。這個值需要根據 workload cluster API server 的容量來調整。
+</Callout>
+
+### QPS/Burst 調整建議
+
+| 情境 | kube-api-qps | kube-api-burst | 說明 |
+|------|-------------|----------------|------|
+| 預設（小型環境） | 100 | 200 | 適合 < 50 clusters |
+| 中型環境 | 200 | 400 | 50-200 clusters |
+| 大型環境 | 500 | 1000 | 200+ clusters，需確認 API server 容量 |
+| clustercache-client-qps | 20（預設）| — | 通常不需調整，除非 workload cluster 事件頻繁 |
+
+## SyncPeriod（全量同步週期）
+
+```bash
+--sync-period  # 預設：10m
+```
+
+SyncPeriod 控制 controller-manager 多久進行一次**全量重新 reconcile**，即使沒有任何 watch event 觸發。
+
+```go
+// 來源：main.go
+fs.DurationVar(&syncPeriod, "sync-period", 10*time.Minute,
+    "The minimum interval at which watched resources are reconciled.")
+```
+
+這個機制確保即使 watch event 遺失（如 etcd 重啟後 watch 斷線），系統仍能在 10 分鐘內恢復一致性。
+
+<Callout type="tip" title="SyncPeriod 與系統負載">
+縮短 SyncPeriod 可以讓系統更快從異常狀態恢復，但會增加 API server 的基礎負載。生產環境通常維持預設的 10 分鐘。
+</Callout>
+
+## Watch Filter（命名空間隔離）
+
+```bash
+--watch-filter  # 預設：空字串（監看所有命名空間）
+                # 設定為 "capi-system" 表示只監看該命名空間的資源
+```
+
+Watch Filter 可以限制 controller 只關注特定 label 的資源，用於在同一 cluster 中部署多個 CAPI controller-manager 實例（多租戶場景）：
+
+```bash
+# Provider A 只管理帶有此 label 的資源
+--watch-filter=provider-a
+
+# 對應資源需要有 label
+# cluster.x-k8s.io/watch-filter: provider-a
+```
+
+<Callout type="info" title="Watch Filter 用途">
+Watch Filter 主要用於在同一 management cluster 上部署多套 CAPI，或實作類似 Blue/Green 的 controller 升級策略。一般單套部署無需設定。
+</Callout>
+
+## Leader Election
+
+CAPI controller-manager 支援高可用部署（多 replica），透過 Leader Election 確保同一時間只有一個 active controller：
+
+```bash
+--leader-elect                              # 啟用 leader election（預設：false）
+--leader-elect-lease-duration=15s           # non-leader 等待多久才強制取得 leadership（預設：15s）
+--leader-elect-renew-deadline=10s           # leader 嘗試更新 leadership 的超時時間（預設：10s）
+--leader-elect-retry-period=2s             # retry 間隔（預設：2s）
+```
+
+```go
+// Leader Election resource lock 名稱
+LeaderElectionID: "controller-leader-election-capi"
+```
+
+<Callout type="warning" title="Leader Election 與 HA 部署">
+在高可用部署中（多 replica），**必須**啟用 `--leader-elect=true`。否則多個 controller 實例會同時 reconcile 同一資源，導致衝突。
+
+預設值 `false` 適合開發環境，生產環境請設定為 `true`。
+</Callout>
+
+## ReconcilerRateLimiting + PriorityQueue（進階調校）
+
+這是 v1.9 引入的兩個協同運作的 Feature Gate：
+
+- **PriorityQueue**（Beta/預設開啟）：使用優先佇列替代標準工作佇列
+- **ReconcilerRateLimiting**（Beta/預設開啟）：對 reconcile 請求進行速率限制
+
+兩者必須**同時啟用**才能發揮效果。
+
+### PriorityQueue 的優先級機制
+
+在 PriorityQueue 模式下，reconcile 請求依來源有不同優先級：
+
+| 優先級 | 觸發來源 | 說明 |
+|--------|---------|------|
+| 高 | Watch event（CREATE/UPDATE/DELETE） | 真實變更，優先處理 |
+| 低 | 定期重入隊（requeue after） | 等待重試或 SyncPeriod 觸發 |
+
+這確保了**真實事件優先於定期輪詢**，提升響應速度。
+
+### ReconcilerRateLimiting
+
+```go
+// 速率限制配置（基於 controller-runtime 的 RateLimiter）
+// 避免 watch event 風暴導致 reconcile 請求爆炸性增長
+```
+
+ReconcilerRateLimiting 為每個 controller 加入限速器，防止：
+- Watch event 風暴（大量 CR 同時被觸發）
+- 失敗重試的指數退避失控
+
+<Callout type="info" title="Feature Gate 相依性">
+ReconcilerRateLimiting 需要 PriorityQueue 也開啟才有效。詳細的 Feature Gate 說明請參考 [Feature Gates](/cluster-api/features/feature-gates)。
+</Callout>
+
+## 效能診斷
+
+### 查看 controller 指標
+
+CAPI controller-manager 暴露 Prometheus 指標：
+
+```bash
+# 查看 controller 的 reconcile 隊列長度
+kubectl port-forward -n capi-system deployment/capi-controller-manager 8080:8080
+curl http://localhost:8080/metrics | grep work_queue
+
+# 關鍵指標
+# workqueue_depth - 隊列中待處理的項目數
+# workqueue_queue_duration_seconds - 項目在隊列中等待的時間
+# workqueue_work_duration_seconds - 實際處理一個 reconcile 的時間
+# controller_runtime_reconcile_total - reconcile 總次數（含錯誤統計）
+```
+
+### 識別效能瓶頸
+
+```bash
+# 症狀 1：reconcile 延遲高（隊列深度大）
+# 解法：提高 --{controller}-concurrency
+
+# 症狀 2：API server 錯誤（429 Too Many Requests）
+# 解法：降低 --kube-api-qps 或降低並發數
+
+# 症狀 3：workload cluster 連線失敗率高
+# 解法：調整 --clustercache-client-qps / --clustercache-client-burst
+# 參考：ClusterCache 架構說明 /cluster-api/features/clustercache
+
+# 症狀 4：Memory 使用量過高
+# 解法：降低並發數，或縮小 informer cache（透過 watch-filter）
+```
+
+## 各規模建議設定
+
+### 小型環境（< 50 clusters，< 500 machines）
+
+```yaml
+# 使用大部分預設值即可
+args:
+- --kube-api-qps=100       # 預設
+- --kube-api-burst=200     # 預設
+- --machine-concurrency=100  # 預設
+- --cluster-concurrency=50   # 預設
+```
+
+### 中型環境（50-200 clusters，500-2000 machines）
+
+```yaml
+args:
+- --kube-api-qps=200
+- --kube-api-burst=400
+- --machine-concurrency=200
+- --cluster-concurrency=100
+- --machineset-concurrency=100
+- --machinedeployment-concurrency=100
+- --clustercache-client-qps=30    # 適度提高
+- --clustercache-client-burst=50
+```
+
+### 大型環境（> 200 clusters，> 2000 machines）
+
+```yaml
+args:
+- --kube-api-qps=500
+- --kube-api-burst=1000
+- --machine-concurrency=500
+- --cluster-concurrency=200
+- --machineset-concurrency=200
+- --machinedeployment-concurrency=200
+- --clustercache-concurrency=200
+- --clustercache-client-qps=50    # 需同步確認 workload cluster API server 容量
+- --clustercache-client-burst=100
+- --leader-elect=true             # 大型環境應啟用 HA
+```
+
+<Callout type="warning" title="大型環境注意事項">
+提高並發數和 QPS 前，請先評估：
+1. Management cluster API server 的 QPS 容量
+2. CAPI controller-manager 的 CPU/Memory 資源配額（需相應提高 `resources.limits`）
+3. Workload cluster API server 的總 QPS 上限（= clustercache-client-qps × cluster 數量）
+</Callout>
+
+## Profiler
+
+```bash
+--profiler-address  # 預設：空字串（不開啟）
+                    # 設定後暴露 Go pprof endpoint
+```
+
+```bash
+# 開啟 profiler
+--profiler-address=:6060
+
+# 使用 pprof 分析 CPU 使用
+kubectl port-forward -n capi-system deployment/capi-controller-manager 6060:6060
+go tool pprof http://localhost:6060/debug/pprof/profile?seconds=30
+
+# 分析 goroutine 洩漏
+curl http://localhost:6060/debug/pprof/goroutine?debug=1
+```

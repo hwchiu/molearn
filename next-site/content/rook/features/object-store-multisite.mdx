@@ -1,0 +1,395 @@
+---
+layout: doc
+title: Rook — RGW 多站點複寫（Multi-site）
+description: 深入解析 Ceph RGW 的 Realm、Zonegroup、Zone 多站點架構，以及如何透過 Rook CRD 設定跨叢集的 S3 Object Store 複寫。
+---
+
+# RGW 多站點複寫（Multi-site）
+
+<Callout type="info" title="相關章節">
+- [S3 Object Store](/rook/features/s3-object-store)
+- [架構總覽](/rook/features/architecture)
+- [Ceph Cluster 設定](/rook/features/ceph-cluster)
+- [拓樸感知與 Stretch Cluster](/rook/features/topology-zone-awareness)
+</Callout>
+
+<Callout type="tip" title="本文適用對象">
+- 🟢 **初學者**：了解 RGW Multi-site 的基本概念與應用場景。
+- 🟡 **中階工程師**：透過 Rook CRD 設定 Realm、Zonegroup、Zone，完成雙叢集複寫。
+- 🔴 **資深工程師**：掌握 active-active 模式的衝突解析、同步效能調校、以及 failover 與 recovery 流程。
+</Callout>
+
+> 📦 **類比**：RGW Multi-site 就像連鎖書店的庫存系統——台北門市（Zone A）上架的新書，會自動同步到台中門市（Zone B），任何一家門市關閉，顧客可以到另一家購買相同的書。
+
+## 什麼是 RGW Multi-site
+
+RGW（RADOS Gateway）Multi-site 是 Ceph 提供的 **S3 Object Store 跨叢集複寫** 機制。它讓多個地理位置的 Ceph 叢集共享同一個 Object Store namespace，實現：
+
+- **地理冗余**：單一叢集/機房故障不影響資料可用性
+- **Active-Active 讀寫**：客戶端可以就近存取最近的 Zone
+- **DR（Disaster Recovery）**：保護 S3 bucket 免於單點故障
+
+### Multi-site vs Stretch Cluster 比較
+
+| 特性 | Multi-site | Stretch Cluster |
+|------|-----------|----------------|
+| 適用資源 | Object Store (S3) | Block + File + Object |
+| 複寫方式 | 非同步 | 同步 |
+| 網路延遲要求 | 低（可跨城市）| 高（< 10ms）|
+| 最終一致性 | 是（非同步）| 否（同步）|
+| 設定複雜度 | 高 | 中 |
+
+## Multi-site 概念層級
+
+RGW Multi-site 有四個層級的概念結構：
+
+```
+Realm（全域命名空間）
+└── Zonegroup（地理區域群組）
+    ├── Zone-A（Master Zone）
+    │   └── RGW instances
+    └── Zone-B（Secondary Zone）
+        └── RGW instances
+```
+
+### 各層級說明
+
+| 層級 | 說明 | 唯一性 |
+|------|------|--------|
+| **Realm** | 整個 Multi-site 部署的命名空間，包含所有 Zonegroup 和 Zone | 全域唯一 |
+| **Zonegroup** | 一組 Zone 的集合，通常對應一個地理區域（如 us-east）| Realm 內唯一 |
+| **Zone** | 對應一個實際的 Ceph 叢集，是資料的實際存放位置 | Zonegroup 內唯一 |
+| **RGW Instance** | 運行在 Zone 內的 RGW daemon，提供 S3 API 端點 | — |
+
+### Master Zone 與 Secondary Zone
+
+| 特性 | Master Zone | Secondary Zone |
+|------|------------|----------------|
+| Bucket 建立 | ✅ 可建立新 bucket | 僅同步 Master 的 bucket |
+| Metadata 管理 | ✅ 管理 Realm 的 metadata | 從 Master 同步 |
+| 資料存取 | 讀/寫 | 讀（Active-Passive）或讀/寫（Active-Active）|
+| 同步方向 | 推送給 Secondary | 從 Master 拉取 |
+
+## Rook CRD：Multi-site 元件
+
+Rook v1.7+ 提供以下 CRD 管理 RGW Multi-site：
+
+| CRD | 說明 |
+|-----|------|
+| `CephObjectRealm` | 建立 Realm |
+| `CephObjectZoneGroup` | 建立 Zonegroup |
+| `CephObjectZone` | 建立 Zone（關聯到特定的 Ceph pool）|
+| `CephObjectStore` | RGW instances（關聯到某個 Zone）|
+
+## 完整 Multi-site 設定流程
+
+### Cluster 1（Master）設定
+
+**Step 1：建立 Realm**
+
+```yaml
+apiVersion: ceph.rook.io/v1
+kind: CephObjectRealm
+metadata:
+  name: my-store
+  namespace: rook-ceph
+spec: {}              # Realm 本身沒有額外設定
+```
+
+**Step 2：建立 Zonegroup**
+
+```yaml
+apiVersion: ceph.rook.io/v1
+kind: CephObjectZoneGroup
+metadata:
+  name: us
+  namespace: rook-ceph
+spec:
+  realm: my-store     # 關聯到上面的 Realm
+```
+
+**Step 3：建立 Master Zone**
+
+```yaml
+apiVersion: ceph.rook.io/v1
+kind: CephObjectZone
+metadata:
+  name: us-east
+  namespace: rook-ceph
+spec:
+  zoneGroup: us
+  metadataPool:
+    replicated:
+      size: 3
+  dataPool:
+    replicated:
+      size: 3
+  storageClass:
+    enabled: true      # 自動建立對應的 StorageClass
+    parameters:
+      storageBackendBucket: ""
+```
+
+**Step 4：建立 Master Zone 的 ObjectStore**
+
+```yaml
+apiVersion: ceph.rook.io/v1
+kind: CephObjectStore
+metadata:
+  name: my-store
+  namespace: rook-ceph
+spec:
+  metadataPool:
+    replicated:
+      size: 3
+  dataPool:
+    replicated:
+      size: 3
+  gateway:
+    port: 80
+    instances: 2
+  zone:
+    name: us-east     # 關聯到 us-east Zone
+```
+
+### 匯出 Master Zone 設定（供 Secondary 使用）
+
+Master Zone 建立後，需要將 Realm 資訊匯出，讓 Secondary 叢集可以接入：
+
+```bash
+# 在 Master 叢集的 toolbox 中執行
+kubectl -n rook-ceph exec -it deploy/rook-ceph-tools -- bash
+
+# 匯出 Realm 設定
+radosgw-admin realm get > realm.json
+
+# 匯出 Period（包含 Zonegroup 和 Zone 資訊）
+radosgw-admin period get > period.json
+
+# 取得 access/secret key（Secondary 用來同步的認證）
+radosgw-admin user info --uid zone.user \
+  | jq -r '.keys[0] | {access_key, secret_key}'
+```
+
+### Cluster 2（Secondary）設定
+
+**Step 1：建立 Realm（從 Master 匯入）**
+
+```yaml
+# 先建立包含 Master Zone access key 的 secret
+apiVersion: v1
+kind: Secret
+metadata:
+  name: realm-a
+  namespace: rook-ceph
+data:
+  endpoint: aHR0cDovLzE5Mi4xNjguMS4xMDA6ODA=   # base64: http://master-rgw-endpoint:80
+  access-key: <base64 encoded access key>
+  secret-key: <base64 encoded secret key>
+
+---
+apiVersion: ceph.rook.io/v1
+kind: CephObjectRealm
+metadata:
+  name: my-store
+  namespace: rook-ceph
+spec:
+  pull:
+    endpoint: http://master-rgw-endpoint:80     # Master Zone 的 RGW endpoint
+```
+
+**Step 2：建立 Zonegroup（同步 Master）**
+
+```yaml
+apiVersion: ceph.rook.io/v1
+kind: CephObjectZoneGroup
+metadata:
+  name: us
+  namespace: rook-ceph
+spec:
+  realm: my-store
+```
+
+**Step 3：建立 Secondary Zone**
+
+```yaml
+apiVersion: ceph.rook.io/v1
+kind: CephObjectZone
+metadata:
+  name: us-west
+  namespace: rook-ceph
+spec:
+  zoneGroup: us
+  metadataPool:
+    replicated:
+      size: 3
+  dataPool:
+    replicated:
+      size: 3
+```
+
+**Step 4：建立 Secondary ObjectStore**
+
+```yaml
+apiVersion: ceph.rook.io/v1
+kind: CephObjectStore
+metadata:
+  name: my-store
+  namespace: rook-ceph
+spec:
+  gateway:
+    port: 80
+    instances: 2
+  zone:
+    name: us-west
+```
+
+## 同步模式：Active-Active vs Active-Passive
+
+### Active-Passive（預設）
+
+```
+Client Write ──→ Master Zone (us-east)
+                    │
+                    └── 非同步複寫 ──→ Secondary Zone (us-west)
+
+Client Read ──→ 任一 Zone（就近）
+```
+
+- 所有寫入只在 Master Zone 執行
+- Secondary Zone 只提供讀取（唯讀）
+- 適合 DR 和 CDN 場景
+
+### Active-Active
+
+```
+Client Write A ──→ Zone A ──→ 非同步複寫 ──→ Zone B
+Client Write B ──→ Zone B ──→ 非同步複寫 ──→ Zone A
+```
+
+Active-Active 讓兩個 Zone 都能接受寫入，但需要注意**衝突解析**：
+
+- 若同一個物件在兩個 Zone 同時被修改，Ceph 使用 **last writer wins**（時間戳比較）
+- 建議應用層避免在多個 Zone 同時寫入同一個物件
+
+## 同步狀態監控
+
+```bash
+# 進入 toolbox 查看同步狀態
+kubectl -n rook-ceph exec -it deploy/rook-ceph-tools -- bash
+
+# 查看 data 同步狀態
+radosgw-admin sync status
+
+# 期望輸出
+realm                 : my-store (realm-id)
+zonegroup             : us (zonegroup-id)
+zone                  : us-east (zone-id)
+current time          : 2024-01-15T10:00:00Z
+zonegroup sync enabled: True
+data sync source zones : [ "us-west" ]
+data is caught up with source
+
+# 詳細的 bucket 同步狀態
+radosgw-admin bucket sync status --bucket my-important-bucket
+```
+
+### 關鍵同步指標
+
+| 指標 | 說明 | 正常狀態 |
+|------|------|---------|
+| `data is caught up` | 資料同步正常 | 應顯示 caught up |
+| `sync lag` | 同步延遲 | < 1分鐘（視網路而定）|
+| `incremental sync` | 增量同步進行中 | 正常寫入時 |
+
+## Failover 與 Recovery
+
+### 場景：Master Zone 完全故障
+
+```bash
+# Step 1：在 Secondary Zone 執行 zone failover
+# （在 Cluster 2 的 toolbox 中執行）
+radosgw-admin zone modify --rgw-zone us-west --master
+
+# Step 2：強制提交新的 Period
+radosgw-admin period update --commit --rgw-realm my-store
+
+# Step 3：通知應用層切換 S3 endpoint 到 Secondary Zone
+```
+
+### 場景：Master Zone 恢復
+
+```bash
+# Master 恢復後，重新加入 Multi-site（作為 Secondary）
+# 在恢復的 Master 叢集中執行
+
+# Step 1：重新 pull Realm（從現在的 Master Zone）
+radosgw-admin realm pull \
+  --url=http://new-master-endpoint:80 \
+  --access-key=<key> \
+  --secret=<secret>
+
+# Step 2：重新 pull Period
+radosgw-admin period pull \
+  --url=http://new-master-endpoint:80 \
+  --access-key=<key> \
+  --secret=<secret>
+
+# Step 3：啟動資料同步
+radosgw-admin sync start
+```
+
+## 效能調校
+
+### 增加同步線程
+
+```bash
+# 在 RGW 設定中增加同步並發數
+# 透過 Rook CephObjectStore 的 configOverrides 設定
+```
+
+```yaml
+spec:
+  gateway:
+    port: 80
+    instances: 2
+    placement:
+      nodeAffinity:
+        requiredDuringSchedulingIgnoredDuringExecution:
+          nodeSelectorTerms:
+            - matchExpressions:
+                - key: role
+                  operator: In
+                  values: ["storage"]
+```
+
+### 同步帶寬控制
+
+大型 bucket 初次同步可能消耗大量帶寬：
+
+```bash
+# 設定 sync throttle（避免影響生產流量）
+radosgw-admin sync policy set-pipe \
+  --bucket "" \
+  --source-zone us-east \
+  --dest-zone us-west \
+  --bucket-sync-flow-id default \
+  --params bw_limit=100000000    # 100 MB/s
+```
+
+## 與 S3 Object Store 的關係
+
+本文補充了 [S3 Object Store](/rook/features/s3-object-store) 的單叢集設定，Multi-site 是在單叢集 S3 的基礎上增加跨叢集複寫能力。基本的 S3 bucket 操作、用戶管理、StorageClass 設定均在 Single-site 中完成，Multi-site 只在其之上增加 Zone 間的同步關係。
+
+## 常見問題排查
+
+| 問題 | 原因 | 解法 |
+|------|------|------|
+| Secondary Zone 無法同步 | Master Zone RGW endpoint 不可達 | 確認 network 連通性與 port 80 開放 |
+| `sync status` 顯示 lag | 網路帶寬不足或 RGW instance 太少 | 增加 RGW instance 數量 |
+| Period commit 失敗 | Realm 版本不一致 | 強制重新 pull period |
+| Bucket 在 Secondary 找不到 | Metadata 同步延遲 | 等待或手動觸發 `radosgw-admin meta sync` |
+
+## 小結
+
+RGW Multi-site 提供了 Ceph S3 Object Store 的跨叢集複寫能力，透過 Realm→Zonegroup→Zone 的層級結構，可以靈活設計地理分佈的 S3 服務。Active-Passive 模式適合 DR 場景，Active-Active 模式適合多地就近讀寫的場景。配合 [Prometheus 監控](/rook/features/monitoring-prometheus) 持續監控同步延遲，可以及早發現同步異常。

@@ -1,0 +1,379 @@
+---
+layout: doc
+title: Rook — 網路配置與 Multus 整合
+description: 深入解析 Rook CephCluster 的網路配置選項，包含 host networking、public/cluster network 分離、Multus CNI 整合，以及 msgr2 加密傳輸設定。
+---
+
+# 網路配置與 Multus 整合
+
+<Callout type="info" title="相關章節">
+- [架構總覽](/rook/features/architecture)
+- [Ceph Cluster 設定](/rook/features/ceph-cluster)
+- [OSD 與 Monitor](/rook/features/osds-monitors)
+- [拓樸感知與 Stretch Cluster](/rook/features/topology-zone-awareness)
+</Callout>
+
+<Callout type="tip" title="本文適用對象">
+- 🟢 **初學者**：了解 Ceph 網路的基本概念，以及 host networking 與 pod networking 的差異。
+- 🟡 **中階工程師**：設定 public/cluster network 分離，提升 Ceph 效能與安全性。
+- 🔴 **資深工程師**：整合 Multus CNI 使用專用高速 NIC，設定 msgr2 加密與壓縮，以及 IPv6/dual-stack 部署。
+</Callout>
+
+> 📦 **類比**：Ceph 的雙網路設計就像工廠的兩條獨立道路——一條是訪客通道（public network，客戶端存取），另一條是貨物通道（cluster network，內部資料複寫），兩條路互不干擾，各自跑最大流量。
+
+## Ceph 的兩個網路平面
+
+Ceph 設計上支援兩個獨立的網路：
+
+| 網路 | 用途 | 流量類型 |
+|------|------|---------|
+| **Public Network** | 客戶端到 OSD/MON 的存取 | CSI I/O、應用程式讀寫 |
+| **Cluster Network** | OSD 間的資料複寫與 recovery | Replication、Backfill、Recovery |
+
+### 分離的優勢
+
+```
+[無分離]
+客戶端 I/O ──────────────────────────────────┐
+OSD 複寫流量（replication） ─────────────────┤ 同一張 NIC 競爭帶寬
+Recovery 流量（backfill）──────────────────── ┘
+
+[有分離]
+Public NIC (10G): 客戶端 I/O
+Cluster NIC (25G/100G): OSD 複寫 + Recovery（不影響客戶端）
+```
+
+**主要優勢：**
+- Recovery 時不影響客戶端 I/O 效能
+- 可以為 cluster network 使用更高速的網路（25G/100G）
+- 安全隔離：cluster network 不需要對外暴露
+
+## CephCluster 網路設定概覽
+
+```yaml
+apiVersion: ceph.rook.io/v1
+kind: CephCluster
+metadata:
+  name: rook-ceph
+  namespace: rook-ceph
+spec:
+  network:
+    provider: host                    # host | multus | default（pod network）
+    selectors:
+      public: "public-net"            # Multus NetworkAttachmentDefinition name
+      cluster: "cluster-net"          # Multus NetworkAttachmentDefinition name
+    ipFamily: IPv4                    # IPv4 | IPv6 | DualStack
+    connections:
+      encryption:
+        enabled: false                # msgr2 加密
+      compression:
+        enabled: false                # 傳輸壓縮
+      requireMsgr2: false             # 強制使用 msgr2 協定
+```
+
+## Host Networking 模式
+
+Host networking 讓 Ceph Pod 直接使用 Kubernetes node 的 host network stack，完全繞過 Kubernetes CNI overlay 的封裝開銷：
+
+```yaml
+spec:
+  network:
+    provider: host
+```
+
+### Host Networking 的優缺點
+
+| 特性 | Host Networking | Pod Networking |
+|------|----------------|----------------|
+| 效能 | 最高（無 overlay 開銷）| 略低 |
+| Port 衝突風險 | 需管理 host port | 無 |
+| 安全隔離 | 較低（共用 host network）| 較高 |
+| IP 固定性 | node IP（穩定）| Pod IP（會變）|
+| 適用場景 | 高效能生產環境 | 一般場景 |
+
+<Callout type="warning" title="Host Networking 限制">
+Host networking 下，每個 node 上只能運行一個 Ceph cluster 的 OSD。若需要在同一個 node 上跑多個 Ceph cluster（少見場景），需使用 pod networking 或 Multus。
+</Callout>
+
+### 設定 Public/Cluster Network CIDR
+
+使用 host networking 時，可以明確指定 Ceph 使用哪個 subnet：
+
+```yaml
+spec:
+  network:
+    provider: host
+  # 透過 Ceph 原生設定指定網路（在 storage.config 中）
+  storage:
+    config:
+      publicNetwork: "192.168.0.0/24"    # Public network CIDR
+      clusterNetwork: "172.16.0.0/24"   # Cluster network CIDR
+```
+
+## Multus CNI 整合
+
+Multus CNI 讓 Pod 擁有多個網路介面，是在 Kubernetes 中實現 Ceph 雙網路分離的最佳方式。
+
+### 架構示意
+
+```
+Ceph OSD Pod
+├── eth0 (Kubernetes default CNI, Pod network)    → K8s 管理面
+├── net1 (Multus public-net)                       → 客戶端 I/O (10G NIC)
+└── net2 (Multus cluster-net)                      → OSD 複寫 (25G NIC)
+```
+
+### 前置需求
+
+1. 叢集已安裝 Multus CNI
+2. 準備好 high-speed NIC（建議 SR-IOV 或 MACVLAN）
+3. 建立 `NetworkAttachmentDefinition`
+
+### 建立 NetworkAttachmentDefinition
+
+```yaml
+# Public Network（客戶端 I/O 用）
+apiVersion: k8s.cni.cncf.io/v1
+kind: NetworkAttachmentDefinition
+metadata:
+  name: public-net
+  namespace: rook-ceph
+spec:
+  config: |
+    {
+      "cniVersion": "0.3.1",
+      "type": "macvlan",
+      "master": "ens4",              # 實際的 NIC 名稱（public network 用的）
+      "mode": "bridge",
+      "ipam": {
+        "type": "whereabouts",
+        "range": "192.168.0.0/24",
+        "range_start": "192.168.0.100",
+        "range_end": "192.168.0.200"
+      }
+    }
+
+---
+# Cluster Network（OSD 複寫用，使用更快的 NIC）
+apiVersion: k8s.cni.cncf.io/v1
+kind: NetworkAttachmentDefinition
+metadata:
+  name: cluster-net
+  namespace: rook-ceph
+spec:
+  config: |
+    {
+      "cniVersion": "0.3.1",
+      "type": "macvlan",
+      "master": "ens8",              # 25G NIC，專用於 cluster 內部通訊
+      "mode": "bridge",
+      "ipam": {
+        "type": "whereabouts",
+        "range": "172.16.0.0/24",
+        "range_start": "172.16.0.100",
+        "range_end": "172.16.0.200"
+      }
+    }
+```
+
+### 使用 SR-IOV 的高效能設定
+
+SR-IOV（Single Root I/O Virtualization）讓 Pod 直接存取物理 NIC 的 Virtual Function，接近裸機效能：
+
+```yaml
+# SR-IOV NetworkAttachmentDefinition
+apiVersion: k8s.cni.cncf.io/v1
+kind: NetworkAttachmentDefinition
+metadata:
+  name: sriov-public-net
+  namespace: rook-ceph
+spec:
+  config: |
+    {
+      "cniVersion": "0.3.1",
+      "name": "sriov-public-net",
+      "type": "sriov",
+      "pfNames": ["ens4f0"],         # PF (Physical Function) NIC 名稱
+      "resourceName": "intel.com/intel_sriov_netdevice",
+      "ipam": {
+        "type": "whereabouts",
+        "range": "192.168.0.0/24"
+      }
+    }
+```
+
+### CephCluster 啟用 Multus
+
+```yaml
+spec:
+  network:
+    provider: multus
+    selectors:
+      public: rook-ceph/public-net      # 格式：namespace/name
+      cluster: rook-ceph/cluster-net
+```
+
+<Callout type="warning" title="Multus 設定注意事項">
+啟用 Multus 後，必須確保每個 Kubernetes node 都有對應的 NIC 設備，否則 Ceph Pod 無法啟動。可以透過 `nodeSelector` 將 Ceph Pod 限制在有正確 NIC 的 node 上。
+</Callout>
+
+## msgr2 協定：加密與壓縮
+
+Ceph Messenger v2（msgr2）是 Ceph 的第二代網路協定，提供傳輸加密（encryption-in-transit）和壓縮功能。
+
+### msgr2 vs msgr1
+
+| 特性 | msgr1 | msgr2 |
+|------|-------|-------|
+| 預設 Port | 6789（MON）| 3300（MON）|
+| 加密 | ❌ | ✅（可選）|
+| 壓縮 | ❌ | ✅（可選）|
+| 協定效率 | 基本 | 改進 |
+| Ceph 版本 | 全版本 | Nautilus (14)+ |
+
+### 設定 msgr2 加密
+
+```yaml
+spec:
+  network:
+    connections:
+      encryption:
+        enabled: true          # 啟用 in-transit 加密（AES-GCM-128）
+      compression:
+        enabled: false         # 壓縮（已加密時通常無需壓縮）
+      requireMsgr2: true       # 拒絕不支援 msgr2 的 client 連線
+```
+
+<Callout type="warning" title="加密的效能影響">
+msgr2 加密會帶來 CPU 開銷，在高吞吐量場景下可能影響效能。對於已使用 IPsec 或 WireGuard 等底層網路加密的環境，通常不需要再啟用 msgr2 加密。
+</Callout>
+
+### 傳輸壓縮使用場景
+
+壓縮在以下場景有效：
+- 傳輸**可壓縮資料**（log 文字、JSON、未壓縮資料）
+- 網路帶寬成為瓶頸（WAN 場景）
+- 資料已啟用 pool 層級壓縮時，傳輸壓縮效果有限
+
+```yaml
+spec:
+  network:
+    connections:
+      compression:
+        enabled: true          # 啟用傳輸壓縮（snappy 算法）
+```
+
+## IPv6 與 Dual-Stack 設定
+
+### IPv6 only
+
+```yaml
+spec:
+  network:
+    provider: host
+    ipFamily: IPv6
+```
+
+### Dual-Stack（IPv4 + IPv6）
+
+```yaml
+spec:
+  network:
+    provider: host
+    ipFamily: DualStack
+    dualStack:
+      preferIPv6: false        # 優先使用 IPv4（true = 優先 IPv6）
+```
+
+<Callout type="info" title="Dual-Stack 需求">
+Dual-Stack 需要 Kubernetes 叢集本身支援 IPv6（`--cluster-cidr` 包含 IPv6 range），以及底層 CNI 插件支援 IPv6。
+</Callout>
+
+## OSD 網路效能考量
+
+OSD 是 Ceph 中最消耗網路帶寬的元件。以下是 OSD 數量與建議帶寬的參考：
+
+| OSD 數量 | 建議 Public NIC | 建議 Cluster NIC |
+|---------|----------------|-----------------|
+| 1-6 | 10GbE | 10GbE |
+| 7-12 | 25GbE | 25GbE |
+| 13-24 | 25GbE LACP bond | 100GbE |
+| 25+ | 100GbE | 100GbE+ |
+
+### Jumbo Frame 設定
+
+啟用 Jumbo Frame（MTU 9000）可以減少 CPU 開銷並提升大 I/O 吞吐量：
+
+```bash
+# 在 node 上設定 NIC MTU
+ip link set ens4 mtu 9000
+
+# 永久設定（NetworkManager）
+nmcli connection modify ens4 802-3-ethernet.mtu 9000
+nmcli connection up ens4
+```
+
+Ceph Pod 中也需要確保 Multus 分配的網卡 MTU 設定一致：
+
+```yaml
+# NetworkAttachmentDefinition 中設定 MTU
+spec:
+  config: |
+    {
+      "mtu": 9000,
+      ...
+    }
+```
+
+## 網路設定驗證
+
+```bash
+# 確認 Ceph 使用的網路設定
+kubectl -n rook-ceph exec -it deploy/rook-ceph-tools -- bash
+
+# 查看 Ceph cluster 的網路設定
+ceph config dump | grep -E "public_network|cluster_network|ms_"
+
+# 確認 msgr2 加密狀態
+ceph config get mon ms_encrypt_authentication
+
+# 確認 OSD 使用的網路介面
+ceph osd tree
+```
+
+### 多 NIC Pod 驗證
+
+```bash
+# 確認 OSD Pod 有多個網路介面
+kubectl -n rook-ceph exec -it $(kubectl -n rook-ceph get pod -l app=rook-ceph-osd -o name | head -1) -- ip addr
+
+# 期望看到：
+# 1: lo
+# 2: eth0 (Pod default network)
+# 3: net1 (public-net)
+# 4: net2 (cluster-net)
+```
+
+## 常見問題排查
+
+| 問題 | 原因 | 解法 |
+|------|------|------|
+| OSD Pod 無法啟動（Multus）| NetworkAttachmentDefinition 不存在 | 確認 NAD 已建立且在正確 namespace |
+| Host networking 下 Port 衝突 | Node 上已有其他服務佔用 Port | 確認 MON port 3300/6789 未被佔用 |
+| msgr2 加密啟用後效能下降 | CPU 開銷過高 | 確認 CPU 支援 AES-NI，或關閉加密 |
+| IPv6 OSD 連接失敗 | K8s 或 CNI 未正確配置 IPv6 | 確認 K8s dual-stack 設定 |
+| Cluster network 未生效 | CIDR 設定錯誤 | 確認 publicNetwork/clusterNetwork CIDR 正確 |
+
+## 最佳實踐建議
+
+| 環境類型 | 建議網路設定 |
+|---------|------------|
+| 測試/開發 | 預設 pod networking，無需特殊設定 |
+| 一般生產 | Host networking + public/cluster 分離 |
+| 高效能生產 | Multus + SR-IOV + Jumbo Frame |
+| 安全敏感場景 | Multus + msgr2 encryption + requireMsgr2 |
+| 跨 AZ 部署 | Stretch Cluster + 低延遲 WAN 鏈路 |
+
+## 小結
+
+正確的網路配置是 Ceph 高效能運行的基礎。透過 Multus CNI 整合專用高速 NIC，分離 public 和 cluster network，可以顯著提升 I/O 效能並避免 Recovery 流量干擾客戶端服務。msgr2 加密提供了資料傳輸的安全保障，在合規要求嚴格的環境中是必要設定。更多關於 OSD 部署的細節，請參考 [OSD 與 Monitor](/rook/features/osds-monitors)。

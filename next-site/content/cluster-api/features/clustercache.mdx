@@ -1,0 +1,354 @@
+---
+layout: doc
+title: Cluster API — ClusterCache 子系統
+description: 深入解析 ClusterCache 的架構設計，了解 CAPI controllers 如何透過 ClusterCache 高效連接並操作 workload cluster 的 API server。
+---
+
+# ClusterCache 子系統
+
+<Callout type="info" title="相關章節">
+- [架構總覽](/cluster-api/features/architecture)
+- [Controller Core](/cluster-api/features/controller-core)
+- [Controller 效能調優](/cluster-api/features/controller-tuning)
+- [Feature Gates 完整指南](/cluster-api/features/feature-gates)
+</Callout>
+
+<Callout type="tip" title="本文適用對象">
+- 🟢 **初學者**：了解 CAPI controller 為何需要連接 workload cluster，以及 ClusterCache 解決了什麼問題
+- 🟡 **中階工程師**：掌握 ClusterCache 的架構，學習如何在自訂 controller 中正確使用 ClusterCache
+- 🔴 **資深工程師**：深入理解 connection 管理、health probe 機制、快取一致性，以及大規模場景下的調優方式
+</Callout>
+
+> 📦 **類比**：ClusterCache 就像外交部的常駐使館系統。Management cluster 的 controllers（外交部）需要頻繁與多個 workload clusters（各國）溝通。ClusterCache 維護著每個「使館」（連線），包含電話線（client）、文件存檔室（cache），並定期確認使館仍在正常運作（health probe）。
+
+## 什麼是 ClusterCache
+
+CAPI controllers 不僅管理 management cluster 中的資源（Cluster、Machine 等 CRD），還需要**直接操作 workload cluster**：
+
+- 監控 workload cluster node 的狀態
+- 驗證 control plane 是否健康
+- 讀取 workload cluster 中的 Pod 狀態（用於 drain）
+- 管理 ClusterResourceSet 中定義的 workload 資源
+
+每個 workload cluster 都有獨立的 API server，需要獨立的 kubeconfig 和 client。若每次操作都建立新連線，會造成大量的 TLS handshake 和 API server 負載。
+
+**ClusterCache** 解決了這個問題：
+
+- 為每個 workload cluster 維護一個持久的 `clusterAccessor`
+- 每個 accessor 包含：已認證的 client、執行中的 informer cache、health probe 狀態
+- 提供統一的介面讓所有 controllers 共用連線
+
+## 架構概覽
+
+```
+┌─────────────────────────────────────────────────────┐
+│                   ClusterCache                       │
+│                                                      │
+│  ┌──────────────────┐   ┌──────────────────┐         │
+│  │ clusterAccessor  │   │ clusterAccessor  │  ...    │
+│  │ cluster: c1      │   │ cluster: c2      │         │
+│  │                  │   │                  │         │
+│  │ ┌─────────────┐  │   │ ┌─────────────┐  │         │
+│  │ │   client    │  │   │ │   client    │  │         │
+│  │ │   (cached)  │  │   │ │   (cached)  │  │         │
+│  │ └─────────────┘  │   │ └─────────────┘  │         │
+│  │ ┌─────────────┐  │   │ ┌─────────────┐  │         │
+│  │ │    cache    │  │   │ │    cache    │  │         │
+│  │ │ (informers) │  │   │ │ (informers) │  │         │
+│  │ └─────────────┘  │   │ └─────────────┘  │         │
+│  │ ┌─────────────┐  │   │                  │         │
+│  │ │ health probe│  │   │                  │         │
+│  │ └─────────────┘  │   │                  │         │
+│  └──────────────────┘   └──────────────────┘         │
+└─────────────────────────────────────────────────────┘
+```
+
+## 核心元件
+
+### Options 設定
+
+建立 ClusterCache 時的設定選項：
+
+```go
+// 來源：controllers/clustercache/cluster_cache.go
+type Options struct {
+    // SecretClient：讀取 kubeconfig secret 的 client
+    // 格式：<cluster-name>-kubeconfig
+    // 建議使用只快取 kubeconfig secret 的特化 client
+    SecretClient client.Reader
+
+    // WatchFilterValue：事件過濾 label value
+    WatchFilterValue string
+
+    // ClusterFilter：自訂 cluster 過濾函數
+    ClusterFilter ClusterFilter
+
+    // Cache：每個 workload cluster cache 的設定
+    Cache CacheOptions
+
+    // Client：每個 workload cluster client 的設定
+    Client ClientOptions
+}
+```
+
+### CacheOptions
+
+```go
+type CacheOptions struct {
+    // SyncPeriod：cache 的同步週期
+    SyncPeriod *time.Duration
+
+    // ByObject：限制每個 GVK 的 ListWatch 欄位
+    ByObject map[client.Object]cache.ByObject
+
+    // Indexes：額外的 index 設定
+    Indexes []CacheOptionsIndex
+}
+```
+
+### clusterAccessor（內部元件）
+
+`clusterAccessor` 是每個 workload cluster 的連線管理器：
+
+```go
+// 來源：controllers/clustercache/cluster_accessor.go
+type clusterAccessor struct {
+    cluster client.ObjectKey   // cluster 識別 key
+
+    config *clusterAccessorConfig
+
+    // lockedStateLock：保護 lockedState 的 RWMutex
+    // 注意：持有此 lock 的時間必須極短，避免阻塞 controllers
+    lockedStateLock sync.RWMutex
+
+    // lockedState：包含 client、cache 和 health probe 狀態
+    lockedState clusterAccessorLockedState
+
+    cacheCtx context.Context   // cache 的生命週期 context
+}
+```
+
+重要設計原則：`lockedStateLock` 不能長時間持有（例如建立連線期間），以免阻塞其他 controller 呼叫 `GetClient()`。
+
+### Health Probe 設定
+
+```go
+type clusterAccessorHealthProbeConfig struct {
+    // Timeout：health probe 的超時時間
+    Timeout time.Duration
+
+    // Interval：兩次 health probe 之間的間隔
+    Interval time.Duration
+
+    // FailureThreshold：連續失敗多少次後標記為不健康
+    FailureThreshold int
+
+    // SuccessThreshold：連續成功多少次後標記為健康
+    SuccessThreshold int
+}
+```
+
+## Controller 如何使用 ClusterCache
+
+### 取得 workload cluster client
+
+```go
+// 在 controller reconciler 中
+func (r *MachineController) Reconcile(ctx context.Context, req reconcile.Request) (reconcile.Result, error) {
+    // 取得連向 workload cluster 的 client
+    clusterKey := client.ObjectKey{
+        Namespace: machine.Namespace,
+        Name:      machine.Spec.ClusterName,
+    }
+
+    // 若 ClusterCache 還未建立連線，會返回 error
+    remoteClient, err := r.ClusterCache.GetClient(ctx, clusterKey)
+    if err != nil {
+        return reconcile.Result{}, err
+    }
+
+    // 使用 remoteClient 操作 workload cluster
+    nodeList := &corev1.NodeList{}
+    if err := remoteClient.List(ctx, nodeList); err != nil {
+        return reconcile.Result{}, err
+    }
+}
+```
+
+### 觸發 controller reconcile（當 workload cluster 有事件）
+
+ClusterCache 提供 `Watch` 機制，讓 controllers 在 workload cluster 的物件發生變更時被觸發：
+
+```go
+// 設定監聽 workload cluster 的 Node 事件
+if err := r.ClusterCache.Watch(
+    ctx,
+    clusterKey,
+    handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, obj client.Object) []reconcile.Request {
+        // 將 Node 事件映射為 Machine reconcile request
+        return []reconcile.Request{{NamespacedName: machineKey}}
+    }),
+    &corev1.Node{},
+); err != nil {
+    return reconcile.Result{}, err
+}
+```
+
+## Connection 生命週期
+
+```
+Cluster 建立（Cluster CR 出現）
+         │
+         ▼
+ClusterCache reconciler 觸發
+         │
+         ▼
+讀取 <cluster-name>-kubeconfig Secret
+         │
+         ├── Secret 不存在？→ 稍後重試
+         │
+         ▼
+建立 REST config（從 kubeconfig）
+         │
+         ▼
+建立 client + cache（clusterAccessor）
+         │
+         ▼
+啟動 cache（ListWatch workload cluster 資源）
+         │
+         ▼
+啟動 health probe（定期 GET /healthz）
+         │
+    ┌────┴────┐
+    │  健康   │  不健康
+    │         ▼
+    │   連續失敗超過 threshold
+    │         │
+    │         ▼
+    │   標記為 unhealthy，停止 cache
+    │         │
+    │         ▼
+    │   等待重連間隔後重試
+    └────────────────────────
+```
+
+## Health Tracking 與重連機制
+
+ClusterCache 透過 health probe 持續監控每個 workload cluster 的可用性：
+
+```go
+// lockedState 包含健康狀態資訊
+type clusterAccessorLockedState struct {
+    // connection：client 和 cache
+    connection *clusterAccessorConnection
+
+    // lastProbeSuccessTime：最後一次健康探測成功的時間
+    lastProbeSuccessTime time.Time
+
+    // consecutiveFailures：連續失敗次數
+    consecutiveFailures int
+}
+```
+
+當 workload cluster 不可用時（例如升級中）：
+1. Health probe 開始失敗
+2. 連續失敗次數超過 `FailureThreshold` 後，停止 cache（釋放資源）
+3. Controllers 呼叫 `GetClient()` 會返回 `ErrClusterNotConnected`
+4. Controllers 通常會 requeue 等待 cluster 恢復
+5. Cluster 恢復後，ClusterCache 重新建立連線
+
+## Controller Pod 本地連線優化
+
+```go
+// 若 controller 本身運行在某個 workload cluster 上
+// ClusterCache 會使用 in-cluster 設定直接連接 API server
+// 而不是透過 loadbalancer，降低延遲
+
+type clusterAccessorConfig struct {
+    // ControllerPodMetadata：controller Pod 的 metadata
+    // 透過 POD_NAMESPACE, POD_NAME, POD_UID 環境變數設定
+    ControllerPodMetadata *metav1.ObjectMeta
+}
+```
+
+這個優化對於**巢狀（nested）cluster 場景**特別重要：management cluster 本身也是某個更上層 management cluster 管理的 workload cluster。
+
+## Index 支援
+
+ClusterCache 支援在 workload cluster 的 cache 上建立 index，以提高查詢效率：
+
+```go
+type CacheOptionsIndex struct {
+    // Object：要建立 index 的物件類型
+    Object client.Object
+
+    // Field：index 名稱（用於 field selector 查詢）
+    Field string
+
+    // ExtractValue：從物件中提取 index 值的函數
+    ExtractValue client.IndexerFunc
+}
+
+// 使用範例：為 Node 建立 provider ID index
+CacheOptionsIndex{
+    Object: &corev1.Node{},
+    Field:  "spec.providerID",
+    ExtractValue: func(obj client.Object) []string {
+        node := obj.(*corev1.Node)
+        return []string{node.Spec.ProviderID}
+    },
+}
+```
+
+## Metrics
+
+ClusterCache 暴露以下 Prometheus metrics（來源：`controllers/clustercache/metrics.go`）：
+
+| Metric | 說明 |
+|--------|------|
+| `capi_clustercache_connections_total` | 成功建立的連線總數 |
+| `capi_clustercache_connection_errors_total` | 連線失敗次數 |
+| `capi_clustercache_health_probe_duration_seconds` | Health probe 耗時 |
+| `capi_clustercache_connected_clusters` | 目前已連線的 cluster 數量 |
+
+## 設定建議
+
+### 記憶體考量
+
+每個 workload cluster 的 `clusterAccessor` 會在記憶體中維護 informer cache。若有大量 workload clusters，應考慮限制 cache 的範圍：
+
+```go
+// 限制每個 workload cluster cache 只監聽必要的資源
+cacheOptions := clustercache.CacheOptions{
+    ByObject: map[client.Object]cache.ByObject{
+        // 只快取 Node，不快取所有資源
+        &corev1.Node{}: {
+            // 只快取必要欄位
+            Field: fields.SelectorFromSet(fields.Set{
+                "spec.providerID": providerID,
+            }),
+        },
+    },
+}
+```
+
+### QPS 控制
+
+每個 workload cluster client 的 QPS 與 Burst 可透過 ClusterCache Options 設定，詳見 [Controller 效能調優](/cluster-api/features/controller-tuning)。
+
+## 疑難排解
+
+```bash
+# 觀察 ClusterCache 的連線狀態（透過 controller logs）
+kubectl logs -n capi-system deployment/capi-controller-manager \
+  | grep -i "clustercache\|cluster accessor"
+
+# 常見錯誤訊息
+# "failed to get rest config for cluster": kubeconfig secret 不存在或格式錯誤
+# "failed to create cluster accessor": 無法連接 workload cluster API server
+# "cluster is not connected": workload cluster 暫時不可用
+```
+
+<Callout type="warning" title="ClusterCache vs 直接 client">
+不要在 CAPI controllers 中直接使用 `client.New()` 建立連向 workload cluster 的 client。應**始終**透過 ClusterCache 取得 client，以確保連線複用、health tracking 和正確的重連行為。
+</Callout>

@@ -1,0 +1,302 @@
+---
+layout: doc
+title: Cluster API Provider MAAS — Resource Pools 與 Tags 主機選擇
+description: 解析如何透過 MAAS Resource Pools 與 Tags 精確篩選特定類型的實體機器，實現 GPU 節點、SSD 專用節點等進階部署策略。
+---
+
+# Resource Pools 與 Tags 主機選擇
+
+<Callout type="info" title="相關章節">
+- [API 類型定義](/cluster-api-provider-maas/features/api-types)
+- [Machine 服務實作](/cluster-api-provider-maas/features/machine-service-implementation)
+- [Failure Domains 與高可用](/cluster-api-provider-maas/features/failure-domains-ha)
+</Callout>
+
+<Callout type="tip" title="本文適用對象">
+- 🟢 **初學者**：了解如何確保 Kubernetes worker node 被分配到特定規格的機器。
+- 🟡 **中階工程師**：掌握 ResourcePool 與 Tags 在 MaasMachine spec 中的設定方式。
+- 🔴 **資深工程師**：分析多重約束條件的組合策略，以及 MAAS allocation 演算法如何處理約束衝突。
+</Callout>
+
+> 📦 **類比**：Resource Pool 就像公司的部門車位——只有特定部門的員工才能停。Tags 則像貼在車位上的標籤（「主管專用」、「電動車充電」），讓員工找到符合自己需求的車位。
+
+## MAAS 中的機器分類機制
+
+MAAS 提供兩種機制來對機器進行分類：
+
+| 機制 | 說明 | 使用場景 |
+|------|------|---------|
+| **Resource Pool** | 機器歸屬的資源池，一台機器只能屬於一個 pool | 按業務單元或團隊隔離資源 |
+| **Tags** | 機器的標籤，一台機器可以有多個 tags | 按硬體特性、用途標記機器 |
+
+## MaasMachine 中的相關 Spec 欄位
+
+```go
+// api/v1beta1/maasmachine_types.go
+type MaasMachineSpec struct {
+    // ResourcePool 指定 MAAS Resource Pool 名稱
+    // +optional
+    ResourcePool *string `json:"resourcePool,omitempty"`
+
+    // Tags 指定 machine 必須有的 tags（所有 tag 都必須符合）
+    // +optional
+    Tags []string `json:"tags,omitempty"`
+
+    // 其他欄位...
+    MinCPU        *int   `json:"minCPU"`
+    MinMemoryInMB *int   `json:"minMemory"`
+    Image         string `json:"image"`
+    FailureDomain *string `json:"failureDomain,omitempty"`
+}
+```
+
+## 在 DeployMachine 中的應用
+
+CAPM 在 allocate 階段將這些約束條件傳給 MAAS：
+
+```go
+// pkg/maas/machine/machine.go
+allocator := s.maasClient.
+    Machines().
+    Allocator().
+    WithCPUCount(*mm.Spec.MinCPU).
+    WithMemory(*mm.Spec.MinMemoryInMB)
+
+// 加入 Zone 約束
+if failureDomain != nil {
+    allocator.WithZone(*failureDomain)
+}
+
+// 加入 Resource Pool 約束
+if mm.Spec.ResourcePool != nil {
+    allocator.WithResourcePool(*mm.Spec.ResourcePool)
+}
+
+// 加入 Tags 約束（所有 tag 都必須符合）
+if len(mm.Spec.Tags) > 0 {
+    allocator.WithTags(mm.Spec.Tags)
+}
+
+m, err = allocator.Allocate(ctx)
+```
+
+所有約束條件都是 AND 關係：機器必須同時滿足所有指定的約束才會被選中。
+
+## 完整約束條件對照表
+
+| `MaasMachine.Spec` 欄位 | MAAS Allocate 參數 | 類型 |
+|------------------------|-------------------|------|
+| `MinCPU` | `cpu_count` | 最小值（≥） |
+| `MinMemoryInMB` | `mem` | 最小值（MB，≥） |
+| `FailureDomain` | `zone` | 完全匹配 |
+| `ResourcePool` | `pool` | 完全匹配 |
+| `Tags` | `tags` | 必須全部存在 |
+
+## 使用情境
+
+### 情境 1：GPU 節點池
+
+為 AI/ML 工作負載配備 GPU 的 worker nodes：
+
+```yaml
+# GPU worker MaasMachineTemplate
+apiVersion: infrastructure.cluster.x-k8s.io/v1beta1
+kind: MaasMachineTemplate
+metadata:
+  name: gpu-worker-template
+spec:
+  template:
+    spec:
+      image: ubuntu/focal-gpu
+      minCPU: 8
+      minMemory: 32768  # 32GB
+      resourcePool: gpu-pool
+      tags:
+        - nvidia-a100
+        - high-memory
+```
+
+MAAS 管理員需要事先將 GPU 機器標記好：
+```bash
+# 在 MAAS 中設定 tags
+maas admin machine add-tag <system_id> nvidia-a100
+maas admin machine add-tag <system_id> high-memory
+
+# 將機器移入 gpu-pool
+maas admin machine update <system_id> pool=gpu-pool
+```
+
+### 情境 2：高效能儲存節點
+
+```yaml
+# SSD-only storage worker
+apiVersion: infrastructure.cluster.x-k8s.io/v1beta1
+kind: MaasMachineTemplate
+metadata:
+  name: storage-worker-template
+spec:
+  template:
+    spec:
+      image: ubuntu/focal
+      minCPU: 4
+      minMemory: 16384  # 16GB
+      tags:
+        - nvme-ssd
+        - high-iops
+```
+
+### 情境 3：隔離的測試環境
+
+```yaml
+# 測試環境專用機器（使用獨立 resource pool 隔離）
+apiVersion: infrastructure.cluster.x-k8s.io/v1beta1
+kind: MaasMachineTemplate
+metadata:
+  name: test-worker-template
+spec:
+  template:
+    spec:
+      image: ubuntu/focal
+      minCPU: 2
+      minMemory: 4096  # 4GB
+      resourcePool: test-pool
+      tags:
+        - test-only
+```
+
+### 情境 4：Zone + ResourcePool + Tags 組合
+
+```yaml
+# 精確定位：北機房 rack 01 的 ARM 機器
+spec:
+  template:
+    spec:
+      image: ubuntu/focal-arm64
+      minCPU: 16
+      minMemory: 65536  # 64GB
+      failureDomain: rack-north-01
+      resourcePool: arm-pool
+      tags:
+        - arm64
+        - graviton3
+```
+
+## MaasMachineTemplate 設定範例
+
+完整的 MaasMachineTemplate 示範：
+
+```yaml
+apiVersion: infrastructure.cluster.x-k8s.io/v1beta1
+kind: MaasMachineTemplate
+metadata:
+  name: prod-worker-template
+  namespace: default
+spec:
+  template:
+    spec:
+      image: ubuntu/focal
+      minCPU: 4
+      minMemory: 8192          # 8GB
+      resourcePool: prod-pool  # 只使用生產環境機器池
+      tags:
+        - production            # 必須有 production tag
+        - k8s-ready             # 必須已預先配置過 k8s 依賴
+      failureDomain: zone-a    # 固定在 zone-a（可選）
+```
+
+## Tag 設計策略建議
+
+### 按硬體特性標記
+
+```
+nvidia-a100     # GPU 型號
+nvme-ssd        # 儲存類型
+10g-network     # 網路速度
+arm64           # 架構類型
+```
+
+### 按業務用途標記
+
+```
+production      # 生產環境
+staging         # 預發布環境
+test-only       # 僅測試
+k8s-ready       # 已安裝 k8s 前置依賴
+```
+
+### 按硬體狀態標記
+
+```
+verified        # 已通過硬體驗證
+maintenance     # 維護中（配合 MAAS 狀態）
+high-memory     # 記憶體 > 256GB
+```
+
+<Callout type="warning" title="Tags 注意事項">
+`MaasMachine.Spec.Tags` 中的所有 tags 都是 **AND** 條件，機器必須同時擁有所有指定的 tags。若需要 OR 邏輯（如「有 A tag 或 B tag 的機器」），需要建立多個 `MaasMachineTemplate` 並使用不同的 `MachineDeployment`。
+</Callout>
+
+## Resource Pool 在 MAAS 中的管理
+
+### 建立 Resource Pool
+
+```bash
+# 在 MAAS 中建立 resource pool
+maas admin resource-pools create name=gpu-pool description="GPU machines"
+maas admin resource-pools create name=prod-pool description="Production machines"
+```
+
+### 將機器加入 Resource Pool
+
+```bash
+# 透過 MAAS CLI 將機器移入指定 pool
+maas admin machine update <system_id> pool=gpu-pool
+
+# 批次移入（示意）
+for system_id in abc123 def456 ghi789; do
+    maas admin machine update $system_id pool=gpu-pool
+done
+```
+
+### 查詢可用機器
+
+```bash
+# 查詢 gpu-pool 中有 nvidia-a100 tag 的可用機器
+maas admin machines read status=4 pool=gpu-pool tags=nvidia-a100
+# status=4 代表 Ready 狀態
+```
+
+## 排除 Allocation 失敗問題
+
+當找不到符合條件的機器時，MAAS 回傳 409 Conflict，CAPM 會收到：
+
+```
+Unable to allocate machine: ...
+409 Conflict: No available machine matches constraints...
+```
+
+### 診斷步驟
+
+```bash
+# 1. 確認 MAAS 中有 Ready 狀態的機器
+maas admin machines read status=4 | jq '.[].hostname'
+
+# 2. 確認 tag 存在於機器上
+maas admin machines read tags=nvidia-a100 | jq '.[].hostname'
+
+# 3. 確認 resource pool 有 Ready 機器
+maas admin machines read pool=gpu-pool status=4 | jq length
+
+# 4. 測試手動 allocate（確認約束條件是否可滿足）
+maas admin machines allocate \
+  cpu_count=8 \
+  mem=32768 \
+  pool=gpu-pool \
+  tags=nvidia-a100
+```
+
+若手動 allocate 成功，記得立即 release：
+
+```bash
+maas admin machine release <system_id>
+```

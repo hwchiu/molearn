@@ -1,0 +1,318 @@
+---
+layout: doc
+title: Cluster API — API 版本轉換系統
+description: 深入解析 CAPI 的 API 版本轉換機制，涵蓋 hub-spoke 模型、conversion webhook 實作、util/conversion 工具套件，以及跨版本升級的最佳實踐。
+---
+
+# API 版本轉換系統
+
+<Callout type="info" title="相關章節">
+- [CRD Migration 系統](/cluster-api/features/crd-migration)
+- [Webhooks 深入解析](/cluster-api/features/webhooks-deepdive)
+- [架構總覽](/cluster-api/features/architecture)
+- [IPAM 子系統](/cluster-api/features/ipam-subsystem)
+</Callout>
+
+<Callout type="tip" title="本文適用對象">
+- 🟢 **初學者**：了解為什麼 API 版本需要轉換，以及 CAPI 如何保持向後相容
+- 🟡 **中階工程師**：掌握 hub-spoke 轉換模型，理解 `cluster.x-k8s.io/conversion-data` annotation 的作用
+- 🔴 **資深工程師**：深入理解 conversion webhook 實作細節、`util/conversion` 工具套件，以及如何撰寫正確的雙向轉換函數
+</Callout>
+
+> 📦 **類比**：CAPI API 版本轉換就像語言翻譯系統。所有國際對話（API 操作）都透過一個共通的「世界語」（v1beta2 hub）進行。英文文件（v1beta1）進入系統時先翻譯成世界語儲存，讀出時再翻譯回英文。翻譯時若遇到無法精確對應的表達，會附上一張原文便條（conversion-data annotation）以保留原始資訊。
+
+## CAPI API 版本歷史
+
+CAPI 自成立以來已發布多個主要 API 版本：
+
+| 版本 | 引入時間 | 狀態 |
+|------|---------|------|
+| `v1alpha2` | CAPI v0.2 | 已移除 |
+| `v1alpha3` | CAPI v0.3 | 已移除 |
+| `v1alpha4` | CAPI v0.4 | 已移除 |
+| `v1beta1` | CAPI v1.0 | Served（支援），但非 storage version |
+| `v1beta2` | CAPI v1.9+ | **目前的 storage version（Hub）** |
+
+目前 CAPI 同時 serve `v1beta1` 和 `v1beta2`，但儲存在 etcd 的格式為 `v1beta2`。
+
+## Hub-Spoke 轉換模型
+
+CAPI 使用 controller-runtime 的 **hub-spoke** 轉換模型：
+
+```
+v1alpha3  ──→ ConvertTo ──╮
+v1alpha4  ──→ ConvertTo ──┤──→ v1beta2 (Hub) ←── 儲存在 etcd
+v1beta1   ──→ ConvertTo ──╯
+
+v1beta1   ←── ConvertFrom ──╮
+v1alpha4  ←── ConvertFrom ──┤──← v1beta2 (Hub)
+v1alpha3  ←── ConvertFrom ──╯
+```
+
+### Hub 定義
+
+```go
+// v1beta2 實作 Hub interface，標記自己是轉換中心
+// 來源：api/core/v1beta2/conversion.go
+func (*Cluster) Hub() {}
+func (*Machine) Hub() {}
+func (*MachineSet) Hub() {}
+func (*MachineDeployment) Hub() {}
+// ...所有 v1beta2 類型
+```
+
+### Spoke 實作（以 v1beta1 為例）
+
+```go
+// 來源：api/core/v1beta1/cluster_conversion.go（示意）
+// v1beta1.Cluster 實作 ConvertTo 和 ConvertFrom
+
+// ConvertTo：v1beta1 → v1beta2
+func (src *Cluster) ConvertTo(dstRaw conversion.Hub) error {
+    dst := dstRaw.(*v1beta2.Cluster)
+
+    // 使用自動生成的轉換函數
+    if err := Convert_v1beta1_Cluster_To_v1beta2_Cluster(src, dst, nil); err != nil {
+        return err
+    }
+
+    // 儲存 v1beta1 原始資料（避免資訊丟失）
+    return conversion.MarshalData(src, dst)
+}
+
+// ConvertFrom：v1beta2 → v1beta1
+func (dst *Cluster) ConvertFrom(srcRaw conversion.Hub) error {
+    src := srcRaw.(*v1beta2.Cluster)
+
+    // 使用自動生成的轉換函數
+    if err := Convert_v1beta2_Cluster_To_v1beta1_Cluster(src, dst, nil); err != nil {
+        return err
+    }
+
+    // 恢復 v1beta1 特有資料
+    return conversion.UnmarshalData(src, dst)
+}
+```
+
+## conversion-data Annotation
+
+這是 CAPI conversion 系統的核心機制。當 v1beta1 物件需要儲存為 v1beta2 時，若 v1beta1 有某些欄位無法對應到 v1beta2，這些資料會被序列化並存入 annotation：
+
+```yaml
+# v1beta2 物件（儲存在 etcd）
+apiVersion: cluster.x-k8s.io/v1beta2
+kind: Cluster
+metadata:
+  annotations:
+    # 儲存 v1beta1 的原始資料，以便回轉時恢復
+    cluster.x-k8s.io/conversion-data: |
+      {"spec":{"deprecatedField":"original-value"}}
+```
+
+```go
+// 來源：util/conversion/conversion.go
+const DataAnnotation = "cluster.x-k8s.io/conversion-data"
+
+// MarshalData：儲存原始物件到 annotation（忽略 metadata）
+func MarshalData(src metav1.Object, dst metav1.Object) error {
+    u, err := runtime.DefaultUnstructuredConverter.ToUnstructured(src)
+    // 移除 metadata（不需要重複儲存）
+    delete(u, "metadata")
+    data, err := json.Marshal(u)
+    // 寫入 annotation
+    dst.SetAnnotations(annotations)
+    return nil
+}
+
+// UnmarshalData：從 annotation 恢復原始資料
+func UnmarshalData(from metav1.Object, to metav1.Object) error {
+    data, ok := annotations[DataAnnotation]
+    // 恢復到 to 物件
+    return json.Unmarshal([]byte(data), &rawMap)
+}
+```
+
+## util/conversion 工具套件
+
+`util/conversion` 提供了建立和測試 conversion 的工具函數：
+
+### 核心函數
+
+| 函數 | 用途 |
+|------|------|
+| `MarshalData(src, dst)` | 將 src 物件序列化存入 dst 的 annotation |
+| `UnmarshalData(from, to)` | 從 from 的 annotation 反序列化到 to |
+| `MarshalDataUnsafeNoCopy(src, dst)` | 同上但修改 src metadata（效能優化版本，用於 ConvertFrom 最後一步） |
+
+### 測試輔助函數
+
+`util/conversion` 也提供了 fuzzing 測試輔助函數，用於驗證 conversion 的正確性：
+
+```go
+// 來源：util/conversion/conversion.go
+// RoundTripTestForAPIVersion 測試 hub → spoke → hub 的往返轉換是否無損
+func RoundTripTestForAPIVersion(t *testing.T,
+    scheme *runtime.Scheme,
+    hubObject conversion.Hub,
+    spokeObject conversion.Convertible,
+    fuzzerFuncs ...fuzzer.FuzzerFuncs,
+) {
+    // 1. 使用 fuzzer 隨機填充 hub 物件
+    // 2. Hub → Spoke 轉換
+    // 3. Spoke → Hub 轉換
+    // 4. 比較原始 hub 與最終 hub，確保無損
+}
+```
+
+```go
+// 在測試中使用
+func TestClusterConversion(t *testing.T) {
+    g := gomega.NewWithT(t)
+    conversion.RoundTripTestForAPIVersion(
+        t,
+        scheme,
+        &v1beta2.Cluster{},
+        &v1beta1.Cluster{},
+        ClusterFuzzerFuncs,
+    )
+}
+```
+
+## Storage Version vs Served Version
+
+```yaml
+# CRD spec 中的版本設定
+spec:
+  versions:
+  - name: v1beta1
+    served: true      # ✅ 仍可透過 API 存取
+    storage: false    # ❌ 不用於 etcd 儲存
+  - name: v1beta2
+    served: true      # ✅ 可透過 API 存取
+    storage: true     # ✅ 用於 etcd 儲存（唯一）
+```
+
+| 概念 | 說明 |
+|------|------|
+| **Served version** | 可透過 API server 存取的版本（multiple） |
+| **Storage version** | etcd 中儲存的版本（只能有一個） |
+| **Hub version** | conversion 的中心版本，等同於 storage version |
+
+## 升級時的 API 版本遷移
+
+### CAPI v1beta1 → v1beta2 升級流程
+
+```
+1. 升級前（CAPI v1.8）
+   - storage: v1beta1
+   - served: v1beta1, v1beta2（v1beta2 是新加的）
+   - etcd：所有物件為 v1beta1 格式
+
+2. 升級 CAPI 到 v1.9+
+   - storage: v1beta2（變更）
+   - served: v1beta1, v1beta2
+   - etcd：物件仍是 v1beta1（需要 CRDMigrator 遷移）
+
+3. 新 CAPI controller 啟動
+   - CRDMigrator 執行 StorageVersionMigration
+   - 所有 v1beta1 物件逐步轉換為 v1beta2
+
+4. 遷移完成
+   - storage: v1beta2
+   - storedVersions: [v1beta2]（已不含 v1beta1）
+```
+
+### 轉換時機
+
+每次 API 操作都可能觸發 conversion：
+
+```
+kubectl get cluster my-cluster   (請求 v1beta1)
+  → API server 從 etcd 讀取 v1beta2
+  → conversion webhook：v1beta2 → v1beta1
+  → 回傳 v1beta1 格式給 kubectl
+
+kubectl apply -f cluster.yaml    (物件為 v1beta1)
+  → conversion webhook：v1beta1 → v1beta2
+  → 儲存 v1beta2 到 etcd
+```
+
+## 常見轉換問題
+
+### 問題 1：資料丟失（Data Loss）
+
+若 v1beta1 有某個欄位在 v1beta2 中被移除：
+
+```go
+// ❌ 錯誤：直接丟棄舊欄位
+func (src *v1beta1Cluster) ConvertTo(dst conversion.Hub) error {
+    // 未處理 src.Spec.DeprecatedField
+    return nil
+}
+
+// ✅ 正確：透過 MarshalData 保留
+func (src *v1beta1Cluster) ConvertTo(dst conversion.Hub) error {
+    if err := convert(src, dst); err != nil {
+        return err
+    }
+    return conversion.MarshalData(src, dst)  // 保留所有 v1beta1 資料
+}
+```
+
+### 問題 2：conversion webhook 版本不匹配
+
+若 CAPI 升級後 webhook 伺服器仍是舊版本：
+
+```bash
+# 症狀：創建或修改 Cluster 時收到轉換錯誤
+Error: conversion webhook returned wrong version
+
+# 解決：確保 CAPI controller pod 已更新
+kubectl rollout status deployment capi-controller-manager -n capi-system
+```
+
+### 問題 3：annotation 資料過大
+
+`conversion-data` annotation 包含完整的物件資料，若物件很大（如有大量 status 資訊），可能超過 annotation 大小限制（256KB）：
+
+```bash
+# 診斷：查看 annotation 大小
+kubectl get cluster my-cluster -o jsonpath='{.metadata.annotations.cluster\.x-k8s\.io/conversion-data}' \
+  | wc -c
+```
+
+## 為 Provider 撰寫 Conversion
+
+若你在開發自訂 infrastructure provider，並需要支援多個 API 版本：
+
+```go
+// 1. 定義 hub 版本（最新版本）
+// api/v1beta2/mymachine_types.go
+func (*MyMachine) Hub() {}
+
+// 2. 定義舊版本的 conversion
+// api/v1beta1/mymachine_conversion.go
+func (src *MyMachine) ConvertTo(dstRaw conversion.Hub) error {
+    dst := dstRaw.(*v1beta2.MyMachine)
+    if err := Convert_v1beta1_MyMachine_To_v1beta2_MyMachine(src, dst, nil); err != nil {
+        return err
+    }
+    return conversion.MarshalData(src, dst)
+}
+
+func (dst *MyMachine) ConvertFrom(srcRaw conversion.Hub) error {
+    src := srcRaw.(*v1beta2.MyMachine)
+    if err := Convert_v1beta2_MyMachine_To_v1beta1_MyMachine(src, dst, nil); err != nil {
+        return err
+    }
+    return conversion.UnmarshalData(src, dst)
+}
+
+// 3. 撰寫 round-trip 測試確保轉換無損
+func TestMyMachineConversion(t *testing.T) {
+    conversion.RoundTripTestForAPIVersion(t, scheme,
+        &v1beta2.MyMachine{}, &v1beta1.MyMachine{})
+}
+```
+
+詳細的 CRD 遷移機制請參考 [CRD Migration 系統](/cluster-api/features/crd-migration)。

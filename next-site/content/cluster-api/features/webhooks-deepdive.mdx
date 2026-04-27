@@ -1,0 +1,305 @@
+---
+layout: doc
+title: Cluster API — Webhooks 深入解析
+description: 完整解析 CAPI 所有 12+ 種 Webhook handler，涵蓋 Validating、Mutating 與 Conversion webhook 的運作原理、驗證規則與疑難排解。
+---
+
+# Webhooks 深入解析
+
+<Callout type="info" title="相關章節">
+- [API 版本轉換系統](/cluster-api/features/api-conversion)
+- [IPAM 子系統](/cluster-api/features/ipam-subsystem)
+- [MachineDrainRule Controller](/cluster-api/features/machinedrainrule)
+- [ClusterClass & Topology](/cluster-api/features/clusterclass-topology)
+</Callout>
+
+<Callout type="tip" title="本文適用對象">
+- 🟢 **初學者**：了解 Kubernetes admission webhook 的基本概念，以及為什麼 CAPI 需要這麼多 webhook
+- 🟡 **中階工程師**：掌握每個 CAPI 資源的關鍵驗證規則，學習常見的 webhook 錯誤診斷方法
+- 🔴 **資深工程師**：深入理解 conversion webhook 的 hub-spoke 模型，以及如何追蹤 webhook 驗證失敗的根本原因
+</Callout>
+
+> 📦 **類比**：CAPI webhook 就像機場的多道安全關卡。旅客（API 請求）在登機前必須通過行李掃描（validating webhook）、護照審查（更嚴格的業務規則驗證）。部分旅客還需要自動更新登機牌格式（mutating webhook）。最後，舊版護照（舊 API 版本）需透過轉換台（conversion webhook）轉換成新版格式。
+
+## Webhook 類型概覽
+
+Kubernetes admission webhook 分為三種類型：
+
+| 類型 | 說明 | 時機 |
+|------|------|------|
+| **Validating** | 驗證請求是否合法，可拒絕 | Create/Update/Delete |
+| **Mutating** | 修改請求物件（設定預設值） | Create/Update |
+| **Conversion** | 在不同 API 版本間轉換物件 | 任何存取舊版本時 |
+
+CAPI 的 webhook 實作位於 `internal/webhooks/` 目錄。
+
+## 所有 Webhook Handlers 一覽
+
+| 資源 | Mutating | Validating | 主要功能 |
+|------|----------|------------|---------|
+| `Cluster` | ✅ | ✅ | 設定預設值、驗證 topology/network 設定 |
+| `ClusterClass` | ✅ | ✅ | 驗證 ClusterClass 結構、patch 格式 |
+| `Machine` | ✅ | ✅ | 設定預設值、驗證 bootstrap/infrastructure 引用 |
+| `MachineSet` | ✅ | ✅ | 驗證 selector 一致性、drain 設定 |
+| `MachineDeployment` | ✅ | ✅ | 驗證 strategy、rollout 設定 |
+| `MachineDrainRule` | ❌ | ✅ | 驗證 drain behavior 與 order 的合法組合 |
+| `MachinePool` | ✅ | ✅ | 驗證 MachinePool 特有欄位 |
+| `MachineHealthCheck` | ✅ | ✅ | 驗證 unhealthyConditions、timeout |
+| `ClusterResourceSet` | ✅ | ✅ | 驗證 selector、strategy |
+| `ClusterResourceSetBinding` | ❌ | ✅ | 驗證 binding 的不可變性 |
+| `ExtensionConfig` | ✅ | ✅ | 驗證 RuntimeSDK extension 設定 |
+| `IPAddress` | ❌ | ✅ | 驗證 IP 格式、prefix、gateway；spec 不可變 |
+| `IPAddressClaim` | ✅ | ✅ | 驗證 poolRef 格式 |
+
+## Cluster Webhook
+
+### Mutating（設定預設值）
+
+```go
+// 來源：internal/webhooks/cluster.go
+func (webhook *Cluster) Default(ctx context.Context, obj *clusterv1.Cluster) error {
+    // 1. 設定 Cluster.Spec.Topology.Version 的預設值
+    // 2. 設定 Cluster.Spec.Paused = false（若未設定）
+    // 3. 傳播 Cluster.Spec.ClusterNetwork 預設值
+}
+```
+
+### Validating（驗證規則）
+
+| 規則 | 說明 |
+|------|------|
+| `spec.controlPlaneRef` 不可變 | 建立後無法更換 control plane 類型 |
+| `spec.infrastructureRef` 不可變 | 建立後無法更換 infrastructure provider |
+| ClusterClass 啟用時，topology.class 不可變 | 不能切換 ClusterClass |
+| 網路 CIDR 不重疊 | pod/service CIDR 不能重疊 |
+| Topology 啟用時，version 格式驗證 | 必須是有效的 semver |
+
+## Machine Webhook
+
+### Mutating（設定預設值）
+
+```go
+// 來源：internal/webhooks/machine.go
+func (webhook *Machine) Default(ctx context.Context, m *clusterv1.Machine) error {
+    // 1. 設定 Machine.Spec.Bootstrap.ConfigRef 的 namespace（與 Machine 相同）
+    // 2. 設定 Machine.Spec.InfrastructureRef 的 namespace
+    // 3. 設定 NodeDrainTimeout、NodeVolumeDetachTimeout 預設值
+}
+```
+
+### Validating（驗證規則）
+
+| 規則 | 說明 |
+|------|------|
+| `spec.clusterName` 不可變 | 建立後不能移動到其他 cluster |
+| `spec.bootstrap.configRef` 不可變 | 建立後不能更換 bootstrap provider |
+| `spec.infrastructureRef` 不可變 | 建立後不能更換 infrastructure |
+| `spec.version` 格式 | 必須是有效的 semver（若設定） |
+
+## MachineSet Webhook
+
+### Validating（驗證規則）
+
+| 規則 | 說明 |
+|------|------|
+| Selector 與 template labels 一致 | `spec.selector` 必須能選中 `spec.template.metadata.labels` |
+| Selector 不可變 | 建立後 selector 不能變更（避免孤兒 Machine） |
+| `spec.clusterName` 不可變 | 不能移動到其他 cluster |
+
+```yaml
+# 常見錯誤：selector 與 template labels 不一致
+spec:
+  selector:
+    matchLabels:
+      app: web      # ← 這裡
+  template:
+    metadata:
+      labels:
+        app: backend  # ← 與上面不匹配，webhook 會拒絕
+```
+
+## MachineDeployment Webhook
+
+### Validating（驗證規則）
+
+| 規則 | 說明 |
+|------|------|
+| Selector 與 template labels 一致 | 同 MachineSet |
+| Selector 不可變 | 同 MachineSet |
+| `spec.strategy.rollingUpdate` 格式 | MaxSurge/MaxUnavailable 不能同時為 0 |
+
+## MachineHealthCheck Webhook
+
+### Mutating（設定預設值）
+
+```go
+// NodeStartupTimeout 預設值
+if mhc.Spec.NodeStartupTimeout == nil {
+    mhc.Spec.NodeStartupTimeout = &metav1.Duration{Duration: 10 * time.Minute}
+}
+```
+
+### Validating（驗證規則）
+
+| 規則 | 說明 |
+|------|------|
+| `spec.selector` 不能選中所有 Machine | 必須有至少一個 label 限制 |
+| `spec.unhealthyConditions` 的 timeout | 不能為負值 |
+| `spec.clusterName` 與 selector namespace 一致 | |
+
+## ExtensionConfig Webhook
+
+ExtensionConfig 是 RuntimeSDK 的核心 CRD。Webhook 主要驗證：
+
+```go
+// 來源：internal/webhooks/extensionconfig.go
+func (webhook *ExtensionConfig) validate(ext *runtimev1.ExtensionConfig) error {
+    // 1. spec.clientConfig.url 與 spec.clientConfig.service 不能同時設定
+    // 2. service 設定時，namespace 和 name 不能為空
+    // 3. namespaceSelector 格式正確
+    // 4. settings 中的 key 格式符合 DNS subdomain 規則
+}
+```
+
+詳細的 RuntimeSDK 架構請參考 [RuntimeSDK Extension 架構](/cluster-api/features/runtimesdk-architecture)。
+
+## ClusterResourceSet Webhook
+
+### Validating（驗證規則）
+
+| 規則 | 說明 |
+|------|------|
+| `spec.clusterSelector` 不可變 | 建立後不能更換 selector |
+| `spec.strategy` 不可變 | `ApplyOnce` vs `Reconcile` 建立後不能改 |
+| Resources 引用的 Secret/ConfigMap 必須在同一 namespace | |
+
+詳細說明請參考 [AddOns & ClusterResourceSet](/cluster-api/features/addons-clusterresourceset)。
+
+## IPAddress Webhook
+
+### Validating（驗證規則）
+
+```go
+// 來源：internal/webhooks/ipaddress.go
+// 1. spec.address 必須是合法 IP（IPv4 或 IPv6）
+addr, err := netip.ParseAddr(ip.Spec.Address)
+
+// 2. prefix 範圍（IPv4: 0-32，IPv6: 0-128）
+
+// 3. gateway 必須是合法 IP（若設定）
+
+// 4. poolRef 必須與對應 IPAddressClaim 的 poolRef 一致
+
+// 5. spec 不可變（Update 時拒絕任何 spec 變更）
+if !equal {
+    return field.Forbidden("spec", "IPAddress spec is immutable")
+}
+```
+
+## Conversion Webhook
+
+Conversion webhook 負責在不同 API 版本間轉換 CAPI 資源，採用 **hub-spoke 模型**：
+
+```
+v1alpha3  ──────────╮
+v1alpha4  ──────────┤──→ v1beta2 (Hub) ←──┬── 所有操作使用 v1beta2 儲存
+v1beta1   ──────────╯                     │
+```
+
+每個非 hub 版本都需要實作 `ConvertTo()` 和 `ConvertFrom()` 方法：
+
+```go
+// 來源：api/core/v1beta1/cluster_conversion.go（示意）
+func (src *Cluster) ConvertTo(dstRaw conversion.Hub) error {
+    dst := dstRaw.(*v1beta2.Cluster)
+    // 將 v1beta1 欄位映射到 v1beta2
+    return Convert_v1beta1_Cluster_To_v1beta2_Cluster(src, dst, nil)
+}
+
+func (dst *Cluster) ConvertFrom(srcRaw conversion.Hub) error {
+    src := srcRaw.(*v1beta2.Cluster)
+    // 將 v1beta2 欄位映射到 v1beta1
+    return Convert_v1beta2_Cluster_To_v1beta1_Cluster(src, dst, nil)
+}
+```
+
+Conversion webhook 的詳細說明請參考 [API 版本轉換系統](/cluster-api/features/api-conversion)。
+
+## Webhook 錯誤診斷
+
+### 查看 Webhook 設定
+
+```bash
+# 列出所有 validating webhook
+kubectl get validatingwebhookconfigurations | grep capi
+
+# 查看 CAPI validating webhook 詳細設定
+kubectl describe validatingwebhookconfiguration capi-validating-webhook-configuration
+```
+
+### 常見錯誤及解決方法
+
+**錯誤 1：`admission webhook ... denied the request`**
+
+```bash
+# 查看詳細錯誤訊息
+kubectl describe machine my-machine -n default
+# 或從 kubectl apply 的輸出中直接取得
+
+# 常見原因：
+# - spec 不可變欄位被修改（e.g., spec.clusterName）
+# - selector 與 template labels 不一致
+# - 格式驗證失敗（e.g., 無效的 IP 位址）
+```
+
+**錯誤 2：`failed calling webhook: Post ... dial tcp ... i/o timeout`**
+
+```bash
+# webhook server 不可用
+# 檢查 CAPI controller pod 狀態
+kubectl get pods -n capi-system
+
+# 查看 webhook server 日誌
+kubectl logs -n capi-system deployment/capi-controller-manager | grep webhook
+```
+
+**錯誤 3：Conversion webhook 錯誤**
+
+```bash
+# 通常發生在 CAPI 升級後，API version 不匹配
+# 檢查是否有 conversion webhook 設定
+kubectl get crd clusters.cluster.x-k8s.io -o jsonpath='{.spec.conversion}'
+```
+
+### Webhook 回應碼含義
+
+| HTTP 狀態碼 | 含義 |
+|-------------|------|
+| 200（allowed=true） | 請求通過 |
+| 200（allowed=false） | 請求被拒絕（包含 reason） |
+| 500 | Webhook 內部錯誤 |
+| timeout | `failurePolicy=Fail` → 請求被拒絕；`failurePolicy=Ignore` → 請求通過 |
+
+<Callout type="info" title="failurePolicy=fail">
+CAPI 所有 webhook 都設定 `failurePolicy: fail`，這意味著若 webhook server 不可用，對應資源的操作**全部會失敗**。在升級或 CAPI 故障時要特別注意這一點。
+</Callout>
+
+## Webhook 安全設定
+
+CAPI webhook 使用以下安全設定：
+
+```yaml
+# webhook 宣告（從 kubebuilder 標記生成）
+# +kubebuilder:webhook:verbs=create;update,
+#   path=/validate-cluster-x-k8s-io-v1beta2-machine,
+#   mutating=false,
+#   failurePolicy=fail,
+#   matchPolicy=Equivalent,   # 新舊 API version 都觸發
+#   groups=cluster.x-k8s.io,
+#   resources=machines,
+#   versions=v1beta2,
+#   sideEffects=None,          # 無副作用
+#   admissionReviewVersions=v1
+```
+
+`matchPolicy=Equivalent` 確保即使 API 請求使用舊版本（如 v1beta1），webhook 仍會觸發。這對於 CAPI 的多版本支援至關重要。

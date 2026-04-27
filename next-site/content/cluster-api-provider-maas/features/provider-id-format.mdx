@@ -1,0 +1,241 @@
+---
+layout: doc
+title: Cluster API Provider MAAS — ProviderID 格式
+description: 解析 CAPM 的 ProviderID 格式 maas:///zone/system_id，以及它如何連結 Kubernetes Node 與實體機器。
+---
+
+# ProviderID 格式
+
+<Callout type="info" title="相關章節">
+- [Machine 服務實作](/cluster-api-provider-maas/features/machine-service-implementation)
+- [Scope 設計模式](/cluster-api-provider-maas/features/scope-pattern)
+- [Machine 生命週期](/cluster-api-provider-maas/features/machine-lifecycle)
+</Callout>
+
+<Callout type="tip" title="本文適用對象">
+- 🟢 **初學者**：了解 ProviderID 是什麼，以及為何每個 Kubernetes node 都需要一個。
+- 🟡 **中階工程師**：掌握 CAPM 設定 ProviderID 的時機與對應的欄位。
+- 🔴 **資深工程師**：分析 ProviderID 在 cloud-provider 整合與 node 識別中的作用，以及 SetNodeProviderID 的實作細節。
+</Callout>
+
+> 📦 **類比**：ProviderID 就像一個員工的工號——Kubernetes 知道節點的名稱（主機名），但工號（ProviderID）才是跟公司人事系統（MAAS）對應的唯一識別符，讓系統知道這個員工到底對應到哪台機器。
+
+## 什麼是 ProviderID
+
+`ProviderID` 是一個 URI 格式的字串，用於在 Kubernetes 中唯一識別一個 infrastructure provider 的機器實例。它存在於兩個地方：
+
+| 位置 | 路徑 | 說明 |
+|------|------|------|
+| `MaasMachine` | `spec.providerID` | CAPM 設定的 provider ID |
+| Kubernetes `Node` | `spec.providerID` | kubelet/cloud-provider 讀取的 provider ID |
+
+兩者必須一致，cloud-provider integration 才能正確運作。
+
+## CAPM 的 ProviderID 格式
+
+CAPM 產生的 ProviderID 格式為：
+
+```
+maas:///<availability-zone>/<system-id>
+```
+
+注意：格式是三斜線（`maas:///`），代表 host 部分為空，`<availability-zone>` 是路徑的第一段。
+
+### 實際範例
+
+```
+maas:///default/abc123de
+maas:///zone-a/xyz789fg
+maas:///rack-01/machine-deadbeef
+```
+
+| 部分 | 值 | 說明 |
+|------|-----|------|
+| `maas` | scheme | 固定前綴，識別 provider 類型 |
+| `///` | 空 host | RFC 3986 URI 格式，host 為空 |
+| `<zone>` | `default`, `zone-a` 等 | MAAS availability zone 名稱 |
+| `<system-id>` | `abc123de` | MAAS machine 的唯一系統 ID |
+
+## ProviderID 的設定時機
+
+ProviderID 在 `DeployMachine` 的 Allocate 成功後立即設定：
+
+```go
+// pkg/maas/machine/machine.go
+m, err = allocator.Allocate(ctx)
+if err != nil {
+    return nil, errors.Wrapf(err, "Unable to allocate machine")
+}
+
+// Allocate 成功後，立即設定 ProviderID
+s.scope.SetProviderID(m.SystemID(), m.Zone().Name())
+err = s.scope.PatchObject()
+if err != nil {
+    return nil, errors.Wrapf(err, "unable to patch machine with provider id")
+}
+```
+
+`SetProviderID` 的實作：
+
+```go
+// pkg/maas/scope/machine.go
+func (m *MachineScope) SetProviderID(systemID, availabilityZone string) {
+    providerID := fmt.Sprintf("maas:///%s/%s", availabilityZone, systemID)
+    m.MaasMachine.Spec.ProviderID = pointer.StringPtr(providerID)
+}
+```
+
+## ProviderID 的解析：GetInstanceID
+
+從 ProviderID 提取 systemID：
+
+```go
+// pkg/maas/scope/machine.go
+func (m *MachineScope) GetInstanceID() *string {
+    parsed, err := infrautil.NewProviderID(m.GetProviderID())
+    if err != nil {
+        m.Error(err, "failed to parse providerID", "providerID", m.GetProviderID())
+        return nil
+    }
+    return pointer.StringPtr(parsed.ID())
+}
+```
+
+`infrautil.NewProviderID` 負責解析 URI，提取路徑最後一段作為 systemID。
+
+## 同步 ProviderID 到 Kubernetes Node
+
+CAPM 需要將 `ProviderID` 從 `MaasMachine.Spec.ProviderID` 同步到遠端 cluster 的 `Node.Spec.ProviderID`：
+
+```go
+// pkg/maas/scope/machine.go
+func (m *MachineScope) SetNodeProviderID() error {
+    ctx := context.TODO()
+    // 取得遠端 cluster 的 API client
+    remoteClient, err := m.tracker.GetClient(ctx, util.ObjectKey(m.Cluster))
+    if err != nil {
+        return err
+    }
+
+    // 透過 hostname 找到對應的 Node 物件
+    node := &corev1.Node{}
+    if err := remoteClient.Get(ctx,
+        client.ObjectKey{Name: m.GetMachineHostname()}, node); err != nil {
+        return err
+    }
+
+    providerID := m.GetProviderID()
+    if node.Spec.ProviderID == providerID {
+        return nil  // 已是最新，跳過 patch
+    }
+
+    patchHelper, err := patch.NewHelper(node, remoteClient)
+    if err != nil {
+        return err
+    }
+
+    node.Spec.ProviderID = providerID
+    return patchHelper.Patch(ctx, node)
+}
+```
+
+### Node 查找邏輯
+
+節點是透過 MAAS machine 的 **hostname** 查找的：
+
+```go
+node := &corev1.Node{}
+remoteClient.Get(ctx, client.ObjectKey{Name: m.GetMachineHostname()}, node)
+```
+
+MAAS 部署完成後，machine 的 hostname 會成為 Kubernetes node 的名稱（由 `cloud-init` 設定）。
+
+## MaasMachine 中的相關欄位
+
+```go
+// api/v1beta1/maasmachine_types.go
+type MaasMachineSpec struct {
+    // ProviderID 儲存 maas:///zone/system_id 格式的字串
+    // +optional
+    ProviderID *string `json:"providerID,omitempty"`
+
+    // SystemID 是 MAAS machine 的系統 ID（短格式）
+    // +optional
+    SystemID *string `json:"systemID,omitempty"`
+
+    // FailureDomain 記錄 machine 所在的 zone
+    // +optional
+    FailureDomain *string `json:"failureDomain,omitempty"`
+    // ...
+}
+```
+
+| 欄位 | 格式 | 範例 |
+|------|------|------|
+| `ProviderID` | `maas:///<zone>/<systemID>` | `maas:///default/abc123` |
+| `SystemID` | 短格式 MAAS ID | `abc123` |
+| `FailureDomain` | zone 名稱 | `default` |
+
+## Kubernetes Node 的 ProviderID 用途
+
+設定到 Node 上的 ProviderID 有以下用途：
+
+| 用途 | 說明 |
+|------|------|
+| **Cloud Provider Integration** | cloud-controller-manager 用 ProviderID 識別對應的實體機器，管理 LoadBalancer、Route 等資源 |
+| **ClusterAPI 節點識別** | CAPI 透過 ProviderID 確認 Machine 物件與 Node 物件的對應關係 |
+| **RemoteClient 索引** | `remote.NodeProviderIDIndex` 在 controller cache 中建立 ProviderID 索引，加速查找 |
+
+## 使用 NodeProviderIDIndex
+
+在 `main.go` 中，CAPM 設定了 `NodeProviderIDIndex`：
+
+```go
+tracker, err := remote.NewClusterCacheTracker(
+    mgr,
+    remote.ClusterCacheTrackerOptions{
+        Log:     &log,
+        Indexes: []remote.Index{remote.NodeProviderIDIndex},
+    },
+)
+```
+
+這個 index 讓 controller 可以快速透過 ProviderID 找到對應的 Node，不需要 list all nodes。
+
+## 排除 ProviderID 未設定的問題
+
+### 症狀
+
+```bash
+# Node 的 ProviderID 是空的
+kubectl get node <node-name> -o jsonpath='{.spec.providerID}'
+# 輸出為空
+
+# MaasMachine 的 ProviderID 也是空的
+kubectl get maasmachine <name> -o jsonpath='{.spec.providerID}'
+# 輸出為空
+```
+
+### 診斷步驟
+
+```bash
+# 1. 確認 MaasMachine 的狀態
+kubectl describe maasmachine <name>
+
+# 2. 確認 MAAS machine 的 state
+# （需要查看 MaasMachine status.machineState）
+kubectl get maasmachine <name> -o jsonpath='{.status.machineState}'
+
+# 3. 查看 controller logs
+kubectl logs -n capmaas-system deploy/capmaas-controller-manager \
+  | grep -E "ProviderID|providerID|system-id"
+```
+
+### 常見原因
+
+| 原因 | 說明 | 解決方法 |
+|------|------|---------|
+| Allocate 尚未成功 | 無符合條件的 MAAS machine | 確認 MAAS 有 Ready 狀態的 machine |
+| PatchObject 失敗 | ProviderID 無法寫入 CRD | 查看 controller log，確認 RBAC 權限 |
+| Bootstrap data 未就緒 | cloud-init 尚未執行完成 | 等待 bootstrap 完成 |
+| Node hostname 不符 | MAAS hostname 與 Node name 不一致 | 確認 cloud-init 正確設定 hostname |

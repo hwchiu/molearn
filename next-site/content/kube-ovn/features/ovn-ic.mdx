@@ -1,0 +1,287 @@
+---
+layout: doc
+title: Kube-OVN — OVN Interconnect 跨 Cluster 互聯
+description: 透過 OVN-IC 將多個 Kubernetes cluster 在 L3 層級互聯，實現跨 cluster Pod 直接通訊
+---
+
+# OVN Interconnect 跨 Cluster 互聯
+
+<Callout type="info" title="相關章節">
+- [整體架構](/kube-ovn/features/architecture)
+- [VPC 與 Subnet 設計](/kube-ovn/features/vpc-subnet)
+- [BGP 整合](/kube-ovn/features/bgp)
+- [OVN 整合原理](/kube-ovn/features/ovn-integration)
+</Callout>
+
+<Callout type="tip" title="本文適用對象">
+- 🟢 **初學者**：了解什麼是 OVN-IC，以及為什麼需要跨 cluster 互聯
+- 🟡 **中階工程師**：掌握 OVN-IC 的 ConfigMap 設定與 Transit Subnet 配置
+- 🔴 **資深工程師**：深入理解 Availability Zone、ECMP gateway 冗餘與拓撲設計
+</Callout>
+
+> 📦 **類比**：OVN-IC 就像企業廣域網路（WAN）中的 MPLS L3 VPN——不同分公司（cluster）各自有獨立的內部路由，OVN-IC 擔任「中繼骨幹」讓各分公司的 Pod 可以直接以 IP 互通，無需 VPN tunnel 或 API Gateway 中轉。
+
+## 什麼是 OVN Interconnect
+
+在多 cluster 場景中，每個 Kube-OVN cluster 擁有獨立的 OVN 控制平面（ovn-central），彼此之間的 Pod 預設無法直接路由。OVN Interconnect（OVN-IC）是 OVN 原生的跨域互聯機制，透過一個共享的 **OVN-IC 資料庫**（IC-NB / IC-SB）協調多個 cluster 的路由資訊，讓跨 cluster 的 Pod 可以像在同一個 L3 網路中一樣互相存取。
+
+| 比較項目 | 傳統方案（Flannel + VPN）| OVN-IC |
+|---------|------------------------|--------|
+| 隧道協定 | IPsec / WireGuard（用戶空間）| OVN Geneve（kernel offload）|
+| 路由管理 | 手動或 BGP daemon | OVN-IC 自動同步 |
+| 設定複雜度 | 高 | 低（ConfigMap 驅動）|
+| 支援 ECMP | 需額外設定 | 內建 |
+| L3 隔離 | 難以細粒度控制 | 按 VPC / AZ 隔離 |
+
+## 架構元件
+
+OVN-IC 由以下四個關鍵元件組成：
+
+### 1. OVN-IC 資料庫（IC-NB / IC-SB）
+
+部署在獨立的節點或集中式節點上，是所有 cluster 共享的「路由資訊交換中心」：
+
+- **IC-NB（IC Northbound DB）**：接收每個 cluster 提交的 availability zone 資訊與路由宣告
+- **IC-SB（IC Southbound DB）**：儲存已協商完成的跨 cluster Logical Flow，各 cluster 的 `ovn-ic` daemon 從此讀取
+
+```
+┌─────────────────────────────────────────────────────┐
+│               OVN-IC DB Node（共享）                  │
+│   ┌─────────────┐        ┌─────────────┐             │
+│   │  ovn-ic-nb  │◄──────►│  ovn-ic-sb  │             │
+│   └─────────────┘        └─────────────┘             │
+└─────────────────────────────────────────────────────┘
+         ▲                            ▲
+         │                            │
+┌────────┴───────┐          ┌─────────┴──────┐
+│  Cluster A     │          │  Cluster B      │
+│  ovn-ic daemon │          │  ovn-ic daemon  │
+│  (AZ: az1)     │          │  (AZ: az2)      │
+└────────────────┘          └────────────────┘
+```
+
+### 2. ovn-ic Daemon
+
+每個 cluster 部署一個 `ovn-ic` 程序（通常以 Deployment 形式運行），它負責：
+
+- 連線至本地 OVN NB/SB DB 讀取本 cluster 的 logical network 資訊
+- 將本 cluster 的路由資訊上報到 IC-NB
+- 從 IC-SB 拉取其他 cluster 的路由，寫入本地 OVN NB DB
+
+### 3. Transit Switch
+
+每個 Availability Zone 在本地 OVN NB DB 中建立一個特殊的 **Transit Logical Switch**，其 IP 範圍來自專用的 Transit Subnet。Transit Switch 不屬於任何 Pod，僅用於跨 cluster 的 L3 路由「過境」。
+
+### 4. Availability Zone（AZ）
+
+每個 cluster 對應一個 AZ，AZ 名稱需全域唯一。AZ 是 OVN-IC 識別 cluster 的基本單位，路由策略以 AZ 為粒度進行控制。
+
+## 設定 OVN-IC
+
+### 步驟一：部署 OVN-IC 資料庫
+
+在共享節點（或 Kubernetes 叢集外的獨立 VM）上啟動 IC DB：
+
+```bash
+# 使用 Kube-OVN 提供的安裝腳本
+bash install-ic-db.sh --db-node-ips 10.0.100.1
+
+# 或以 Docker 手動啟動
+docker run -d --name ovn-ic-db \
+  --network host \
+  kubeovn/kube-ovn:v1.13.0 \
+  bash start-ic-db.sh
+```
+
+IC-NB 預設監聽 `6645` port，IC-SB 監聽 `6646` port。
+
+### 步驟二：在每個 Cluster 建立 `ovn-ic-config` ConfigMap
+
+```yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ovn-ic-config
+  namespace: kube-system
+data:
+  enable-ic: "true"               # 啟用 OVN-IC
+  az-name: "az1"                  # 本 cluster 的 AZ 名稱（全域唯一）
+  ic-db-address: "10.0.100.1"     # IC DB 節點 IP
+  ic-nb-port: "6645"              # IC-NB 埠號
+  ic-sb-port: "6646"              # IC-SB 埠號
+  auto-route: "true"              # 自動同步路由（推薦）
+  enable-ecmp: "false"            # 是否啟用 ECMP（多路由冗餘）
+  black-list: ""                  # 不宣告給其他 AZ 的 Subnet CIDR 列表
+```
+
+<Callout type="warning" title="AZ 名稱不可重複">
+`az-name` 一旦設定後不可修改（需重建 Transit Switch）。在多 cluster 環境中規劃時，建議使用有意義的命名，例如地理位置（`cn-north-1`）或環境（`prod-a`、`staging`）。
+</Callout>
+
+### 步驟三：部署 ovn-ic Deployment
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ovn-ic
+  namespace: kube-system
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: ovn-ic
+  template:
+    metadata:
+      labels:
+        app: ovn-ic
+    spec:
+      containers:
+      - name: ovn-ic
+        image: kubeovn/kube-ovn:v1.13.0
+        command: ["/kube-ovn/start-ic-controller.sh"]
+        env:
+        - name: POD_NAMESPACE
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.namespace
+        volumeMounts:
+        - name: host-run-ovn
+          mountPath: /var/run/ovn
+      volumes:
+      - name: host-run-ovn
+        hostPath:
+          path: /var/run/ovn
+```
+
+## Transit Subnet 配置
+
+Transit Subnet 是跨 cluster 路由的「橋接 IP 段」，不分配給任何 Pod，僅用於 OVN 內部路由計算。
+
+```yaml
+apiVersion: kubeovn.io/v1
+kind: Subnet
+metadata:
+  name: ovn-ic-transit
+spec:
+  protocol: IPv4
+  cidrBlock: 169.254.100.0/24   # RFC 5737 文件用 IP，或自定義私有段
+  provider: ovn-ic               # 特殊 provider，標識為 transit subnet
+  vlan: ""
+  natOutgoing: false
+  allowSubnets: []
+```
+
+<Callout type="info" title="Transit IP 不可與業務 Subnet 重疊">
+`169.254.x.x` 是常用的 Transit Subnet CIDR，確保此段不與任何業務 Pod subnet 或節點 IP 重疊，否則路由會發生衝突。
+</Callout>
+
+## 路由模式
+
+### 自動路由（Auto Route）
+
+當 `auto-route: "true"` 時，OVN-IC 自動將所有遠端 AZ 的 Subnet CIDR 注入本地 OVN Logical Router，實現「開箱即用」的跨 cluster 路由：
+
+```
+Cluster A Pod (10.16.0.5) → Cluster B Pod (10.17.0.8)
+路徑：10.16.0.5 → [Cluster A Gateway Node] → Transit Switch → [Cluster B Gateway Node] → 10.17.0.8
+```
+
+### 手動路由（Manual Route）
+
+設定 `auto-route: "false"`，搭配 `black-list` 精確控制哪些 subnet 可以被宣告：
+
+```yaml
+data:
+  auto-route: "false"
+  black-list: "10.16.100.0/24,10.16.200.0/24"  # 這兩段不宣告給其他 AZ
+```
+
+此模式適合需要精細路由策略的場景，例如：只允許特定 subnet 跨 cluster 通訊。
+
+## ECMP Gateway 冗餘
+
+當多個 Gateway Node 存在時，可啟用 ECMP（Equal-Cost Multi-Path）讓跨 cluster 流量分散到多個 Gateway，提升可用性：
+
+```yaml
+data:
+  enable-ecmp: "true"
+```
+
+ECMP 模式下，OVN 會為目標 AZ 的路由安裝多條等價路徑，流量依五元組 Hash 分配。若某 Gateway Node 故障，OVN 自動移除對應路徑。
+
+| ECMP 特性 | 說明 |
+|-----------|------|
+| 負載均衡方式 | 五元組 Hash（src IP + dst IP + protocol + src/dst port）|
+| 故障切換時間 | 取決於 BFD 探測間隔（預設 ~1s）|
+| 最大 Gateway 數量 | 無硬性限制，建議 ≤ 8 條以避免流表膨脹 |
+
+## 支援的拓撲
+
+### Hub-and-Spoke（中心輻射）
+
+```
+        ┌──────────────┐
+        │  Hub Cluster │
+        │  (az-hub)    │
+        └──────┬───────┘
+        ┌──────┴──────┐
+   ┌────┴────┐   ┌────┴────┐
+   │ Spoke A │   │ Spoke B │
+   │ (az-a)  │   │ (az-b)  │
+   └─────────┘   └─────────┘
+```
+
+Spoke cluster 只與 Hub 互聯，Spoke 之間不直接路由（流量需經 Hub 中轉）。適合管控嚴格的多租戶環境。
+
+### Full-Mesh（全網格）
+
+所有 cluster 互相宣告路由，任意兩個 cluster 的 Pod 可直接通訊。適合延遲敏感的微服務架構。
+
+```yaml
+# 每個 cluster 都連接到同一個 IC-DB，auto-route: true
+# OVN-IC 自動建立 N*(N-1)/2 條路由對
+```
+
+<Callout type="warning" title="Full-Mesh 規模限制">
+Full-Mesh 拓撲在 cluster 數量超過 10 個時，IC-DB 的路由資訊同步壓力顯著增加。大規模場景建議使用 Hub-and-Spoke 搭配選擇性路由宣告。
+</Callout>
+
+## 跨 Cluster 流量路徑詳解
+
+以 Cluster A（AZ: az1）的 Pod `10.16.0.5` 存取 Cluster B（AZ: az2）的 Pod `10.17.0.8` 為例：
+
+| 步驟 | 位置 | 動作 |
+|------|------|------|
+| 1 | Cluster A Node | Pod 發出封包，目的地 10.17.0.8 |
+| 2 | Cluster A OVS | 查詢 Logical Flow，匹配 az2 路由，轉發至 Gateway Node |
+| 3 | Cluster A Gateway | 封包通過 Transit Switch Port，Geneve 封裝，傳送到 Cluster B Gateway |
+| 4 | Cluster B Gateway | 解封裝，查詢本地 Logical Flow，轉發到目標 Node |
+| 5 | Cluster B Node | 封包送達 Pod 10.17.0.8 |
+
+整個路徑為純 L3 路由，無需 IPIP/VXLAN 疊加，OVN 的 Geneve 隧道在 OVS kernel module 層處理，效能優於用戶空間 VPN。
+
+## 常見問題排查
+
+```bash
+# 查看 IC-NB 中的 AZ 資訊
+ovn-ic-nbctl show
+
+# 查看本 cluster 的 Transit Switch
+ovn-nbctl show | grep transit
+
+# 確認跨 cluster 路由是否已注入
+ovn-nbctl lr-route-list ovn-cluster
+
+# 測試跨 cluster 連通性
+kubectl exec -n test pod-a -- ping 10.17.0.8
+
+# 查看 ovn-ic daemon 日誌
+kubectl logs -n kube-system deployment/ovn-ic -f
+```
+
+## 安全考量
+
+- **網路分隔**：預設所有 Subnet 都會宣告給其他 AZ，使用 `black-list` 限制敏感 subnet
+- **IC-DB 存取控制**：IC DB 節點應只開放 6645/6646 埠給 cluster Gateway Node
+- **Encryption**：OVN-IC 本身不加密流量，跨 cluster 流量加密需搭配 IPsec 或節點層級 WireGuard

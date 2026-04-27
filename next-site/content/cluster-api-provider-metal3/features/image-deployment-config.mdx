@@ -1,0 +1,342 @@
+---
+layout: doc
+title: Cluster API Provider Metal3 — 映像與部署配置
+description: 說明 Metal3Machine 的 Image 結構設定，包含格式、checksum 類型、userData、metaData、networkData 的完整用法
+---
+
+# 映像與部署配置
+
+<Callout type="info" title="相關章節">
+- [磁碟清理策略](/cluster-api-provider-metal3/features/disk-cleaning-strategy)
+- [Ironic 整合原理](/cluster-api-provider-metal3/features/ironic-integration)
+- [Metal3DataClaim 工作流](/cluster-api-provider-metal3/features/data-claim-workflow)
+- [Data Templates 機制](/cluster-api-provider-metal3/features/data-templates)
+</Callout>
+
+<Callout type="tip" title="本文適用對象">
+- 🟢 **初學者**：了解如何設定一個最小可用的 Metal3Machine image 設定
+- 🟡 **中階工程師**：掌握 checksum 類型選擇、多種 image 格式的差異，以及三種 data 注入方式
+- 🔴 **資深工程師**：了解 Ironic 如何使用這些參數，以及 configdrive 的建構方式
+</Callout>
+
+> 📦 **類比**：Metal3Machine 的 image 設定就像「安裝光碟的規格書」——你需要告訴 Ironic 去哪裡取得安裝檔（URL）、如何驗證它沒有損毀（checksum）、以及安裝後要執行哪些初始設定腳本（userData、metaData、networkData）。
+
+## Image 結構定義
+
+Metal3Machine 的 `spec.image` 欄位使用共用的 `Image` 結構（定義於 `api/v1beta1/common_types.go`）：
+
+```go
+// Image holds the details of an image to use during provisioning.
+type Image struct {
+    // URL is a location of an image to deploy.
+    URL string `json:"url"`
+
+    // Checksum is a md5sum, sha256sum or sha512sum value or a URL to retrieve one.
+    Checksum string `json:"checksum"`
+
+    // ChecksumType is the checksum algorithm for the image.
+    // +kubebuilder:validation:Enum=md5;sha256;sha512
+    ChecksumType *string `json:"checksumType,omitempty"`
+
+    // DiskFormat contains the image disk format.
+    // +kubebuilder:validation:Enum=raw;qcow2;vdi;vmdk;live-iso
+    DiskFormat *string `json:"format,omitempty"`
+}
+```
+
+## 完整 Image 設定範例
+
+```yaml
+apiVersion: infrastructure.cluster.x-k8s.io/v1beta1
+kind: Metal3Machine
+metadata:
+  name: worker-machine-0
+  namespace: metal3
+spec:
+  image:
+    url: "http://192.168.0.100/images/ubuntu-22.04-server-cloudimg-amd64.img"
+    checksum: "sha256:3f7c58cd6c3e7d1e1c2f3a4b5c6d7e8f..."
+    checksumType: sha256
+    format: qcow2
+```
+
+## URL 欄位
+
+`url` 是 image 的下載來源，Ironic 的 deploy ramdisk 會從此 URL 下載 image 並寫入目標磁碟。
+
+支援的 URL 協定：
+
+| 協定 | 範例 | 說明 |
+|------|------|------|
+| HTTP | `http://192.168.0.100/images/ubuntu.img` | 內部 HTTP 伺服器（速度快） |
+| HTTPS | `https://storage.example.com/ubuntu.img` | 加密傳輸（需要 Ironic 信任憑證） |
+| Swift | `swift://container/object` | OpenStack Swift 物件儲存 |
+| FTP | `ftp://ftp.example.com/images/ubuntu.img` | 較少使用 |
+
+<Callout type="tip" title="效能建議">
+建議將 image 放在與 Ironic 同網段的本地 HTTP 伺服器。下載速度直接影響 provisioning 時間。1GB image 透過 1Gbps 網路大約需要 10-15 秒傳輸，但透過低速管理網路可能需要數分鐘。
+</Callout>
+
+## Checksum 欄位
+
+### checksum 值格式
+
+`checksum` 支援兩種格式：
+
+```yaml
+# 格式一：直接提供 checksum 字串
+checksum: "3f7c58cd6c3e7d1e1c2f3a4b5c6d7e8f9a0b1c2d3e4f5a6b7c8d9e0f1a2b3c"
+
+# 格式二：提供一個 URL，Ironic 會從該 URL 下載 checksum 檔案
+checksum: "http://192.168.0.100/images/ubuntu-22.04.sha256"
+```
+
+checksum 檔案的格式（與 `sha256sum` 指令輸出相容）：
+
+```
+3f7c58cd6c3e7d1e1c2f3a4b5c6d7e8f  ubuntu-22.04-server-cloudimg-amd64.img
+```
+
+### checksumType 枚舉值
+
+| checksumType | 演算法 | 長度 | 建議使用場景 |
+|-------------|--------|------|------------|
+| `md5` | MD5 | 32 hex 字元 | 舊系統相容（不推薦新系統） |
+| `sha256` | SHA-256 | 64 hex 字元 | 標準建議值，安全與速度兼顧 |
+| `sha512` | SHA-512 | 128 hex 字元 | 最高安全性要求 |
+| 未設定 | 自動偵測 | — | Ironic 根據字串長度自動判斷 |
+
+```bash
+# 本地生成 checksum
+sha256sum ubuntu-22.04-server-cloudimg-amd64.img
+# 輸出: 3f7c58cd... ubuntu-22.04-server-cloudimg-amd64.img
+
+# 或使用 URL 方式（官方 Ubuntu 提供）
+# checksum: "https://cloud-images.ubuntu.com/releases/22.04/release/SHA256SUMS"
+```
+
+## 支援的 Image 格式
+
+### raw 格式
+
+```yaml
+format: raw
+```
+
+- 原始磁碟 image（dd 格式）
+- 可直接寫入磁碟，無需轉換
+- 檔案大小最大（等於磁碟容量）
+- 傳輸和寫入速度最快（特別是 SSD/NVMe）
+
+### qcow2 格式
+
+```yaml
+format: qcow2
+```
+
+- QEMU Copy-On-Write 格式
+- 稀疏檔案（sparse file），實際大小遠小於磁碟容量
+- 需要轉換成 raw 再寫入（Ironic 內部處理）
+- 最常見的 cloud image 格式（Ubuntu、CentOS 等官方 cloud image）
+
+### live-iso 格式
+
+```yaml
+format: live-iso
+# 注意：live-iso 不需要 checksum
+```
+
+特殊的 ISO 格式，機器從 virtual media（虛擬光碟）啟動，不會寫入磁碟。適用場景：
+- 臨時性診斷工具
+- 網路重啟環境（Rescue OS）
+- 不需要持久化的計算節點
+
+<Callout type="warning" title="live-iso 的限制">
+使用 `live-iso` 時，機器重啟後會重新從 ISO 啟動，所有 userspace 變更都會遺失。此格式需要 Ironic 支援 Virtual Media（Redfish 虛擬媒體）。
+</Callout>
+
+### 格式比較
+
+| 格式 | 典型大小 | 寫入速度 | 持久性 | 支援壓縮 |
+|------|----------|----------|--------|----------|
+| raw | 10-50 GB | 最快 | ✅ | ❌（需額外壓縮） |
+| qcow2 | 1-5 GB | 較慢 | ✅ | ✅（內建） |
+| live-iso | 0.5-2 GB | 不寫磁碟 | ❌ | — |
+
+## UserData：Cloud-init 設定注入
+
+`userData` 是一個 Kubernetes Secret 的引用，內容通常是 cloud-init 設定：
+
+```yaml
+spec:
+  userData:
+    name: worker-machine-0-userdata   # Secret 名稱
+    namespace: metal3                  # Secret 所在 namespace
+```
+
+### UserData Secret 內容
+
+```yaml
+apiVersion: v1
+kind: Secret
+metadata:
+  name: worker-machine-0-userdata
+  namespace: metal3
+type: Opaque
+data:
+  # key 必須是 "value"
+  value: <base64 encoded cloud-init>
+```
+
+cloud-init 設定範例（解碼後）：
+
+```yaml
+#cloud-config
+users:
+  - name: ubuntu
+    shell: /bin/bash
+    sudo: ALL=(ALL) NOPASSWD:ALL
+    ssh_authorized_keys:
+      - ssh-rsa AAAAB3NzaC1yc2E... admin@example.com
+
+package_update: true
+packages:
+  - curl
+  - wget
+
+runcmd:
+  # kubeadm join 指令（由 CAPI bootstrap provider 自動生成）
+  - kubeadm join 192.168.0.100:6443 \
+      --token abcdef.0123456789abcdef \
+      --discovery-token-ca-cert-hash sha256:...
+```
+
+<Callout type="info" title="UserData 通常由 CAPI 自動管理">
+在實際的 CAPI 部署中，不需要手動建立 userdata Secret。CAPI 的 bootstrap provider（如 KubeadmConfigTemplate）會自動生成 bootstrap data Secret，CAPM3 會將其引用到 `userData` 欄位。
+</Callout>
+
+## MetaData：實例 Metadata 注入
+
+`metaData` 注入到 cloud-init 的 `meta-data` 檔案：
+
+```yaml
+spec:
+  metaData:
+    name: worker-machine-0-metadata
+    namespace: metal3
+```
+
+MetaData Secret 的 `value` key 包含 JSON 格式的 metadata：
+
+```json
+{
+  "local-hostname": "worker-2",
+  "instance-id": "worker-machine-0",
+  "availability-zone": "rack-1"
+}
+```
+
+Cloud-init 會將這些值提供給 `cloud-init query` 和各模組使用。
+
+## NetworkData：網路設定注入
+
+`networkData` 控制機器啟動後的網路設定，採用 Nmstate YAML 或 cloud-init network-config v2 格式：
+
+```yaml
+spec:
+  networkData:
+    name: worker-machine-0-networkdata
+    namespace: metal3
+```
+
+NetworkData Secret 的內容範例（Nmstate 格式）：
+
+```yaml
+# Secret value（base64 decoded）
+version: 2
+ethernets:
+  eno1:
+    match:
+      macaddress: "00:11:22:33:44:55"
+    addresses:
+      - "192.168.1.12/24"
+    gateway4: "192.168.1.1"
+    nameservers:
+      addresses:
+        - "8.8.8.8"
+        - "8.8.4.4"
+bonds:
+  bond0:
+    interfaces:
+      - eno2
+      - eno3
+    parameters:
+      mode: active-backup
+    addresses:
+      - "10.0.0.12/24"
+```
+
+## Data 注入優先順序
+
+有三種方式可以提供 metaData 和 networkData：
+
+| 方式 | 設定位置 | 優先順序 |
+|------|----------|---------|
+| 直接指定 Secret | `Metal3Machine.Spec.MetaData` / `Spec.NetworkData` | 最高 |
+| 透過 DataTemplate | `Metal3Machine.Spec.DataTemplate` → Metal3DataClaim → Metal3Data | 次之（自動生成，含 IP 分配等） |
+
+若同時設定了 `DataTemplate` 和直接 Secret，以直接指定的 Secret 為準（Metal3DataTemplate 中定義的 metadataTemplate keys 優先於 metadata field，但直接 Secret 完全覆蓋）。
+
+## 實際設定範例：完整 Metal3Machine
+
+```yaml
+apiVersion: infrastructure.cluster.x-k8s.io/v1beta1
+kind: Metal3Machine
+metadata:
+  name: worker-machine-0
+  namespace: metal3
+spec:
+  # Image 設定
+  image:
+    url: "http://192.168.0.100/images/ubuntu-22.04-server.qcow2"
+    checksum: "sha256:3f7c58cd6c3e7d1e1c2f3a4b5c6d7e8f"
+    checksumType: sha256
+    format: qcow2
+
+  # DataTemplate 自動生成 metaData 和 networkData
+  dataTemplate:
+    name: worker-data-template
+    namespace: metal3
+
+  # UserData（由 CAPI bootstrap provider 填入）
+  userData:
+    name: worker-machine-0-userdata
+    namespace: metal3
+
+  # Host 選擇條件
+  hostSelector:
+    matchLabels:
+      environment: production
+
+  # 磁碟清理策略
+  automatedCleaningMode: metadata
+
+  # Failure domain
+  failureDomain: zone-a
+```
+
+## 驗證 Image 設定
+
+```bash
+# 測試 image URL 是否可達
+curl -I http://192.168.0.100/images/ubuntu-22.04-server.qcow2
+
+# 驗證 checksum
+wget http://192.168.0.100/images/ubuntu-22.04-server.qcow2
+sha256sum ubuntu-22.04-server.qcow2
+# 確認輸出與 spec.image.checksum 一致
+
+# 查看 BMH 上設定的 image（確認 CAPM3 已正確更新）
+kubectl get baremetalhost worker-host-01 -n metal3 \
+  -o jsonpath='{.spec.image}' | jq .
+```

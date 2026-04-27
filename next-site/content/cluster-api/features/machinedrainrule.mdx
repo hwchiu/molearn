@@ -1,0 +1,324 @@
+---
+layout: doc
+title: Cluster API — MachineDrainRule Controller
+description: 深入解析 MachineDrainRule CRD，學習如何透過 drain 規則精細控制 Machine 刪除時的 node drain 行為，保護資料庫 Pod 或跳過 DaemonSet。
+---
+
+# MachineDrainRule Controller
+
+<Callout type="info" title="相關章節">
+- [Machine 生命週期](/cluster-api/features/machine-lifecycle)
+- [Machine Health Check](/cluster-api/features/machine-health-check)
+- [Webhooks 深入解析](/cluster-api/features/webhooks-deepdive)
+- [API Cluster & Machine](/cluster-api/features/api-cluster-machine)
+</Callout>
+
+<Callout type="tip" title="本文適用對象">
+- 🟢 **初學者**：了解什麼是 node drain，以及為什麼需要客製化 drain 行為
+- 🟡 **中階工程師**：掌握 MachineDrainRule 的 selector 機制，學習如何為不同工作負載設定 drain 策略
+- 🔴 **資深工程師**：深入理解 drain 順序（order）控制、WaitCompleted 語義，以及與 Machine controller 的整合細節
+</Callout>
+
+> 📦 **類比**：MachineDrainRule 就像大樓疏散計畫的特殊指示。疏散時（Machine 刪除），一般人員（普通 Pod）正常疏散，但資料中心（資料庫 Pod）的員工必須先完成數據備份才能離開（WaitCompleted），而保全人員（DaemonSet）則直接跳過疏散流程（Skip）繼續值班。
+
+## 什麼是 MachineDrainRule
+
+當 CAPI 刪除一台 Machine 時，會先對對應的 Kubernetes node 執行 **drain** 操作：將 node 上的所有 Pod 驅逐（evict）到其他 node 後，才繼續刪除 Machine。
+
+預設的 drain 行為對所有 Pod 一視同仁，但真實環境中往往需要：
+
+- **跳過某些 Pod 的 drain**（例如：DaemonSet Pod 無法調度到其他地方）
+- **等待某些 Pod 自然完成**（例如：Batch Job 不應被強制驅逐）
+- **控制 drain 的順序**（例如：先驅逐應用 Pod，再驅逐儲存元件）
+
+`MachineDrainRule` 就是為解決這些需求而設計的 CRD。
+
+## CRD 結構
+
+```yaml
+apiVersion: cluster.x-k8s.io/v1beta2
+kind: MachineDrainRule
+metadata:
+  name: skip-daemonsets
+  namespace: default
+spec:
+  # drain 行為設定
+  drain:
+    behavior: Skip        # Drain | Skip | WaitCompleted
+    order: 0              # 僅 behavior=Drain 時有效
+
+  # 要套用此規則的 Machines（可省略，表示套用至所有 Machine）
+  machines:
+  - selector:
+      matchExpressions:
+      - key: cluster.x-k8s.io/control-plane
+        operator: Exists
+  - selector:
+      matchLabels:
+        os: linux
+    clusterSelector:
+      matchLabels:
+        stage: production
+
+  # 要套用此規則的 Pods（可省略，表示套用至所有 Pod）
+  pods:
+  - selector:
+      matchLabels:
+        app: prometheus
+    namespaceSelector:
+      matchLabels:
+        kubernetes.io/metadata.name: monitoring
+```
+
+### spec.drain 欄位
+
+| 欄位 | 型別 | 說明 |
+|------|------|------|
+| `drain.behavior` | string（必填） | 驅逐行為：`Drain`、`Skip`、`WaitCompleted` |
+| `drain.order` | int32（可選） | 驅逐順序，僅 `behavior=Drain` 時有效，預設 0 |
+
+### Drain Behavior 語義
+
+| Behavior | 說明 |
+|----------|------|
+| `Drain` | 正常驅逐 Pod。可透過 `order` 控制驅逐順序 |
+| `Skip` | 完全跳過這些 Pod，不驅逐也不等待 |
+| `WaitCompleted` | 不驅逐 Pod，但等待 Pod 自然終止（適合 Batch Job）。`order` 強制為 0 |
+
+<Callout type="warning" title="Webhook 驗證規則">
+當 `behavior` 為 `Skip` 或 `WaitCompleted` 時，**不可**設定 `order` 欄位。嘗試這樣做會被 admission webhook 拒絕，錯誤訊息為：`order must not be set if drain behavior is "Skip" or "WaitCompleted"`。
+</Callout>
+
+### spec.machines 欄位
+
+`machines` 定義此規則套用到哪些 Machine，是一個 selector 陣列（OR 關係）：
+
+```go
+// 來源：api/core/v1beta2/machinedrainrules_types.go
+type MachineDrainRuleMachineSelector struct {
+    // selector：依 Machine 的 label 選取（空表示全選）
+    Selector *metav1.LabelSelector `json:"selector,omitempty"`
+
+    // clusterSelector：依 Cluster 的 label 過濾（空表示不限 Cluster）
+    ClusterSelector *metav1.LabelSelector `json:"clusterSelector,omitempty"`
+}
+```
+
+- 若 `machines` 未設定，此規則套用至 namespace 中**所有** Machine
+- 陣列中多個 selector 之間為 **OR** 關係
+- 單一 selector 內 `selector` 與 `clusterSelector` 為 **AND** 關係
+- 最多可設定 32 個 selector
+
+### spec.pods 欄位
+
+`pods` 定義此規則套用到哪些 Pod：
+
+```go
+type MachineDrainRulePodSelector struct {
+    // selector：依 Pod 的 label 選取（空表示全選）
+    Selector *metav1.LabelSelector `json:"selector,omitempty"`
+
+    // namespaceSelector：依 Namespace 的 label 過濾（空表示全 namespace）
+    NamespaceSelector *metav1.LabelSelector `json:"namespaceSelector,omitempty"`
+}
+```
+
+## Drain 順序控制
+
+當有多條 `behavior=Drain` 的規則且 `order` 值不同時，CAPI 會依序執行 drain：
+
+```
+order: -100  → 最先被驅逐的 Pod group
+order: 0     → 預設順序（未設定 order 的 Pod）
+order: 100   → 較晚被驅逐的 Pod group
+```
+
+CAPI 會**等待較低 order 的所有 Pod 完全從 node 移除後**，才開始驅逐下一個 order group。
+
+```yaml
+# 範例：先驅逐應用 Pod（order=0），再驅逐儲存相關 Pod（order=100）
+---
+apiVersion: cluster.x-k8s.io/v1beta2
+kind: MachineDrainRule
+metadata:
+  name: storage-drain-last
+spec:
+  drain:
+    behavior: Drain
+    order: 100
+  pods:
+  - selector:
+      matchLabels:
+        tier: storage
+```
+
+## Pod Label 優先順序
+
+除了 `MachineDrainRule` CRD，CAPI 也支援直接在 **workload cluster 的 Pod** 上設定 label：
+
+```yaml
+# 在 Pod 上設定（優先於 MachineDrainRule）
+metadata:
+  labels:
+    cluster.x-k8s.io/drain: "skip"         # 跳過 drain
+    # 或
+    cluster.x-k8s.io/drain: "wait-completed"  # 等待完成
+```
+
+<Callout type="info" title="Label 優先於 Rule">
+Pod 上的 `cluster.x-k8s.io/drain` label **優先**於 management cluster 中的 `MachineDrainRule`。這讓 workload 開發者可以自主控制 Pod 的 drain 行為，而不需要修改 management cluster 的規則。
+</Callout>
+
+## Webhook 驗證
+
+MachineDrainRule 使用純驗證 webhook（無 mutation）：
+
+```go
+// 來源：internal/webhooks/machinedrainrules.go
+func (webhook *MachineDrainRule) validate(newMDR *clusterv1.MachineDrainRule) error {
+    var allErrs field.ErrorList
+
+    // 規則 1：Skip 或 WaitCompleted 不能設定 order
+    if newMDR.Spec.Drain.Behavior == Skip || newMDR.Spec.Drain.Behavior == WaitCompleted {
+        if newMDR.Spec.Drain.Order != nil {
+            // 拒絕
+        }
+    }
+
+    // 規則 2：驗證所有 selector 格式合法
+    allErrs = append(allErrs, ValidateMachineDrainRulesSelectors(newMDR)...)
+}
+```
+
+Selector 驗證（`ValidateMachineDrainRulesSelectors`）是一個 exported 函數，Machine controller 在 drain 時也會呼叫它來驗證 selector 的合法性。
+
+## 實際使用範例
+
+### 範例 1：跳過 DaemonSet Pod
+
+```yaml
+apiVersion: cluster.x-k8s.io/v1beta2
+kind: MachineDrainRule
+metadata:
+  name: skip-daemonsets
+  namespace: default
+spec:
+  drain:
+    behavior: Skip
+  pods:
+  - selector:
+      matchExpressions:
+      - key: app.kubernetes.io/managed-by
+        operator: In
+        values:
+        - DaemonSet
+```
+
+<Callout type="info" title="DaemonSet 的特殊情況">
+DaemonSet Pod 通常無法被調度到其他 node，因此 drain 時無法真正驅逐它們。使用 `Skip` 可以避免 drain 因 DaemonSet Pod 而卡住。
+</Callout>
+
+### 範例 2：保護資料庫 Pod（WaitCompleted）
+
+```yaml
+apiVersion: cluster.x-k8s.io/v1beta2
+kind: MachineDrainRule
+metadata:
+  name: wait-for-db
+  namespace: default
+spec:
+  drain:
+    behavior: WaitCompleted
+  pods:
+  - selector:
+      matchLabels:
+        app: postgres
+    namespaceSelector:
+      matchLabels:
+        kubernetes.io/metadata.name: database
+```
+
+### 範例 3：特定 cluster 的 control plane 優先驅逐
+
+```yaml
+apiVersion: cluster.x-k8s.io/v1beta2
+kind: MachineDrainRule
+metadata:
+  name: control-plane-drain-order
+  namespace: default
+spec:
+  drain:
+    behavior: Drain
+    order: -100   # 最先驅逐
+  machines:
+  - selector:
+      matchExpressions:
+      - key: cluster.x-k8s.io/control-plane
+        operator: Exists
+    clusterSelector:
+      matchLabels:
+        environment: staging
+```
+
+### 範例 4：Batch Job 等待完成
+
+```yaml
+apiVersion: cluster.x-k8s.io/v1beta2
+kind: MachineDrainRule
+metadata:
+  name: wait-batch-jobs
+  namespace: default
+spec:
+  drain:
+    behavior: WaitCompleted
+  pods:
+  - selector:
+      matchExpressions:
+      - key: batch.kubernetes.io/job-name
+        operator: Exists
+```
+
+## 與 Machine 生命週期的關係
+
+MachineDrainRule 在 Machine 刪除流程中的位置：
+
+```
+Machine 標記為刪除（DeletionTimestamp 設定）
+         │
+         ▼
+Machine controller 開始 drain 流程
+         │
+         ▼
+收集所有符合條件的 MachineDrainRules
+         │
+         ▼
+依 order 分組，執行 drain
+  - Skip：跳過對應 Pod
+  - WaitCompleted：等待 Pod 自然終止
+  - Drain：按 order 順序驅逐
+         │
+         ▼
+所有 Pod 處理完畢（或超時）
+         │
+         ▼
+Node 刪除 → Machine 繼續刪除流程
+```
+
+更多 Machine 刪除細節請參考 [Machine 生命週期](/cluster-api/features/machine-lifecycle)。
+
+## 疑難排解
+
+```bash
+# 查看所有 MachineDrainRule
+kubectl get machinedrainrules -n default
+
+# 查看特定規則的詳細設定
+kubectl describe machinedrainrule skip-daemonsets -n default
+
+# 確認 Machine drain 狀態（在 Machine 物件上）
+kubectl get machine my-machine -o jsonpath='{.status.conditions}' | jq '.[] | select(.type=="Draining")'
+```
+
+<Callout type="warning" title="Namespace 範圍">
+`MachineDrainRule` 是 namespace-scoped 的資源。它只會影響同一個 namespace 中的 Machine，即使 `machines` 欄位未設定 clusterSelector 也不會跨 namespace 生效。
+</Callout>

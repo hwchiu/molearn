@@ -1,0 +1,300 @@
+---
+layout: doc
+title: Cluster API — IPAM 子系統
+description: 深入解析 Cluster API 的 IP Address Management 子系統，涵蓋 IPAddress/IPAddressClaim CRD、API 版本演進、生命週期與 Webhook 驗證。
+---
+
+# IPAM 子系統
+
+<Callout type="info" title="相關章節">
+- [架構總覽](/cluster-api/features/architecture)
+- [Provider Contracts & Runtime Hooks](/cluster-api/features/provider-contracts-runtime-hooks)
+- [Webhooks 深入解析](/cluster-api/features/webhooks-deepdive)
+- [API 版本轉換系統](/cluster-api/features/api-conversion)
+</Callout>
+
+<Callout type="tip" title="本文適用對象">
+- 🟢 **初學者**：了解什麼是 IPAM、為什麼 Kubernetes 裡的機器需要 IP 位址管理
+- 🟡 **中階工程師**：掌握 IPAddress 與 IPAddressClaim 的 CRD 結構，以及與 infrastructure provider 的整合方式
+- 🔴 **資深工程師**：深入理解 IPAM webhook 驗證邏輯、API 版本轉換路徑，以及如何撰寫自訂 IPAM provider
+</Callout>
+
+> 📦 **類比**：IPAM 子系統就像一間旅館的房間分配系統。旅客（infrastructure provider）提出入住申請（IPAddressClaim），旅館管理員（IPAM provider）從空房清單（IP Pool）分配一個房間（IPAddress）並回填房號給旅客。旅客退房（Machine 刪除）後，房間自動釋出。
+
+## 什麼是 IPAM 子系統
+
+IPAM（IP Address Management）子系統是 Cluster API 為 bare-metal 及需要靜態 IP 的 infrastructure provider 設計的 IP 位址管理框架。
+
+在雲端環境中，IP 位址通常由雲端平台自動分配。但在 bare-metal 或私有雲場景中，機器需要事先指定 IP 位址，這時就需要 IPAM 子系統：
+
+- **Infrastructure providers**（如 Metal3、MAAS）建立 `IPAddressClaim` 來請求 IP 位址
+- **IPAM providers**（如 InClusterIPAM、Metal3 IPAM）監聽 `IPAddressClaim` 並從 IP Pool 分配，建立 `IPAddress` 物件
+- Infrastructure provider 在 `IPAddressClaim.status.addressRef` 有值後，取得 IP 位址並設定到機器上
+
+## CRD 結構
+
+### IPAddressClaim
+
+`IPAddressClaim` 是 infrastructure provider 用來**請求** IP 位址的資源。
+
+```yaml
+apiVersion: ipam.cluster.x-k8s.io/v1beta2
+kind: IPAddressClaim
+metadata:
+  name: my-machine-0
+  namespace: default
+  ownerReferences:
+  - apiVersion: infrastructure.cluster.x-k8s.io/v1beta1
+    kind: Metal3Machine
+    name: my-machine
+spec:
+  clusterName: my-cluster
+  poolRef:
+    apiGroup: ipam.cluster.x-k8s.io
+    kind: InClusterIPPool
+    name: my-ip-pool
+status:
+  addressRef:
+    name: my-machine-0       # 由 IPAM provider 填入
+  conditions:
+  - type: Ready
+    status: "True"
+```
+
+| 欄位 | 說明 |
+|------|------|
+| `spec.clusterName` | 此 IPAddressClaim 所屬的 cluster 名稱（可選） |
+| `spec.poolRef.apiGroup` | IP Pool 的 API group |
+| `spec.poolRef.kind` | IP Pool 的 kind（由 IPAM provider 定義） |
+| `spec.poolRef.name` | IP Pool 的名稱 |
+| `status.addressRef.name` | 分配成功後，指向所建立的 `IPAddress` 名稱 |
+| `status.conditions` | Ready condition：`AllocationFailed`、`PoolNotReady`、`PoolExhausted` |
+
+### IPAddress
+
+`IPAddress` 是 IPAM provider **建立**的資源，代表一個已分配的 IP 位址。
+
+```yaml
+apiVersion: ipam.cluster.x-k8s.io/v1beta2
+kind: IPAddress
+metadata:
+  name: my-machine-0
+  namespace: default
+  ownerReferences:
+  - apiVersion: ipam.cluster.x-k8s.io/v1beta2
+    kind: IPAddressClaim
+    name: my-machine-0
+spec:
+  address: "192.168.1.100"
+  prefix: 24
+  gateway: "192.168.1.1"
+  claimRef:
+    name: my-machine-0
+  poolRef:
+    apiGroup: ipam.cluster.x-k8s.io
+    kind: InClusterIPPool
+    name: my-ip-pool
+```
+
+| 欄位 | 說明 |
+|------|------|
+| `spec.address` | IP 位址字串（IPv4 或 IPv6，最長 39 字元） |
+| `spec.prefix` | 網路前綴長度（IPv4: 0-32，IPv6: 0-128） |
+| `spec.gateway` | 預設 gateway（可選） |
+| `spec.claimRef.name` | 對應的 `IPAddressClaim` 名稱 |
+| `spec.poolRef` | 此 IP 來自哪個 Pool |
+
+<Callout type="info" title="IPAddress 沒有 Status">
+注意：`IPAddress` 物件本身**沒有 status 子資源**。它是一個純資料物件，代表已分配的 IP 位址。狀態追蹤在 `IPAddressClaim.status` 上。
+</Callout>
+
+## API 版本演進
+
+IPAM API 隨 CAPI 版本演進，目前有三個版本：
+
+| 版本 | 狀態 | 說明 |
+|------|------|------|
+| `v1alpha1` | Deprecated | 最初版本，僅有 `IPAddress` 和 `IPAddressClaim` 基礎欄位 |
+| `v1beta1` | Deprecated（將移除） | 新增 condition 支援，為 Hub 版本前的過渡期 |
+| `v1beta2` | **目前 Hub 版本（storageversion）** | 採用 `metav1.Condition` 標準 condition，deprecated status 欄位整理至 `.status.deprecated` |
+
+```go
+// v1beta2 是 storage version（+kubebuilder:storageversion）
+// v1beta1, v1alpha1 透過 conversion webhook 轉換
+
+// IPAddressClaim v1beta2 使用標準 metav1.Condition
+type IPAddressClaimStatus struct {
+    Conditions []metav1.Condition `json:"conditions,omitempty"`
+    AddressRef IPAddressReference `json:"addressRef,omitempty,omitzero"`
+    // deprecated 欄位整理至此
+    Deprecated *IPAddressClaimDeprecatedStatus `json:"deprecated,omitempty"`
+}
+```
+
+## IPAM 生命週期
+
+```
+Infrastructure Provider 建立 Machine
+         │
+         ▼
+  建立 IPAddressClaim（spec.poolRef 指向 IP Pool）
+         │
+         ▼
+  IPAM Provider 監聽 IPAddressClaim（Watch）
+         │
+         ▼
+  從 IP Pool 分配地址 → 建立 IPAddress 物件
+         │
+         ▼
+  更新 IPAddressClaim.status.addressRef
+         │
+         ▼
+  Infrastructure Provider 讀取 IPAddress.spec.address
+         │
+         ▼
+  設定到 Machine 的網路設定
+         │
+    （Machine 刪除時）
+         ▼
+  Infrastructure Provider 刪除 IPAddressClaim
+         │
+         ▼
+  IPAM Provider 刪除 IPAddress，釋出 IP 回 Pool
+```
+
+### Condition 狀態機
+
+`IPAddressClaim` 的 Ready condition 有以下狀態：
+
+| Reason | 說明 |
+|--------|------|
+| `（無）` | 分配成功，condition status = True |
+| `AllocationFailed` | 分配失敗，詳細原因在 message |
+| `PoolNotReady` | 所引用的 IP Pool 尚未就緒 |
+| `PoolExhausted` | IP Pool 已耗盡，無法分配新位址 |
+
+## Webhook 驗證
+
+### IPAddress Webhook
+
+CAPI 為 `IPAddress` 實作驗證 webhook（`ValidateCreate`、`ValidateUpdate`、`ValidateDelete`）：
+
+**建立時驗證（ValidateCreate）：**
+
+```go
+// 來源：internal/webhooks/ipaddress.go
+func (webhook *IPAddress) validate(ctx context.Context, ip *ipamv1.IPAddress) error {
+    // 1. 驗證 spec.address 是合法的 IP 位址
+    addr, err := netip.ParseAddr(ip.Spec.Address)
+
+    // 2. 驗證 prefix 範圍（IPv4: 0-32，IPv6: 0-128）
+    if addr.Is4() && prefix > 32 { /* error */ }
+    if addr.Is6() && prefix > 128 { /* error */ }
+
+    // 3. 若有 gateway，驗證是合法 IP
+    if ip.Spec.Gateway != "" {
+        netip.ParseAddr(ip.Spec.Gateway)
+    }
+
+    // 4. 驗證 spec.poolRef 與 IPAddressClaim 的 poolRef 一致
+    // （兩者引用的 Pool 必須相同）
+}
+```
+
+**更新時驗證（ValidateUpdate）：**
+
+```go
+// IPAddress spec 是不可變的（immutable）
+// 任何 spec 欄位的變更都會被拒絕
+if !equal {
+    return field.Forbidden("spec", "IPAddress spec is immutable")
+}
+```
+
+### IPAddressClaim Webhook
+
+`IPAddressClaim` 的 webhook 驗證 `spec.poolRef` 的合法性，確保引用的 Pool 存在且格式正確。
+
+## Infrastructure Provider 整合範例
+
+以 Metal3 Provider 為例，說明如何整合 IPAM：
+
+```go
+// Metal3Machine reconciler 中
+func (r *Metal3MachineReconciler) reconcileIPAddressClaim(ctx context.Context, m3m *infrav1.Metal3Machine) error {
+    claim := &ipamv1.IPAddressClaim{
+        ObjectMeta: metav1.ObjectMeta{
+            Name:      m3m.Name,
+            Namespace: m3m.Namespace,
+            OwnerReferences: []metav1.OwnerReference{
+                *metav1.NewControllerRef(m3m, infrav1.GroupVersion.WithKind("Metal3Machine")),
+            },
+        },
+        Spec: ipamv1.IPAddressClaimSpec{
+            PoolRef: ipamv1.IPPoolReference{
+                APIGroup: m3m.Spec.IPAddressPoolRef.APIGroup,
+                Kind:     m3m.Spec.IPAddressPoolRef.Kind,
+                Name:     m3m.Spec.IPAddressPoolRef.Name,
+            },
+        },
+    }
+    // 建立 claim，等待 status.addressRef 有值
+}
+```
+
+## 實際使用範例
+
+### 手動建立測試用 IPAddressClaim
+
+```bash
+# 查看 IPAddressClaim 狀態
+kubectl get ipaddressclaims -n default
+
+# 查看已分配的 IPAddress
+kubectl get ipaddresses -n default
+
+# 描述特定 claim 以查看條件
+kubectl describe ipaddressclaim my-machine-0 -n default
+```
+
+### 疑難排解
+
+<Callout type="warning" title="常見問題">
+**PoolExhausted 錯誤**：當 IP Pool 中所有位址都已分配，新的 `IPAddressClaim` 會停留在 `PoolExhausted` 狀態。解決方法：擴展 IP Pool 的可用位址範圍。
+
+**IPAddress spec 不可變**：若嘗試更新 `IPAddress.spec`，webhook 會直接拒絕。若需要更換 IP 位址，必須刪除舊的 `IPAddressClaim`（連帶刪除 `IPAddress`）並重新建立。
+</Callout>
+
+```bash
+# 診斷 IPAddressClaim 問題
+kubectl get ipaddressclaim my-machine-0 -o jsonpath='{.status.conditions}' | jq .
+
+# 輸出範例（Pool 耗盡）
+[
+  {
+    "type": "Ready",
+    "status": "False",
+    "reason": "PoolExhausted",
+    "message": "IP pool my-ip-pool is exhausted"
+  }
+]
+```
+
+## 與 Conditions Framework 的整合
+
+IPAM API 在 v1beta2 中全面採用 `metav1.Condition`（標準 upstream condition），而非 CAPI 早期自訂的 `clusterv1.Condition`：
+
+```go
+// v1beta2 使用標準 condition
+type IPAddressClaimStatus struct {
+    Conditions []metav1.Condition `json:"conditions,omitempty"`
+    // ...
+}
+
+// 舊版 v1beta1 的 condition 保留在 deprecated 欄位
+type IPAddressClaimDeprecatedStatus struct {
+    V1Beta1 *IPAddressClaimV1Beta1DeprecatedStatus
+}
+```
+
+詳細的 Conditions Framework 說明請參考 [Conditions Framework](/cluster-api/features/conditions-framework)。

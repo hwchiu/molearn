@@ -1,0 +1,288 @@
+---
+layout: doc
+title: Cluster API Provider Metal3 — 主機選擇策略
+description: 深入解析 CAPM3 的 chooseHost 演算法，說明如何從 BareMetalHost 清單中挑選最合適的實體機器
+---
+
+# 主機選擇策略
+
+<Callout type="info" title="相關章節">
+- [BareMetalHost 生命週期](/cluster-api-provider-metal3/features/bmh-lifecycle)
+- [Node 重用機制](/cluster-api-provider-metal3/features/node-reuse)
+- [CRD：Metal3Machine](/cluster-api-provider-metal3/features/crds-machine)
+</Callout>
+
+<Callout type="tip" title="本文適用對象">
+- 🟢 **初學者**：了解為什麼有些機器無法被分配，以及如何設定 label 篩選
+- 🟡 **中階工程師**：理解選擇優先順序與 nodeReuse 策略的交互關係
+- 🔴 **資深工程師**：深入 `chooseHost()` 演算法的實作細節與邊界條件
+</Callout>
+
+> 📦 **類比**：就像醫院的床位分配系統——先確認病人有無指定床位（ConsumerRef），再依照病情優先級（nodeReuse 優先）安排空床（Ready/Available 狀態），同時過濾掉維修中（ErrorMessage）或被暫停使用（PausedAnnotation）的床位。
+
+## 什麼是主機選擇策略
+
+當 CAPI 建立一個 Machine 物件，CAPM3 的 Metal3Machine controller 需要決定「哪一台實體機器（BareMetalHost）來承載這個 workload」。這個選擇過程由 `chooseHost()` 函式執行，位於 `baremetal/metal3machine_manager.go`。
+
+選擇策略直接影響：
+- 哪些機器會被分配（可用性）
+- 分配的優先順序（node reuse vs 一般可用機器）
+- 分配失敗時的行為（requeue vs 直接報錯）
+
+## chooseHost() 演算法流程
+
+`chooseHost()` 的執行步驟可以分為四個階段：
+
+| 階段 | 動作 | 說明 |
+|------|------|------|
+| 1. 建立 label selector | `hostLabelSelectorForMachine()` | 從 Metal3Machine.Spec.HostSelector 建立篩選條件 |
+| 2. 列舉候選機器 | `client.List()` with InNamespace | 只在同一 namespace 內搜尋 |
+| 3. 過濾不可用機器 | 多條件過濾 | ConsumerRef、狀態、annotation 等 |
+| 4. 選擇最終機器 | nodeReuse 優先，其次隨機 | 依優先順序從候選清單選出 |
+
+### 階段一：建立 Label Selector
+
+```go
+// baremetal/metal3machine_manager.go
+func hostLabelSelectorForMachine(machine *infrav1.Metal3Machine, log logr.Logger) (labels.Selector, error) {
+    labelSelector := labels.NewSelector()
+
+    if machine.Spec.HostSelector == nil {
+        return labelSelector, nil  // 無限制，接受所有 host
+    }
+
+    for labelKey, labelVal := range machine.Spec.HostSelector.MatchLabels {
+        r, err := labels.NewRequirement(labelKey, selection.Equals, []string{labelVal})
+        labelSelector = labelSelector.Add(*r)
+    }
+
+    for _, req := range machine.Spec.HostSelector.MatchExpressions {
+        lowercaseOperator := selection.Operator(strings.ToLower(string(req.Operator)))
+        r, err := labels.NewRequirement(req.Key, lowercaseOperator, req.Values)
+        labelSelector = labelSelector.Add(*r)
+    }
+    return labelSelector, nil
+}
+```
+
+### 階段二：過濾不可用機器
+
+每一台候選機器都必須通過以下所有過濾條件：
+
+```
+候選機器過濾規則（任一條件成立即跳過）：
+├── ConsumerRef != nil 且不是指向此 Metal3Machine → 已被其他 machine 占用
+├── nodeReuseLabelExists() && !nodeReuseLabelMatches() → nodeReuse label 指向其他 machine
+├── DeletionTimestamp != nil → 正在刪除中
+├── Status.ErrorMessage != "" → 有錯誤需要人工介入
+├── 有 PausedAnnotation → BMH 被暫停
+├── 有 UnhealthyAnnotation (capi.metal3.io/unhealthy) → 被標記為不健康
+└── Provisioning.State 不在 Ready/Available → 狀態不可用
+```
+
+<Callout type="warning" title="已棄用的 annotation">
+舊版本使用 `metal3.io/unhealthy`，新版本改為 `capi.metal3.io/unhealthy`。若 BMH 帶有舊版 annotation，CAPM3 會記錄警告日誌，並同樣跳過該機器。建議盡快遷移到新版 annotation。
+</Callout>
+
+### 階段三：分類候選清單
+
+通過過濾的機器被分為兩個清單：
+
+| 清單 | 條件 | 說明 |
+|------|------|------|
+| `availableHostsWithNodeReuse` | 有 nodeReuse label 且 label 值相符 | 優先使用 |
+| `availableHosts` | 無 nodeReuse label 且狀態為 Ready/Available | 一般可用機器 |
+
+### 階段四：選擇最終機器
+
+```
+選擇優先順序：
+1. ConsumerRef 已指向此 Metal3Machine → 立即返回（重啟恢復用）
+2. availableHostsWithNodeReuse 不為空：
+   a. 若其中有 Ready/Available 狀態的機器 → 選取
+   b. 若都不在 Ready/Available 狀態 → requeue（等待清理完成）
+3. availableHostsWithNodeReuse 為空且 availableHosts 不為空：
+   → 從 availableHosts 中隨機選取（pickHost）
+4. 兩個清單都為空 → 返回 nil（沒有可用機器，等待重試）
+```
+
+## HostSelector 設定
+
+`HostSelector` 讓你可以對 BareMetalHost 的 label 設定篩選條件，只有符合條件的 host 才會被考慮。
+
+### matchLabels
+
+簡單的 key=value 等值比對：
+
+```yaml
+apiVersion: infrastructure.cluster.x-k8s.io/v1beta1
+kind: Metal3Machine
+metadata:
+  name: worker-machine-0
+spec:
+  image:
+    url: http://192.168.0.1/images/ubuntu-22.04.img
+    checksum: sha256:abc123...
+  hostSelector:
+    matchLabels:
+      rack: rack-1
+      environment: production
+```
+
+### matchExpressions
+
+支援更複雜的邏輯運算：
+
+```yaml
+spec:
+  hostSelector:
+    matchExpressions:
+      - key: rack
+        operator: In
+        values:
+          - rack-1
+          - rack-2
+      - key: maintenance
+        operator: DoesNotExist
+        values: []
+      - key: gpu-type
+        operator: NotIn
+        values:
+          - nvidia-a100  # 不選擇 GPU 機器（留給 GPU workload）
+```
+
+支援的 operator：
+
+| Operator | 說明 | 範例 |
+|----------|------|------|
+| `In` | label 值在指定清單中 | `rack In [rack-1, rack-2]` |
+| `NotIn` | label 值不在指定清單中 | `tier NotIn [gpu, storage]` |
+| `Exists` | label key 存在（值不限） | `ssd Exists` |
+| `DoesNotExist` | label key 不存在 | `maintenance DoesNotExist` |
+
+### 在 BareMetalHost 上設定 label
+
+```yaml
+apiVersion: metal3.io/v1alpha1
+kind: BareMetalHost
+metadata:
+  name: worker-host-01
+  labels:
+    rack: rack-1
+    environment: production
+    cpu-arch: x86_64
+    ssd: "true"
+spec:
+  online: false
+  bootMACAddress: "00:11:22:33:44:55"
+  bmc:
+    address: ipmi://192.168.1.100
+    credentialsName: worker-host-01-bmc-secret
+```
+
+## Provisioning State 與可用性
+
+`chooseHost()` 只接受以下兩種 provisioning state 的 host（不考慮 nodeReuse）：
+
+| State | 說明 | 是否可選擇 |
+|-------|------|-----------|
+| `ready` | 通過 inspection，等待被分配 | ✅ 可以 |
+| `available` | 同 ready，v1.1+ 的新名稱 | ✅ 可以 |
+| `none` | 初始狀態 | ❌ 不行 |
+| `registering` | 正在向 Ironic 註冊 | ❌ 不行 |
+| `inspecting` | 正在做硬體 inspection | ❌ 不行 |
+| `preparing` | 正在執行 automated cleaning | ❌ 不行 |
+| `provisioning` | 正在部署 OS image | ❌ 不行 |
+| `provisioned` | 已部署，有 workload 運行中 | ❌ 不行 |
+| `deprovisioning` | 正在清除 workload | ❌ 不行 |
+| `deleting` | 正在刪除 BMH 物件 | ❌ 不行 |
+
+## Pre-provisioned Host（ExternallyProvisioned）
+
+對於已預先安裝好 OS 的機器（`externallyProvisioned` 狀態），`chooseHost()` **不會**選擇它們作為一般可用機器。ExternallyProvisioned 的 host 必須透過直接設定 ConsumerRef 的方式與 Metal3Machine 關聯，而不是透過 `chooseHost()` 的自動選擇流程。
+
+## 選擇失敗情境
+
+### 情境一：沒有符合條件的 host
+
+當 `availableHosts` 和 `availableHostsWithNodeReuse` 都是空的：
+
+```
+症狀：Metal3Machine 持續保持 Provisioning 狀態
+原因診斷：
+1. 所有 BMH 都在非 Ready/Available 狀態
+2. HostSelector 的 label 條件沒有任何 BMH 符合
+3. 所有可用 BMH 都已有其他 ConsumerRef
+4. 可用 BMH 帶有 PausedAnnotation 或 UnhealthyAnnotation
+```
+
+診斷指令：
+
+```bash
+# 查看所有 BMH 的狀態
+kubectl get baremetalhosts -n metal3
+
+# 查看 Metal3Machine 的事件
+kubectl describe metal3machine <machine-name> -n <namespace>
+
+# 查看符合 label 的 BMH
+kubectl get baremetalhosts -l rack=rack-1 -n metal3
+```
+
+### 情境二：nodeReuse Host 尚未就緒
+
+```
+症狀：Metal3Machine 持續 requeue，日誌顯示
+      "Found BareMetalHost(s) with nodeReuseLabelName in not-available state, requeuing"
+原因：nodeReuse host 存在但還在清理/inspection 中
+處理：等待 BMH 完成清理進入 Ready state（可能需要 5-30 分鐘）
+```
+
+## 完整選擇流程圖（文字版）
+
+```
+Metal3Machine 觸發 reconcile
+         │
+         ▼
+建立 HostSelector label selector
+         │
+         ▼
+List BareMetalHosts (同 namespace，符合 label)
+         │
+         ▼
+對每個 host 進行過濾：
+  ├── ConsumerRef 指向此 Machine? → 直接返回此 host
+  ├── ConsumerRef 指向其他 Machine? → 跳過
+  ├── 有 nodeReuse label 但不匹配? → 跳過
+  ├── DeletionTimestamp 存在? → 跳過
+  ├── ErrorMessage 非空? → 跳過
+  ├── Paused annotation? → 跳過
+  ├── Unhealthy annotation? → 跳過
+  ├── 有 nodeReuse label 且匹配? → 加入 availableHostsWithNodeReuse
+  └── 狀態 Ready/Available? → 加入 availableHosts
+         │
+         ▼
+兩個清單都為空? → 返回 nil（等待重試）
+         │ 否
+         ▼
+availableHostsWithNodeReuse 非空?
+  ├── 是，且有 Ready state → 選取（優先）
+  ├── 是，但都不 Ready → requeue（等待）
+  └── 否 → 從 availableHosts 隨機選取
+```
+
+## 進階：FailureDomain 與選擇策略
+
+當 Metal3Machine 設定了 `failureDomain` 欄位，CAPM3 會嘗試選擇在對應 failure domain 的機器。BareMetalHost 需要透過 label 標記其所在的 failure domain：
+
+```yaml
+# BareMetalHost label
+labels:
+  failure-domain.beta.kubernetes.io/zone: zone-a
+
+# Metal3Machine spec
+spec:
+  failureDomain: zone-a
+```
+
+CAPM3 在建立 `hostLabelSelectorForMachine` 時會加入 failure domain 的 label 條件。若指定 failure domain 內沒有可用機器，會 fallback 到任意可用機器（根據 Cluster API 的 failure domain 分配邏輯）。

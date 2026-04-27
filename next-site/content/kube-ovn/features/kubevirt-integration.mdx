@@ -1,0 +1,288 @@
+---
+layout: doc
+title: Kube-OVN — KubeVirt 虛擬機網路整合
+description: 為 KubeVirt VM 提供靜態 IP/MAC、Live Migration 不斷線、VPC 隔離等企業級虛擬化網路能力
+---
+
+# KubeVirt 虛擬機網路整合
+
+<Callout type="info" title="相關章節">
+- [VPC 與 Subnet 設計](/kube-ovn/features/vpc-subnet)
+- [IPAM 設計](/kube-ovn/features/ipam)
+- [DPDK 與硬體 Offload](/kube-ovn/features/dpdk-hardware-offload)
+- [EIP、SNAT 與 DNAT](/kube-ovn/features/eip-snat-dnat)
+- [整體架構](/kube-ovn/features/architecture)
+</Callout>
+
+<Callout type="tip" title="本文適用對象">
+- 🟢 **初學者**：理解 KubeVirt VM 為何需要特殊的網路處理
+- 🟡 **中階工程師**：掌握靜態 IP/MAC annotation、EIP 暴露 VM、VPC 內 VM 通訊
+- 🔴 **資深工程師**：深入理解 Live Migration 期間的封包路徑、OVN 的 IP 跟隨機制
+</Callout>
+
+> 📦 **類比**：一般 Kubernetes Pod 就像「臨時工」——重啟後換人換 IP；KubeVirt VM 則像「正式員工」——不管搬到哪個辦公室（節點），工牌（IP + MAC）永遠不變，客戶仍用同一個電話號碼聯絡他。
+
+## 為何 KubeVirt VM 需要特殊網路處理
+
+KubeVirt 將虛擬機以 Pod 形式執行（`virt-launcher` Pod），但 VM 與普通 Pod 有本質差異：
+
+| 特性 | 普通 Pod | KubeVirt VM（virt-launcher Pod）|
+|------|---------|-------------------------------|
+| 生命週期 | 短暫，重啟即換 IP | 長期，需維持固定 IP/MAC |
+| Live Migration | 不支援 | 支援（VM 不停機移到另一個節點）|
+| 網路標識 | IP 用完即棄 | IP/MAC 是 VM 的身分標識 |
+| 連線持久性 | 不需要（無狀態設計）| 需要（TCP/UDP 連線需在遷移後延續）|
+| Guest OS | 無 | 有（Guest OS 直接看到 MAC 地址）|
+
+Live Migration 是最關鍵的挑戰：VM 從 Node A 遷移到 Node B 時，`virt-launcher` Pod 會先在 Node B 建立，再將 Node A 的 VM 記憶體狀態傳輸過去，最後切換。若 IP 在這個過程中改變，所有進行中的 TCP 連線都會中斷。
+
+## 靜態 IP 與 MAC：annotation 設定
+
+Kube-OVN 允許在 VM（或其 VMI）上設定靜態 IP 和 MAC，讓每次重啟或遷移後 IP/MAC 保持不變：
+
+### 方法一：在 VirtualMachine 上設定 annotation
+
+```yaml
+apiVersion: kubevirt.io/v1
+kind: VirtualMachine
+metadata:
+  name: web-server-vm
+  namespace: production
+  annotations:
+    ovn.kubernetes.io/ip_address: "10.16.0.200"      # 靜態 IP
+    ovn.kubernetes.io/mac_address: "00:11:22:33:44:55"  # 靜態 MAC
+spec:
+  running: true
+  template:
+    metadata:
+      annotations:
+        ovn.kubernetes.io/ip_address: "10.16.0.200"    # VMI template 也需要設定
+        ovn.kubernetes.io/mac_address: "00:11:22:33:44:55"
+    spec:
+      domain:
+        devices:
+          interfaces:
+          - name: default
+            masquerade: {}
+        resources:
+          requests:
+            memory: "2Gi"
+            cpu: "2"
+      networks:
+      - name: default
+        pod: {}
+```
+
+<Callout type="warning" title="annotation 需同時設定在 VM 和 VMI template">
+KubeVirt 在 Live Migration 時會建立新的 VMI（VirtualMachineInstance）。若 annotation 只設定在 VM 物件上而不在 `spec.template.metadata.annotations` 中，新建的 VMI Pod 將無法繼承靜態 IP。
+</Callout>
+
+### 方法二：直接在 VMI 上設定
+
+```yaml
+apiVersion: kubevirt.io/v1
+kind: VirtualMachineInstance
+metadata:
+  name: database-vm
+  annotations:
+    ovn.kubernetes.io/ip_address: "10.16.0.150"
+    ovn.kubernetes.io/mac_address: "00:aa:bb:cc:dd:ee"
+    ovn.kubernetes.io/ip_pool: "10.16.0.0/24"       # 可選：限制從哪個 Subnet 分配
+spec:
+  # ... domain 設定
+```
+
+### Dual-Stack VM
+
+在 Dual-Stack Subnet 中，可同時指定 IPv4 和 IPv6 地址：
+
+```yaml
+annotations:
+  ovn.kubernetes.io/ip_address: "10.16.0.200,fd00:10:16::200"  # 逗號分隔
+  ovn.kubernetes.io/mac_address: "00:11:22:33:44:55"
+```
+
+## OVN 的 Live Migration 網路支援
+
+### 遷移期間的封包路徑
+
+Live Migration 過程分為三個階段：
+
+**階段一：遷移前（VM 在 Node A）**
+```
+外部客戶端 → [Node A OVS] → virt-launcher-a Pod → VM
+```
+
+**階段二：遷移中（雙節點並存）**
+```
+外部客戶端 → [OVN Logical Router] → ?
+              ├── Node A OVS port（舊）→ VM（記憶體同步中）
+              └── Node B OVS port（新）→ virt-launcher-b Pod（準備就緒）
+```
+
+OVN 的 Logical Router Port 仍指向原始 IP/MAC，所有入站封包繼續送往 Node A，確保遷移中 VM 可繼續處理請求。
+
+**階段三：遷移完成（VM 切換到 Node B）**
+```
+外部客戶端 → [OVN Logical Router] → Node B OVS → virt-launcher-b Pod → VM
+```
+
+KubeVirt 通知 `kube-ovn-controller` 更新 Logical Switch Port 的綁定（IP/MAC 不變，但 chassis 從 Node A 改為 Node B）。OVN 自動更新 Southbound DB 的 binding，封包無縫切換到 Node B。
+
+### 設定 Live Migration 策略
+
+```yaml
+apiVersion: kubevirt.io/v1
+kind: VirtualMachineInstanceMigration
+metadata:
+  name: migrate-web-vm
+  namespace: production
+spec:
+  vmiName: web-server-vm
+```
+
+執行遷移時，Kube-OVN 會自動處理網路切換，無需額外設定。
+
+## VPC 層級 VM 網路
+
+### VM 在自訂 VPC 中通訊
+
+將 VM 放入自訂 VPC，實現多租戶 VM 網路隔離：
+
+```yaml
+# 先建立 VPC
+apiVersion: kubeovn.io/v1
+kind: Vpc
+metadata:
+  name: tenant-a-vpc
+spec:
+  namespaces:
+  - tenant-a
+
+---
+# 建立 VPC 內的 Subnet
+apiVersion: kubeovn.io/v1
+kind: Subnet
+metadata:
+  name: tenant-a-vm-subnet
+spec:
+  vpc: tenant-a-vpc
+  cidrBlock: "192.168.10.0/24"
+  namespaces:
+  - tenant-a
+```
+
+```yaml
+# VM 在 tenant-a namespace 中，自動使用 tenant-a-vm-subnet
+apiVersion: kubevirt.io/v1
+kind: VirtualMachine
+metadata:
+  name: tenant-a-vm
+  namespace: tenant-a
+  annotations:
+    ovn.kubernetes.io/ip_address: "192.168.10.50"
+spec:
+  # ...
+```
+
+### VM 與 Pod 同 Subnet 通訊
+
+VM 和普通 Pod 在同一個 Subnet 中可以直接 L2 通訊（同一 OVN Logical Switch）：
+
+```bash
+# 從 Pod 到 VM
+kubectl exec -n tenant-a regular-pod -- ping 192.168.10.50  # 直達 VM，無需路由
+
+# 從 VM 到 Pod
+# 在 VM 內部執行
+ping 192.168.10.80  # Pod IP，同 Subnet 直通
+```
+
+## 對外暴露 VM
+
+### 方法一：EIP（Floating IP）
+
+為 VM 分配固定的外部 IP，外部可直接存取 VM：
+
+```yaml
+# 申請 EIP
+apiVersion: kubeovn.io/v1
+kind: OvnEip
+metadata:
+  name: eip-vm-web
+spec:
+  externalSubnet: external
+  type: nat
+
+---
+# 綁定到 VM
+apiVersion: kubeovn.io/v1
+kind: IptablesFIPRule
+metadata:
+  name: fip-vm-web
+spec:
+  eip: eip-vm-web
+  internalIp: 10.16.0.200   # VM 的 cluster IP
+```
+
+### 方法二：LoadBalancer Service
+
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: vm-web-lb
+spec:
+  type: LoadBalancer
+  selector:
+    kubevirt.io/domain: web-server-vm    # KubeVirt VM label
+  ports:
+  - port: 80
+    targetPort: 80
+```
+
+### 方法三：NodePort
+
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: vm-ssh
+spec:
+  type: NodePort
+  selector:
+    kubevirt.io/domain: web-server-vm
+  ports:
+  - port: 22
+    targetPort: 22
+    nodePort: 30022
+```
+
+## 常見設定與驗證
+
+```bash
+# 確認 VM 的 IP 已正確分配
+kubectl get vmi web-server-vm -o jsonpath='{.status.interfaces[0].ipAddress}'
+
+# 確認 Kube-OVN IP CRD 記錄靜態 IP
+kubectl get ip | grep web-server-vm
+
+# 查看 OVN Logical Switch Port 的 MAC 綁定
+ovn-nbctl list logical_switch_port | grep "00:11:22:33:44:55"
+
+# 監控 Live Migration 期間的 OVN binding 變化
+kubectl get vmi web-server-vm -w &
+ovn-sbctl watch &   # 觀察 SB DB 的 binding 更新
+
+# 確認遷移後 IP 不變
+kubectl exec test-pod -- ping 10.16.0.200 -c 100  # 全程不應有封包遺失（< 1% loss）
+```
+
+## 已知限制
+
+| 限制項目 | 說明 |
+|---------|------|
+| Masquerade 模式 | KubeVirt 的 `masquerade` 介面模式會在 virt-launcher 內做 NAT，VM 看不到真實 cluster IP。若要完整利用 Kube-OVN IPAM，建議使用 `bridge` 模式搭配 Multus |
+| SR-IOV 與 Live Migration | 使用 SR-IOV VF 的 VM 不支援 Live Migration（VF 不可熱遷移），需改用 DPDK vhostuser |
+| 跨 namespace VM 通訊 | 不同 namespace 的 VM 通訊需要透過 VPC Router，不能直接 L2 通訊 |
+| Windows VM | Kube-OVN 的靜態 MAC 功能對 Windows Guest 完全透明，但需確認 Windows 驅動相容性 |

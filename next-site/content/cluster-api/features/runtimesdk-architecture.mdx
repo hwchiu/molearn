@@ -1,0 +1,369 @@
+---
+layout: doc
+title: Cluster API — RuntimeSDK Extension 架構
+description: 深入解析 CAPI RuntimeSDK 擴展框架，了解如何透過 RuntimeExtension 在不 fork CAPI 的情況下注入自訂邏輯，涵蓋 lifecycle hooks、ExtensionConfig 與 HTTP server 模式。
+---
+
+# RuntimeSDK Extension 架構
+
+<Callout type="info" title="相關章節">
+- [架構總覽](/cluster-api/features/architecture)
+- [ClusterClass & Topology](/cluster-api/features/clusterclass-topology)
+- [Feature Gates 完整指南](/cluster-api/features/feature-gates)
+- [Webhooks 深入解析](/cluster-api/features/webhooks-deepdive)
+- [Provider Contracts & Runtime Hooks](/cluster-api/features/provider-contracts-runtime-hooks)
+</Callout>
+
+<Callout type="tip" title="本文適用對象">
+- 🟢 **初學者**：了解為什麼需要 RuntimeSDK，以及它與直接修改 CAPI 原始碼的差別
+- 🟡 **中階工程師**：掌握 ExtensionConfig CRD 設定，學習如何部署和連接 runtime extension
+- 🔴 **資深工程師**：深入理解 extension discovery 流程、catalog 機制、HTTP 協定細節，以及如何撰寫完整的 runtime extension server
+</Callout>
+
+> 📦 **類比**：RuntimeSDK 就像機場的插件（plug-in）系統。CAPI（機場）在旅客出發/到達的關鍵節點（lifecycle hooks）預留了「插座」。航空公司（infrastructure provider）或第三方服務（extension）可以在這些插座上連接自己的設備（HTTP server），在旅客辦理登機（BeforeClusterCreate）或出關（AfterClusterUpgrade）時執行自訂程序，而不需要修改機場的基礎設施。
+
+## 什麼是 RuntimeSDK
+
+在 RuntimeSDK 出現之前，若要在 CAPI 的 cluster lifecycle 中注入自訂邏輯，只有兩種選擇：
+
+1. **Fork CAPI 原始碼**：維護成本高，每次 CAPI 升級都需要 merge
+2. **Provider 自行 watch CRD**：無法與 CAPI 的協調流程緊密整合
+
+RuntimeSDK（`RuntimeSDK` feature gate）提供了第三種方式：一個基於 HTTP 的擴展框架，讓外部服務（runtime extensions）可以在 CAPI 的 cluster lifecycle 關鍵節點被呼叫，且這些呼叫是 CAPI reconcile 流程的一部分（同步執行）。
+
+## Feature Gate 依賴
+
+RuntimeSDK 目前是 Alpha 功能，需要明確啟用：
+
+```bash
+# 啟用 RuntimeSDK feature gate
+--feature-gates=RuntimeSDK=true,ClusterTopology=true
+```
+
+<Callout type="warning" title="Alpha 功能">
+RuntimeSDK 目前處於 Alpha 階段（`Default: false`）。API 可能在未來版本中發生變更。
+</Callout>
+
+## 核心概念
+
+### ExtensionConfig CRD
+
+`ExtensionConfig` 是連接外部 runtime extension server 的設定資源：
+
+```yaml
+apiVersion: runtime.cluster.x-k8s.io/v1alpha1
+kind: ExtensionConfig
+metadata:
+  name: my-extension
+spec:
+  clientConfig:
+    # 方式 1：直接 URL
+    url: "https://my-extension.example.com/hooks"
+
+    # 方式 2：透過 Kubernetes Service
+    service:
+      name: my-extension-service
+      namespace: my-extension-system
+      port: 443
+      path: /hooks
+
+  # 限定此 extension 只處理特定 namespace 的 cluster
+  namespaceSelector:
+    matchLabels:
+      kubernetes.io/metadata.name: production
+
+  # 透過 settings 傳遞設定給 extension
+  settings:
+    logLevel: "debug"
+    region: "us-east-1"
+```
+
+| 欄位 | 說明 |
+|------|------|
+| `spec.clientConfig.url` | Extension server 的 URL（與 service 二擇一） |
+| `spec.clientConfig.service` | Kubernetes Service 引用（與 url 二擇一） |
+| `spec.namespaceSelector` | 限制 extension 處理哪些 namespace 的 cluster |
+| `spec.settings` | 傳遞給 extension 的設定 key-value |
+
+### Hook 類型
+
+RuntimeSDK 定義了以下 lifecycle hooks：
+
+| Hook | 觸發時機 | 用途 |
+|------|---------|------|
+| `BeforeClusterCreate` | Cluster 建立前（infrastructure 還未建立） | 驗證設定、準備外部資源 |
+| `AfterControlPlaneInitialized` | Control plane 首次就緒後 | 安裝初始工具 |
+| `BeforeClusterUpgrade` | Cluster 升級開始前 | 驗證升級相容性、備份 |
+| `AfterControlPlaneUpgraded` | Control plane 升級完成後 | 更新監控設定 |
+| `AfterClusterUpgrade` | 整個 Cluster 升級完成後 | 清理舊資源 |
+| `BeforeClusterDelete` | Cluster 刪除前 | 備份資料、釋出外部資源 |
+| `BeforeClusterMachineGroupUpgrade` | Machine group（MachineDeployment/MachinePool）升級前 | 細粒度升級控制 |
+| `AfterClusterMachineGroupUpgrade` | Machine group 升級後 | 通知下游系統 |
+| `BeforeMachineDelete` | Machine 刪除前 | 資料遷移、連接移除 |
+| `DiscoveryRequest` | Extension 首次連接時（discovery） | 回報 extension 支援的 hooks |
+| `TopologyMutationHook` | ClusterClass 拓撲計算時 | 動態修改生成的資源 |
+
+## Extension Discovery 流程
+
+當 `ExtensionConfig` 被建立時，`ExtensionConfigReconciler` 會自動發現 extension 支援的 hooks：
+
+```
+ExtensionConfig 建立
+         │
+         ▼
+ExtensionConfigReconciler 觸發
+         │
+         ▼
+向 extension server 發送 DiscoveryRequest
+（HTTP POST /hooks/v1alpha1/discovery）
+         │
+         ▼
+Extension server 回傳支援的 hooks 清單
+{
+  "handlers": [
+    {
+      "name": "before-cluster-create",
+      "hook": {
+        "apiVersion": "hooks.runtime.cluster.x-k8s.io/v1alpha1",
+        "name": "BeforeClusterCreate"
+      },
+      "timeoutSeconds": 10,
+      "failurePolicy": "Fail"
+    }
+  ]
+}
+         │
+         ▼
+Catalog 更新（記錄此 extension 支援的 hooks）
+         │
+         ▼
+ExtensionConfig.status 更新
+```
+
+## Runtime Catalog
+
+`Catalog` 是 extension 的本地登錄表，記錄每個 `ExtensionConfig` 支援的 hooks：
+
+```go
+// 來源：exp/runtime/catalog/catalog.go
+type Catalog struct {
+    // 記錄 hook 與 extension 的映射
+    handlers map[GroupHook][]ExtensionHandler
+}
+
+// GroupHook 識別一個特定的 hook
+type GroupHook struct {
+    Group string  // e.g., "hooks.runtime.cluster.x-k8s.io"
+    Hook  string  // e.g., "BeforeClusterCreate"
+}
+```
+
+CAPI 在執行 cluster lifecycle 操作時，會查詢 Catalog 找到所有訂閱此 hook 的 extensions，然後依序呼叫它們的 HTTP endpoints。
+
+## HTTP 協定
+
+Runtime extensions 使用標準 HTTPS 協定接收 hook 請求：
+
+### 請求格式
+
+```json
+POST /hooks/v1alpha1/before-cluster-create
+Content-Type: application/json
+
+{
+  "apiVersion": "hooks.runtime.cluster.x-k8s.io/v1alpha1",
+  "kind": "BeforeClusterCreateRequest",
+  "cluster": {
+    "apiVersion": "cluster.x-k8s.io/v1beta2",
+    "kind": "Cluster",
+    "metadata": { "name": "my-cluster", "namespace": "default" },
+    "spec": { ... }
+  },
+  "settings": {
+    "logLevel": "debug"
+  }
+}
+```
+
+### 回應格式
+
+```json
+{
+  "apiVersion": "hooks.runtime.cluster.x-k8s.io/v1alpha1",
+  "kind": "BeforeClusterCreateResponse",
+  "status": "Success",    // 或 "Failure"
+  "message": "",          // 失敗時的錯誤訊息
+  "retryAfterSeconds": 0  // 若需要重試，設定等待秒數
+}
+```
+
+| `status` | 行為 |
+|----------|------|
+| `Success` | CAPI 繼續 reconcile 流程 |
+| `Failure` | CAPI 停止並重試（依 failurePolicy） |
+| `retryAfterSeconds > 0` | CAPI 等待指定秒數後重試，不計為失敗 |
+
+## Extension Server SDK
+
+CAPI 提供 `exp/runtime/server/` 套件讓開發者快速建立 runtime extension server：
+
+```go
+// 來源：exp/runtime/server/server.go
+type Server struct {
+    webhook.Server
+    catalog  *runtimecatalog.Catalog
+    handlers map[string]ExtensionHandler
+}
+
+// 建立 Server
+s, err := server.New(server.Options{
+    Catalog: catalog,
+    Port:    9443,
+    CertDir: "/certs",
+})
+
+// 註冊 hook handler
+s.AddExtensionHandler(server.ExtensionHandler{
+    Hook: hooks.BeforeClusterCreate,
+    Name: "before-cluster-create",
+    HandlerFunc: func(ctx context.Context, req *runtimehooksv1.BeforeClusterCreateRequest,
+        resp *runtimehooksv1.BeforeClusterCreateResponse) {
+        // 自訂邏輯
+        resp.Status = runtimehooksv1.ResponseStatusSuccess
+    },
+})
+```
+
+## TopologyMutation Hook
+
+`TopologyMutationHook` 是最強大的 hook，允許 extension 動態修改 ClusterClass 生成的資源：
+
+```go
+// 允許修改生成的 InfrastructureCluster、ControlPlane 等物件
+type GeneratePatchesRequest struct {
+    // Items 包含所有待生成的資源（MachineDeployment、ControlPlane 等）
+    Items []GeneratePatchesRequestItem
+    // Variables 包含 ClusterClass 變數值
+    Variables []Variable
+}
+
+type GeneratePatchesResponse struct {
+    // Items 包含每個資源的 JSON Patch 清單
+    Items []GeneratePatchesResponseItem
+}
+```
+
+CAPI 提供 `exp/runtime/topologymutation/` 輔助套件：
+
+```go
+// 使用 TopologyMutation walker 處理每個資源
+topologymutation.WalkTemplates(
+    ctx, apiReader, holderRef, templateRef,
+    func(ctx context.Context, obj client.Object, variables map[string]apiextensionsv1.JSON,
+        holderRef runtimehooksv1.HolderReference) error {
+        // 依資源類型修改設定
+        switch obj.(type) {
+        case *infrav1.AWSMachineTemplate:
+            // 修改 AWS 特有設定
+        }
+        return nil
+    },
+)
+```
+
+## 完整範例：BeforeClusterCreate Extension
+
+```go
+package main
+
+import (
+    "context"
+    "fmt"
+
+    runtimehooksv1 "sigs.k8s.io/cluster-api/api/runtime/hooks/v1alpha1"
+    runtimecatalog "sigs.k8s.io/cluster-api/exp/runtime/catalog"
+    "sigs.k8s.io/cluster-api/exp/runtime/server"
+)
+
+func main() {
+    catalog := runtimecatalog.New()
+    // 註冊支援的 hooks
+    _ = runtimehooksv1.AddToCatalog(catalog)
+
+    s, err := server.New(server.Options{
+        Catalog: catalog,
+        Port:    9443,
+    })
+    if err != nil {
+        panic(err)
+    }
+
+    // 處理 BeforeClusterCreate
+    if err := s.AddExtensionHandler(server.ExtensionHandler{
+        Hook: runtimehooksv1.BeforeClusterCreate,
+        Name: "my-before-cluster-create",
+        HandlerFunc: beforeClusterCreate,
+    }); err != nil {
+        panic(err)
+    }
+
+    if err := s.Start(context.Background()); err != nil {
+        panic(err)
+    }
+}
+
+func beforeClusterCreate(
+    ctx context.Context,
+    req *runtimehooksv1.BeforeClusterCreateRequest,
+    resp *runtimehooksv1.BeforeClusterCreateResponse,
+) {
+    fmt.Printf("BeforeClusterCreate called for cluster %s\n", req.Cluster.Name)
+
+    // 驗證 cluster 設定
+    if req.Cluster.Spec.ClusterNetwork == nil {
+        resp.Status = runtimehooksv1.ResponseStatusFailure
+        resp.Message = "cluster network must be configured"
+        return
+    }
+
+    resp.Status = runtimehooksv1.ResponseStatusSuccess
+}
+```
+
+## FailurePolicy
+
+每個 hook handler 可設定 `failurePolicy`：
+
+| FailurePolicy | extension 失敗時的行為 |
+|---------------|----------------------|
+| `Fail`（預設） | CAPI 停止 reconcile，等待 extension 恢復 |
+| `Ignore` | CAPI 忽略 extension 失敗，繼續 reconcile |
+
+<Callout type="warning" title="Fail Policy 的影響">
+使用 `failurePolicy: Fail` 時，若 extension server 不可用，CAPI 會無法執行任何 cluster 的建立/升級/刪除操作。請確保 extension server 有足夠的高可用設定。
+</Callout>
+
+## ExtensionConfig Status
+
+Extension 連接後，CAPI 會更新 `ExtensionConfig.status`：
+
+```yaml
+status:
+  conditions:
+  - type: Discovered
+    status: "True"
+    reason: "DiscoverySucceeded"
+  handlers:
+  - name: "before-cluster-create"
+    hook:
+      apiVersion: hooks.runtime.cluster.x-k8s.io/v1alpha1
+      name: BeforeClusterCreate
+    timeoutSeconds: 10
+    failurePolicy: Fail
+```
+
+```bash
+# 查看 ExtensionConfig 狀態
+kubectl get extensionconfigs
+kubectl describe extensionconfig my-extension
+```

@@ -1,0 +1,270 @@
+---
+layout: doc
+title: Cluster API — Feature Gates 完整指南
+description: 完整解析 CAPI 所有 Feature Gate，涵蓋各 gate 的階段、預設值、功能說明，以及如何透過 controller-manager 參數啟用或停用。
+---
+
+# Feature Gates 完整指南
+
+<Callout type="info" title="相關章節">
+- [架構總覽](/cluster-api/features/architecture)
+- [RuntimeSDK Extension 架構](/cluster-api/features/runtimesdk-architecture)
+- [ClusterClass & Topology](/cluster-api/features/clusterclass-topology)
+- [Controller 效能調優](/cluster-api/features/controller-tuning)
+- [Experimental MachinePool](/cluster-api/features/experimental-machine-pool)
+</Callout>
+
+<Callout type="tip" title="本文適用對象">
+- 🟢 **初學者**：了解什麼是 feature gate，以及如何在 CAPI 中啟用實驗性功能
+- 🟡 **中階工程師**：掌握各 feature gate 的用途與互相依賴關係，學習在正式環境中的安全啟用策略
+- 🔴 **資深工程師**：深入理解 feature gate 與 CRD 安裝的耦合關係，以及 Alpha gate 的穩定性考量
+</Callout>
+
+> 📦 **類比**：Feature Gate 就像飛機的「乘客設施開關面板」。某些設施（Beta 功能）在大多數航班中預設開啟，某些實驗性設施（Alpha 功能）需要機長（operator）手動開啟，而一些設施在所有航班中強制啟用（GA 功能）。
+
+## 什麼是 Feature Gate
+
+Feature Gate 是一種**運行時開關機制**，允許在不重新編譯程式碼的情況下啟用或停用特定功能。在 CAPI 中：
+
+- 部分功能在開發完善之前以 **Alpha** 或 **Beta** 狀態發布
+- Alpha 功能預設**關閉**，需要明確啟用
+- Beta 功能預設**開啟**，可以手動關閉
+- GA 功能**永遠開啟**，feature gate 僅保留作向後相容
+
+## 完整 Feature Gate 清單
+
+| Feature Gate | 階段 | 預設值 | 說明 |
+|--------------|------|--------|------|
+| `MachinePool` | Beta | ✅ true | 啟用 MachinePool CRD 和 controller（管理相同設定的 Machine 群組） |
+| `ClusterTopology` | Alpha | ❌ false | 啟用 ClusterClass 與 managed topology 功能 |
+| `RuntimeSDK` | Alpha | ❌ false | 啟用 Runtime hooks 和 Extensions 功能 |
+| `KubeadmBootstrapFormatIgnition` | Alpha | ❌ false | 啟用 KubeadmConfig 的 Ignition bootstrap 格式支援 |
+| `MachineSetPreflightChecks` | Beta | ✅ true | 啟用 MachineSet 的 preflight check（升級前驗證） |
+| `PriorityQueue` | Beta | ✅ true | 使用 controller-runtime PriorityQueue 替代預設佇列 |
+| `ReconcilerRateLimiting` | Beta | ✅ true | 啟用 reconciler 的 rate limiting（需要 PriorityQueue） |
+| `InPlaceUpdates` | Alpha | ❌ false | 啟用 Machine 的 in-place 就地更新功能 |
+| `MachineTaintPropagation` | Alpha | ❌ false | 啟用 Machine taint 傳播至 node 的功能 |
+| `MachineWaitForVolumeDetachConsiderVolumeAttachments` | GA | ✅ true | Machine 刪除時同時考慮 VolumeAttachments（已 GA，將於 v1.15 移除 gate） |
+
+## 各 Feature Gate 詳解
+
+### MachinePool（Beta，預設開啟）
+
+```go
+// alpha: v0.3
+// beta: v1.7
+MachinePool featuregate.Feature = "MachinePool"
+```
+
+啟用 `MachinePool` CRD，允許管理「一組具有相同設定的 Machine」。MachinePool 由 infrastructure provider 直接管理（如 AWS Auto Scaling Group），與 MachineSet 的 controller-per-machine 模式不同。
+
+詳細說明請參考 [Experimental MachinePool](/cluster-api/features/experimental-machine-pool)。
+
+### ClusterTopology（Alpha，預設關閉）
+
+```go
+// alpha: v0.4
+ClusterTopology featuregate.Feature = "ClusterTopology"
+```
+
+啟用 ClusterClass 與 Cluster topology 管理功能。ClusterClass 允許定義 cluster 的藍圖，並透過 `Cluster.spec.topology` 引用，由 topology controller 自動建立所有元件。
+
+<Callout type="warning" title="ClusterTopology + RuntimeSDK">
+若要使用 RuntimeSDK 的 `TopologyMutationHook`，需要同時啟用 `ClusterTopology` 和 `RuntimeSDK` 兩個 feature gate。
+</Callout>
+
+詳細說明請參考 [ClusterClass & Topology](/cluster-api/features/clusterclass-topology)。
+
+### RuntimeSDK（Alpha，預設關閉）
+
+```go
+// alpha: v1.2
+RuntimeSDK featuregate.Feature = "RuntimeSDK"
+```
+
+啟用 Runtime Extension 框架，允許外部服務在 cluster lifecycle 的關鍵節點注入自訂邏輯。需要部署 `ExtensionConfig` CRD 並建立對應的 extension server。
+
+詳細說明請參考 [RuntimeSDK Extension 架構](/cluster-api/features/runtimesdk-architecture)。
+
+### KubeadmBootstrapFormatIgnition（Alpha，預設關閉）
+
+```go
+// alpha: v1.1
+KubeadmBootstrapFormatIgnition featuregate.Feature = "KubeadmBootstrapFormatIgnition"
+```
+
+為 `KubeadmConfig` 新增 Ignition 格式的 bootstrap 支援（除了原有的 cloud-init 格式）。Ignition 是 Fedora CoreOS 和 Flatcar Linux 使用的 bootstrap 格式。
+
+```yaml
+# 啟用後可設定
+apiVersion: bootstrap.cluster.x-k8s.io/v1beta2
+kind: KubeadmConfig
+spec:
+  format: Ignition   # 新增支援
+```
+
+### MachineSetPreflightChecks（Beta，預設開啟）
+
+```go
+// alpha: v1.5
+// beta: v1.9
+MachineSetPreflightChecks featuregate.Feature = "MachineSetPreflightChecks"
+```
+
+啟用 MachineSet 的 preflight check 機制。在建立新 Machine 前，先確認：
+
+- Kubernetes 版本與 control plane 版本的相容性
+- 升級順序的合法性（不跳版）
+- Bootstrap token 等基礎設施是否就緒
+
+### PriorityQueue（Beta，預設開啟）
+
+```go
+// alpha: v1.10
+// beta: v1.13
+PriorityQueue featuregate.Feature = "PriorityQueue"
+```
+
+使用 controller-runtime 的 `PriorityQueue` 替代預設佇列。PriorityQueue 允許為不同的 reconcile request 設定優先順序，確保重要操作（如 Machine 刪除）不被低優先級的 requeue 阻塞。
+
+<Callout type="info" title="PriorityQueue 與 ReconcilerRateLimiting 的依賴">
+`ReconcilerRateLimiting` 必須在 `PriorityQueue` 啟用的情況下才能使用。若只啟用 `ReconcilerRateLimiting` 而不啟用 `PriorityQueue`，會在啟動時報錯。
+</Callout>
+
+### ReconcilerRateLimiting（Beta，預設開啟）
+
+```go
+// alpha: v1.12
+// beta: v1.13
+// Note: 目前 rate limiting 為 1 request/second
+ReconcilerRateLimiting featuregate.Feature = "ReconcilerRateLimiting"
+```
+
+為每個 reconciler 啟用 rate limiting，防止大量事件同時觸發大量 reconcile 操作造成 API server 過載。目前的 rate 設定為每個物件 1 request/second。
+
+### InPlaceUpdates（Alpha，預設關閉）
+
+```go
+// alpha: v1.12
+InPlaceUpdates featuregate.Feature = "InPlaceUpdates"
+```
+
+允許在不重建 Machine 的情況下更新 Machine 的部分設定（就地更新）。傳統模式下，任何 Machine spec 變更都需要重建 Machine（rolling update）。InPlaceUpdates 啟用後，部分欄位可以直接更新。
+
+### MachineTaintPropagation（Alpha，預設關閉）
+
+```go
+// alpha: v1.12
+MachineTaintPropagation featuregate.Feature = "MachineTaintPropagation"
+```
+
+自動將 Machine 的 taints 傳播至對應的 Kubernetes node。這讓 CAPI 使用者可以透過設定 Machine taint 來間接控制 node 的調度行為。
+
+## 如何設定 Feature Gates
+
+### 透過 controller-manager 啟動參數
+
+```bash
+# 方式 1：命令列參數
+./capi-controller-manager \
+  --feature-gates=ClusterTopology=true,RuntimeSDK=true,InPlaceUpdates=false
+
+# 方式 2：Kubernetes Deployment env
+env:
+- name: FEATURE_GATES
+  value: "ClusterTopology=true,RuntimeSDK=true"
+```
+
+### 透過 CAPI 安裝工具（clusterctl）
+
+```bash
+# 使用 clusterctl 安裝時指定 feature gates
+clusterctl init \
+  --infrastructure docker \
+  --feature-gates "ClusterTopology=true,RuntimeSDK=true"
+```
+
+詳細的 clusterctl 使用方式請參考 [clusterctl 指令](/cluster-api/features/clusterctl)。
+
+### 修改已部署的 controller
+
+```bash
+# 修改 CAPI controller 的 Deployment
+kubectl edit deployment capi-controller-manager -n capi-system
+
+# 在 args 中新增或修改
+spec:
+  containers:
+  - name: manager
+    args:
+    - "--feature-gates=ClusterTopology=true"
+```
+
+## Feature Gate 與 CRD 的關係
+
+部分 feature gate 不只控制 controller 行為，還控制相關 CRD 的安裝：
+
+| Feature Gate | 控制的 CRD |
+|--------------|----------|
+| `MachinePool` | `MachinePools.exp.cluster.x-k8s.io` |
+| `ClusterTopology` | `ClusterClasses.cluster.x-k8s.io`（部分 API） |
+| `RuntimeSDK` | `ExtensionConfigs.runtime.cluster.x-k8s.io` |
+
+<Callout type="warning" title="CRD 與 Feature Gate 的順序">
+若在未啟用 feature gate 的情況下嘗試建立對應的 CRD 資源，會收到「resource type not found」或「feature gate disabled」錯誤。請確保先啟用 feature gate，再安裝對應的 CRD。
+</Callout>
+
+## Feature Gate 進階用法（測試環境）
+
+在測試或開發環境中，可以在程式碼中臨時設定 feature gate：
+
+```go
+// 在測試中設定 feature gate
+import "k8s.io/component-base/featuregate/testing"
+
+func TestSomething(t *testing.T) {
+    defer testing.SetFeatureGateDuringTest(
+        t,
+        feature.Gates,
+        feature.ClusterTopology,
+        true,
+    )()
+
+    // 測試邏輯
+}
+```
+
+## 版本演進路徑
+
+Feature gate 的生命週期：
+
+```
+Alpha（預設關閉）
+  → Beta（預設開啟）
+    → GA（強制開啟，gate 最終移除）
+```
+
+| 當前版本 | 預計 Beta | 預計 GA | 備註 |
+|---------|---------|---------|------|
+| ClusterTopology（Alpha v0.4） | 待定 | 待定 | 持續開發中 |
+| RuntimeSDK（Alpha v1.2） | 待定 | 待定 | 持續開發中 |
+| InPlaceUpdates（Alpha v1.12） | 待定 | 待定 | 新功能 |
+| MachineTaintPropagation（Alpha v1.12） | 待定 | 待定 | 新功能 |
+| MachineWaitForVolumeDetachConsiderVolumeAttachments（GA） | 已 GA | 已 GA | v1.15 移除 gate |
+
+## 疑難排解
+
+```bash
+# 確認目前 feature gate 設定
+kubectl exec -n capi-system deployment/capi-controller-manager \
+  -- /manager --feature-gates=""  # 啟動失敗時會顯示支援的 gates
+
+# 查看 controller 日誌中的 feature gate 資訊
+kubectl logs -n capi-system deployment/capi-controller-manager \
+  | grep -i "feature gate\|featuregate"
+
+# 常見錯誤：ClusterClass 操作失敗
+# Error: "ClusterClass is not available, please enable the ClusterTopology feature gate"
+# 解決：kubectl edit deployment capi-controller-manager -n capi-system
+#       在 args 中加入 --feature-gates=ClusterTopology=true
+```

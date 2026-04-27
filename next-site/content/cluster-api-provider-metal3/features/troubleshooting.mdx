@@ -1,0 +1,419 @@
+---
+layout: doc
+title: Cluster API Provider Metal3 — 故障排除指南
+description: 常見 Metal3 問題的診斷與解決方法，包含 Machine 卡住、Host 選擇失敗、ProviderID 未設定、Remediation 不觸發等情境
+---
+
+# 故障排除指南
+
+<Callout type="info" title="相關章節">
+- [Host 選擇策略](/cluster-api-provider-metal3/features/host-selection-strategy)
+- [ProviderID 工作流](/cluster-api-provider-metal3/features/provider-id-workflow)
+- [Remediation 整合](/cluster-api-provider-metal3/features/machine-health-check-integration)
+- [Ironic 整合](/cluster-api-provider-metal3/features/ironic-integration)
+</Callout>
+
+## 診斷工具速查
+
+在排查任何問題前，先收集這些資訊：
+
+```bash
+# 查看所有 Metal3 資源狀態
+kubectl get cluster,metal3cluster,machine,metal3machine \
+  -n default -o wide
+
+# 查看所有 BareMetalHost 狀態
+kubectl get baremetalhosts -n metal3 -o wide
+
+# CAPM3 controller 日誌（最近 100 行）
+kubectl logs -n capm3-system \
+  deploy/capm3-controller-manager \
+  -c manager --tail=100
+
+# BMO controller 日誌
+kubectl logs -n baremetal-operator-system \
+  deploy/baremetal-operator-controller-manager \
+  --tail=100
+```
+
+## 問題 1：Machine 卡在 Provisioning 狀態
+
+### 症狀
+
+```bash
+kubectl get machine -n default
+# NAME        PHASE         AGE
+# worker-0    Provisioning  15m
+```
+
+### 診斷步驟
+
+**步驟 1**：確認 Metal3Machine 狀態
+
+```bash
+kubectl get metal3machine -n metal3 -o yaml worker-machine-0
+# 重點查看：
+# - spec.providerID（是否已設定）
+# - status.ready（是否為 true）
+# - status.conditions
+```
+
+**步驟 2**：確認 BareMetalHost 狀態
+
+```bash
+kubectl get baremetalhosts -n metal3
+# 正常流程：
+# available → provisioning → provisioned
+```
+
+**步驟 3**：根據 BMH 狀態排查
+
+| BMH State | 可能原因 | 解決方法 |
+|-----------|---------|----------|
+| `available` | 沒有符合條件的 BMH 被選中 | 確認 HostSelector labels |
+| `provisioning` | Ironic 正在執行但很慢 | 查看 BMO logs 和 Ironic logs |
+| `provisioningError` | Ironic 執行失敗 | 查看 BMH.Status.ErrorMessage |
+| `registering` | BMH 尚未完成 introspection | 等待完成，或排查 Ironic 連線 |
+
+**步驟 4**：查看 BMH 的詳細錯誤
+
+```bash
+kubectl get baremetalhost worker-host-01 -n metal3 \
+  -o jsonpath='{.status.errorMessage}{"\n"}'
+
+kubectl get baremetalhost worker-host-01 -n metal3 \
+  -o jsonpath='{.status.errorType}{"\n"}'
+```
+
+**步驟 5**：查看 CAPM3 controller 日誌
+
+```bash
+kubectl logs -n capm3-system \
+  deploy/capm3-controller-manager \
+  -c manager | grep -E "worker-machine-0|ERROR|error" | tail -30
+```
+
+### 常見根因與解決方法
+
+**根因 A：Image URL 無法存取**
+
+```bash
+# 確認 Ironic 可以下載 image
+curl -I http://your-http-server/rhcos.raw.gz
+# 必須回傳 200 OK
+
+# 查看 BMH 錯誤
+kubectl describe baremetalhost worker-host-01 -n metal3 | grep -A5 "Error"
+```
+
+**根因 B：Checksum 不匹配**
+
+```bash
+# 手動計算 image checksum
+sha256sum /path/to/rhcos.raw.gz
+
+# 與 Metal3Machine spec 中的 checksum 比對
+kubectl get metal3machine worker-machine-0 -n metal3 \
+  -o jsonpath='{.spec.image.checksum}'
+```
+
+**根因 C：userData 格式錯誤**
+
+```bash
+# 確認 bootstrap Secret 存在且有 value 欄位
+kubectl get secret worker-machine-0-bootstrap -n metal3 -o yaml
+# 必須有 data.value 欄位（base64 encoded）
+```
+
+## 問題 2：Host 選擇失敗（No available host）
+
+### 症狀
+
+Metal3Machine 長時間沒有對應的 BMH，CAPM3 日誌出現：
+
+```
+No available host found for metal3machine "worker-machine-0"
+```
+
+### 診斷步驟
+
+**步驟 1**：確認 BMH 數量和狀態
+
+```bash
+kubectl get baremetalhosts -n metal3 \
+  -o custom-columns='NAME:.metadata.name,STATE:.status.provisioning.state,CONSUMER:.spec.consumerRef.name'
+```
+
+只有 `available` 和 `ready` 狀態的 BMH 才可被選擇。
+
+**步驟 2**：確認 HostSelector 設定
+
+```bash
+# 查看 Metal3Machine 的 HostSelector
+kubectl get metal3machine worker-machine-0 -n metal3 \
+  -o jsonpath='{.spec.hostSelector}' | jq .
+
+# 查看所有 BMH 的 labels
+kubectl get baremetalhosts -n metal3 --show-labels
+```
+
+**步驟 3**：手動模擬 label selector
+
+```bash
+# 若 Metal3Machine 要求 label: node-type=worker
+kubectl get baremetalhosts -n metal3 \
+  -l node-type=worker
+```
+
+### 常見根因
+
+**根因 A：所有 BMH 都被佔用（有 ConsumerRef）**
+
+```bash
+kubectl get baremetalhosts -n metal3 \
+  -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.spec.consumerRef.name}{"\n"}{end}'
+```
+
+解決：等待其他 Machine 釋放 BMH，或新增更多 BMH。
+
+**根因 B：HostSelector 不匹配**
+
+```bash
+# 確認 label key 的格式正確（注意大小寫和特殊字元）
+kubectl get metal3machine worker-machine-0 -n metal3 \
+  -o jsonpath='{.spec.hostSelector.matchLabels}'
+```
+
+**根因 C：BMH namespace 與 Metal3Machine 不同**
+
+CAPM3 只選擇與 Metal3Machine **同 namespace** 的 BMH。確認兩者都在相同 namespace：
+
+```bash
+kubectl get metal3machine,baremetalhosts -n metal3
+```
+
+**根因 D：BMH 帶有 paused annotation**
+
+```bash
+kubectl get baremetalhosts -n metal3 \
+  -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.metadata.annotations.metal3\.io/capm3-paused}{"\n"}{end}'
+```
+
+## 問題 3：ProviderID 未設定 / Node 不加入叢集
+
+### 症狀
+
+```bash
+kubectl get machine worker-0 -n default
+# 沒有 NodeRef，Machine.Status.Phase 停在 Provisioned
+
+kubectl get node
+# worker 節點不出現，或出現但狀態 NotReady
+```
+
+### 診斷步驟
+
+**步驟 1**：確認 Metal3Machine.Spec.ProviderID 是否設定
+
+```bash
+kubectl get metal3machine worker-machine-0 -n metal3 \
+  -o jsonpath='{.spec.providerID}'
+# 預期：metal3://metal3/worker-host-01/worker-machine-0
+```
+
+**步驟 2**：確認 BMH 已 provisioned
+
+```bash
+kubectl get baremetalhost worker-host-01 -n metal3 \
+  -o jsonpath='{.status.provisioning.state}'
+# 預期：provisioned
+```
+
+**步驟 3**：確認 Node 上的 ProviderID
+
+```bash
+# Node 已加入但 ProviderID 格式不對
+kubectl get node worker-node-01 \
+  -o jsonpath='{.spec.providerID}'
+```
+
+**步驟 4**：確認 CAPM3 是否設定了 Node ProviderID
+
+```bash
+# 查看 CAPM3 日誌中的 ProviderID 相關訊息
+kubectl logs -n capm3-system \
+  deploy/capm3-controller-manager \
+  -c manager | grep -i "providerID\|noderef" | tail -20
+```
+
+### 常見根因
+
+**根因 A：hostname 不匹配**
+
+CAPM3 使用 BMH 名稱或 `spec.hostname` 來找 Node。確認：
+
+```bash
+# Metal3Machine 對應的 BMH
+kubectl get metal3machine worker-machine-0 -n metal3 \
+  -o jsonpath='{.status.addresses}' | jq .
+
+# Node hostname
+kubectl get node worker-node-01 \
+  -o jsonpath='{.metadata.labels.kubernetes\.io/hostname}'
+```
+
+**根因 B：cloud-provider-metal3 未部署**
+
+若使用外部 cloud provider 模式，需要 cloud-provider-metal3：
+
+```bash
+kubectl get pods -n kube-system | grep cloud-provider-metal3
+```
+
+**根因 C：已停用外部 cloud provider（不使用 cloud-provider-metal3）**
+
+```bash
+# 確認 Metal3Machine 的 externalCloudProvider 設定
+kubectl get metal3machine worker-machine-0 -n metal3 \
+  -o jsonpath='{.spec.externalCloudProvider}'
+# 若為 false，則由 CAPM3 直接設定 Node.Spec.ProviderID
+```
+
+## 問題 4：Remediation 不觸發
+
+### 症狀
+
+MachineHealthCheck 設定了，但 unhealthy Machine 沒有被 remediate：
+
+```bash
+kubectl get machinehealthcheck -n default
+# 顯示 UNHEALTHY 數量 > 0 但 Machine 未重啟
+```
+
+### 診斷步驟
+
+**步驟 1**：確認 Metal3Remediation 資源是否被建立
+
+```bash
+kubectl get metal3remediation -n metal3
+```
+
+**步驟 2**：確認 MachineHealthCheck 的 remediationTemplate 設定
+
+```bash
+kubectl get machinehealthcheck my-mhc -n default \
+  -o jsonpath='{.spec.remediationTemplate}' | jq .
+# 應指向 Metal3RemediationTemplate
+```
+
+**步驟 3**：查看 Metal3RemediationTemplate 設定
+
+```bash
+kubectl get metal3remediationtemplate -n metal3 -o yaml
+# 確認 spec.template.spec.strategy 正確設定
+```
+
+**步驟 4**：確認 UnhealthyAnnotation 是否存在
+
+```bash
+kubectl get baremetalhost -n metal3 \
+  -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.metadata.annotations.capi\.metal3\.io/unhealthy}{"\n"}{end}'
+```
+
+**步驟 5**：查看 CAPM3 remediation controller 日誌
+
+```bash
+kubectl logs -n capm3-system \
+  deploy/capm3-controller-manager \
+  -c manager | grep -i "remediation\|reboot" | tail -30
+```
+
+### 常見根因
+
+**根因 A：使用了舊版 UnhealthyAnnotation**
+
+```bash
+# 舊版（不再支援）
+metal3.io/unhealthy
+
+# 新版（正確）
+capi.metal3.io/unhealthy
+```
+
+若 BMH 上有舊版 annotation，CAPM3 會記錄 warning 但不執行 remediation。
+
+**根因 B：Cluster 或 Machine 被 paused**
+
+```bash
+kubectl get cluster my-cluster -n default \
+  -o jsonpath='{.spec.paused}'
+```
+
+**根因 C：MachineHealthCheck 未正確關聯**
+
+```bash
+# 確認 MHC selector 匹配到 Machine
+kubectl get machinehealthcheck my-mhc -n default \
+  -o jsonpath='{.spec.selector}' | jq .
+
+kubectl get machine -n default --show-labels | grep worker
+```
+
+## 問題 5：Metal3DataClaim 卡住（不建立 Metal3Data）
+
+### 症狀
+
+```bash
+kubectl get metal3dataclaim -n metal3
+# NAME            PHASE   AGE
+# worker-claim    ""      10m   # 沒有 PHASE
+```
+
+### 診斷步驟
+
+```bash
+# 確認 Metal3DataTemplate 存在
+kubectl get metal3datatemplate -n metal3
+
+# 確認 Metal3DataTemplate 的 spec 正確
+kubectl get metal3datatemplate my-template -n metal3 -o yaml
+
+# 查看 Metal3DataClaim 的 ownerReference
+kubectl get metal3dataclaim worker-claim -n metal3 \
+  -o jsonpath='{.metadata.ownerReferences}' | jq .
+```
+
+### 常見根因
+
+**根因 A**：Metal3DataClaim 的 `spec.template.name` 指向不存在的 Metal3DataTemplate：
+
+```bash
+kubectl get metal3dataclaim worker-claim -n metal3 \
+  -o jsonpath='{.spec.template.name}'
+# 確認此名稱的 Metal3DataTemplate 存在
+```
+
+## 緊急診斷 Checklist
+
+遇到任何 Metal3 問題，依序確認：
+
+```bash
+# 1. 所有 Metal3 controller 都在 Running
+kubectl get pods -n capm3-system
+kubectl get pods -n baremetal-operator-system
+
+# 2. Webhook 服務正常
+kubectl get svc -n capm3-system
+
+# 3. BMH 狀態總覽
+kubectl get baremetalhosts -n metal3 \
+  -o custom-columns='NAME:.metadata.name,STATE:.status.provisioning.state,ERROR:.status.errorMessage'
+
+# 4. Machine 與 Metal3Machine 對應
+kubectl get machine -n default
+kubectl get metal3machine -n metal3
+
+# 5. Conditions 摘要
+kubectl get metal3machine -n metal3 \
+  -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{range .status.conditions[*]}  {.type}: {.status} ({.reason}){"\n"}{end}{end}'
+```

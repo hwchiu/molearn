@@ -1,0 +1,225 @@
+---
+layout: doc
+title: Kube-OVN — EIP、SNAT 與 DNAT
+description: 使用 OVN 原生 EIP / SNAT / DNAT CRD 為 Pod 提供細粒度的外部 IP 存取控制
+---
+
+# EIP、SNAT 與 DNAT
+
+<Callout type="info" title="相關章節">
+- [VPC 與 Subnet 設計](/kube-ovn/features/vpc-subnet)
+- [NAT Gateway](/kube-ovn/features/nat-gateway)
+- [IPAM 設計](/kube-ovn/features/ipam)
+- [整體架構](/kube-ovn/features/architecture)
+</Callout>
+
+<Callout type="tip" title="本文適用對象">
+- 🟢 **初學者**：理解 EIP、SNAT、DNAT 的基本概念與使用場景
+- 🟡 **中階工程師**：掌握 OvnEip、IptablesEIPRule 等 CRD 的設定方式
+- 🔴 **資深工程師**：深入理解 OVN-native EIP 與 iptables-based EIP 的差異、Floating IP 1:1 NAT 的實作原理
+</Callout>
+
+> 📦 **類比**：EIP（Elastic IP）就像公有雲中的彈性公網 IP——無論 Pod 重啟、重排程到哪個 Node，都持有相同的對外 IP 地址。SNAT 是「共用出口」，DNAT 是「開放入口」。
+
+## EIP / SNAT / DNAT 與 VPC NAT Gateway 的差異
+
+Kube-OVN 提供兩套 NAT 機制，需要區分清楚：
+
+| 特性 | VPC NAT Gateway（Pod-based）| OVN-native / iptables EIP |
+|------|---------------------------|--------------------------|
+| 實作位置 | 專用 NAT Gateway Pod（用戶空間）| OVN Logical Router 或 Node iptables |
+| 適用範圍 | 整個 VPC / Subnet | 單一 Pod 或特定 IP |
+| CRD 類型 | `VpcNatGateway` | `OvnEip`, `IptablesEIPRule`, `IptablesFIPRule` 等 |
+| 效能 | 受限於 Gateway Pod 吞吐 | OVN 路徑為 kernel offload |
+| 設定粒度 | Subnet 層級 | Pod 層級 |
+| 主要用途 | 大規模 outbound SNAT | 單 Pod 對外暴露 / 精細 NAT 控制 |
+
+> **重要**：本文描述的 EIP/SNAT/DNAT 是 **iptables-based** 實作（部署在 Node 上，不需要獨立 Gateway Pod）與 **OVN-native** 實作，兩者 CRD 名稱不同，適用場景也不同。
+
+## 兩種 EIP 實作路徑
+
+### OVN-native EIP
+
+透過 OVN Logical Router 的 NAT 功能實作，流量直接在 OVS kernel 層處理，效能最佳：
+
+- 使用 `OvnEip` CRD 宣告外部 IP
+- 由 `kube-ovn-controller` 在 OVN NB DB 中建立 `nat` 條目
+- 適用於 **VPC 自訂路由** + **Underlay provider network** 場景
+
+### iptables-based EIP
+
+在每個節點上使用 iptables DNAT/SNAT 規則實作，由 `kube-ovn-daemon` 管理規則：
+
+- 使用 `IptablesEIPRule`、`IptablesFIPRule`、`IptablesSnatRule`、`IptablesDnatRule` 等 CRD
+- 不依賴 OVN NAT 功能，相容性更廣
+- 適用於 **Overlay 網路** + **需要精細 Pod 級 NAT** 的場景
+
+## OvnEip CRD
+
+`OvnEip` 代表從 Provider Network 分配的一個外部 IP，類似公有雲的「申請一個彈性公網 IP」：
+
+```yaml
+apiVersion: kubeovn.io/v1
+kind: OvnEip
+metadata:
+  name: eip-web-server
+spec:
+  externalSubnet: external-subnet   # 對應 Underlay provider subnet 名稱
+  type: nat                         # 用途：nat（給 NAT 用）或 lsp（直接接口）
+```
+
+建立後，`OvnEip` 的 `status` 會顯示分配到的 IP：
+
+```yaml
+status:
+  ip: 203.0.113.50
+  mac: "00:00:00:11:22:33"
+  ready: true
+  type: nat
+```
+
+## IptablesEIPRule：Pod 綁定外部 IP
+
+`IptablesEIPRule` 將一個 EIP 綁定到特定 Pod，使該 Pod 的 outbound 流量使用此 EIP 作為來源 IP：
+
+```yaml
+apiVersion: kubeovn.io/v1
+kind: IptablesEIPRule
+metadata:
+  name: bind-eip-web
+spec:
+  eip: eip-web-server              # 引用 OvnEip 名稱（或已分配的外部 IP）
+  internalIp: 10.16.0.100          # Pod 的 cluster 內部 IP
+```
+
+<Callout type="info" title="EIP 與 Pod 的對應">
+`internalIp` 填寫 Pod 的 Kube-OVN IPAM 分配 IP。透過 `kubectl get ip` 可查詢每個 Pod 對應的 IP CRD 物件。
+</Callout>
+
+## IptablesFIPRule：Floating IP（1:1 NAT）
+
+Floating IP 是「雙向 1:1 NAT」——外部流量進來轉到 Pod，Pod 出去流量改成 EIP。這是最完整的 EIP 語義：
+
+```yaml
+apiVersion: kubeovn.io/v1
+kind: IptablesFIPRule
+metadata:
+  name: fip-database
+spec:
+  eip: eip-db-server               # EIP 名稱
+  internalIp: 10.16.0.200          # Pod 內部 IP（雙向 NAT）
+```
+
+| 方向 | NAT 動作 | 效果 |
+|------|---------|------|
+| Outbound（Pod → 外部）| SNAT：src 改為 EIP | 外部看到 EIP 作為來源 |
+| Inbound（外部 → EIP）| DNAT：dst 改為 Pod IP | 流量直達 Pod |
+
+這等同於 AWS 的「彈性 IP 直接關聯到 EC2 Instance」語義。
+
+## IptablesSnatRule：Subnet SNAT
+
+對整個 Subnet 做 SNAT，讓 Subnet 內所有 Pod 共用一個或多個外部 IP 出去：
+
+```yaml
+apiVersion: kubeovn.io/v1
+kind: IptablesSnatRule
+metadata:
+  name: snat-app-subnet
+spec:
+  eip: eip-app-egress             # 用哪個 EIP 做 SNAT
+  internalCIDR: 10.16.10.0/24     # 哪個 Subnet 的流量需要 SNAT
+```
+
+<Callout type="tip" title="SNAT 與預設 natOutgoing 的差異">
+Kube-OVN Subnet 的 `spec.natOutgoing: true` 使用的是節點 IP 做 SNAT（與 Flannel 行為類似）。`IptablesSnatRule` 則讓你指定一個固定的外部 EIP 做 SNAT，適合需要固定出口 IP 的合規場景（如資料庫白名單）。
+</Callout>
+
+## IptablesDnatRule：DNAT 入埠對應
+
+將外部特定 port 的流量轉發到 Pod 的指定 port，類似 NAT 路由器的「連接埠轉發（Port Forwarding）」：
+
+```yaml
+apiVersion: kubeovn.io/v1
+kind: IptablesDnatRule
+metadata:
+  name: dnat-ssh-jumpbox
+spec:
+  eip: eip-jumpbox                 # 外部 IP
+  externalPort: "2222"             # 外部埠號
+  protocol: tcp                    # tcp / udp
+  internalIp: 10.16.0.50          # 目標 Pod IP
+  internalPort: "22"               # Pod 的目標埠號
+```
+
+此規則讓 `ssh 203.0.113.60 -p 2222` 直達 Pod `10.16.0.50:22`，而無需透過 NodePort 或 LoadBalancer。
+
+## 完整使用範例：暴露 Web 服務
+
+以下示範從零開始，為一個 Nginx Pod 分配 EIP 並開放 80 port：
+
+```bash
+# 步驟 1：查看可用的 external subnet
+kubectl get subnet | grep external
+
+# 步驟 2：申請 EIP
+kubectl apply -f - <<EOF
+apiVersion: kubeovn.io/v1
+kind: OvnEip
+metadata:
+  name: eip-nginx
+spec:
+  externalSubnet: external
+  type: nat
+EOF
+
+# 步驟 3：等待 EIP 就緒，查看分配的 IP
+kubectl get ovneip eip-nginx -o jsonpath='{.status.ip}'
+```
+
+```yaml
+# 步驟 4：建立 FIP（雙向 1:1 NAT）
+apiVersion: kubeovn.io/v1
+kind: IptablesFIPRule
+metadata:
+  name: fip-nginx
+spec:
+  eip: eip-nginx
+  internalIp: 10.16.0.150   # Nginx Pod 的 IP
+```
+
+```bash
+# 步驟 5：驗證
+curl http://$(kubectl get ovneip eip-nginx -o jsonpath='{.status.ip}')
+```
+
+## EIP 與 LoadBalancer Service 的比較
+
+| 特性 | EIP（IptablesFIPRule）| LoadBalancer Service |
+|------|----------------------|----------------------|
+| 適用對象 | 單一 Pod | 一組 Pod（selector）|
+| 負載均衡 | 無（直連 Pod）| 有（kube-proxy / OVN LB）|
+| 固定 IP | 是（EIP 持久）| 取決於雲端 LB |
+| 入埠控制 | 每個 port 獨立設定 | Service port 對應 |
+| 主要用途 | 合規出口 IP、SSH 跳板 | 生產服務對外暴露 |
+
+## 查詢與排查
+
+```bash
+# 列出所有 EIP
+kubectl get ovneip
+
+# 查看 FIP 綁定狀態
+kubectl get iptablesfip -o wide
+
+# 確認 iptables 規則是否正確
+ssh <node> iptables -t nat -L PREROUTING -n | grep <eip>
+ssh <node> iptables -t nat -L POSTROUTING -n | grep <internal-ip>
+
+# 查看 controller 處理 EIP 的日誌
+kubectl logs -n kube-system deployment/kube-ovn-controller | grep -i eip
+```
+
+<Callout type="warning" title="EIP 與 NetworkPolicy 的互動">
+使用 EIP 直接暴露 Pod 時，NetworkPolicy 仍然有效。建議同時設定 NetworkPolicy 限制允許訪問的來源 IP 範圍，避免 Pod 直接暴露在公網。
+</Callout>

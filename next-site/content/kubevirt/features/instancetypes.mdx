@@ -1,0 +1,450 @@
+---
+layout: doc
+title: KubeVirt — Instancetypes 與 Preferences
+description: 透過 VirtualMachineInstancetype 與 VirtualMachinePreference CRD，將硬體規格與 VM 定義分離，實現標準化的 VM 規格管理。
+---
+
+# Instancetypes 與 Preferences
+
+<Callout type="info" title="相關章節">
+- [VMI 生命週期](/kubevirt/features/vmi-lifecycle)
+- [virt-controller](/kubevirt/features/virt-controller)
+- [CDI 與 DataVolume](/kubevirt/features/cdi-datavolume)
+- [CPU Pinning 與 NUMA 拓樸](/kubevirt/features/cpu-pinning-numa)
+</Callout>
+
+<Callout type="tip" title="本文適用對象">
+- 🟢 **初學者**：了解為什麼需要 Instancetype，以及如何使用內建規格建立 VM
+- 🟡 **中階工程師**：學習如何設計自訂 Instancetype 與 Preference，建立企業內部規格目錄
+- 🔴 **資深工程師**：深入 ControllerRevision 快照機制、衝突解析邏輯與 API admission webhook 行為
+</Callout>
+
+> 📦 **類比**：Instancetype 就像雲端供應商的「VM 規格型號」（如 AWS 的 t3.medium、GCP 的 n1-standard-2）——使用者只需選擇型號，不需要自己填寫 CPU 數量與記憶體大小；Preference 則像「作業系統建議的最佳硬體組合」，告訴 KubeVirt 哪種磁碟匯流排最適合特定 guest OS。
+
+## 什麼是 Instancetype
+
+在 KubeVirt 早期，每個 VirtualMachine 定義都必須完整描述所有硬體細節：CPU 數量、記憶體大小、磁碟匯流排類型等。這造成幾個問題：
+
+1. **重複設定**：建立 100 個相同規格的 VM，要複製貼上相同的硬體區塊 100 次
+2. **規格不一致**：不同工程師各自設定，導致同一「標準」規格有微妙差異
+3. **變更困難**：要調整某規格時，需要更新所有使用該規格的 VM 定義
+
+Instancetype 機制解決上述問題，將「**硬體資源需求**」與「**VM 個人設定**」分離為獨立物件。
+
+### 四種相關 CRD
+
+| CRD | 範疇 | 用途 |
+|-----|------|------|
+| `VirtualMachineInstancetype` | Namespace | 命名空間內共享的硬體規格 |
+| `VirtualMachineClusterInstancetype` | Cluster | 跨命名空間共享的硬體規格 |
+| `VirtualMachinePreference` | Namespace | 命名空間內共享的 guest 偏好設定 |
+| `VirtualMachineClusterPreference` | Cluster | 跨命名空間共享的 guest 偏好設定 |
+
+**Instancetype** 定義「資源需求」（CPU、記憶體、GPU），這些欄位會**強制覆蓋** VM spec 中的對應設定。
+
+**Preference** 定義「建議設定」（磁碟匯流排、網路介面類型、輸入裝置），只有在 VM spec **未明確指定**時才套用。
+
+---
+
+## VirtualMachineInstancetype 規格詳解
+
+### CPU 設定
+
+```yaml
+apiVersion: instancetype.kubevirt.io/v1beta1
+kind: VirtualMachineClusterInstancetype
+metadata:
+  name: u1.medium
+spec:
+  cpu:
+    guest: 4                          # guest vCPU 數量（必填）
+    model: host-passthrough           # CPU model：host-passthrough / host-model / 特定型號
+    dedicatedCPUPlacement: false      # 是否使用獨佔 CPU（需要 CPU Manager）
+    isolateEmulatorThread: false      # 是否將模擬器執行緒隔離到獨立 CPU
+    threads: 2                        # 每個 core 的執行緒數（SMT 拓樸）
+    cores: 2                          # 每個 socket 的 core 數
+    sockets: 1                        # socket 數
+    numa:
+      guestMappingPassthrough: {}     # 將主機 NUMA 拓樸傳遞給 guest
+```
+
+| 欄位 | 說明 | 典型值 |
+|------|------|--------|
+| `guest` | guest 可見的 vCPU 總數 | 1, 2, 4, 8, 16 |
+| `model` | libvirt CPU model | `host-passthrough`（最佳效能）|
+| `dedicatedCPUPlacement` | 獨佔 CPU core（需 Kubernetes CPU Manager static policy）| `false`（預設）|
+| `isolateEmulatorThread` | QEMU 模擬器執行緒使用額外 CPU | `false` |
+
+### 記憶體設定
+
+```yaml
+spec:
+  memory:
+    guest: 8Gi                        # guest 記憶體大小（必填）
+    hugepages:
+      pageSize: "2Mi"                 # 大頁記憶體：2Mi 或 1Gi
+    overcommitPercent: 0              # 記憶體超額分配百分比（0 = 不超賣）
+```
+
+<Callout type="warning" title="Hugepages 注意事項">
+使用 hugepages 時，`memory.guest` 必須是 pageSize 的整數倍。例如 pageSize 為 `2Mi` 時，guest 記憶體必須是 2Mi 的倍數（如 2Gi = 1024 × 2Mi）。主機節點也需要預先配置對應數量的 hugepages。
+</Callout>
+
+### GPU 設定
+
+```yaml
+spec:
+  gpus:
+    - name: gpu1
+      deviceName: nvidia.com/GP102GL_Tesla_P40  # 對應 device plugin 資源名稱
+```
+
+### I/O 執行緒策略
+
+```yaml
+spec:
+  ioThreadsPolicy: shared   # shared（共享一個 I/O 執行緒）或 auto（每個磁碟一個執行緒）
+```
+
+---
+
+## VirtualMachinePreference 規格詳解
+
+Preference 描述「如果 VM 沒指定，建議用這些設定」。常見用途是針對特定 guest OS（Windows、Ubuntu、RHEL）提供最佳硬體設定。
+
+```yaml
+apiVersion: instancetype.kubevirt.io/v1beta1
+kind: VirtualMachineClusterPreference
+metadata:
+  name: windows.2k22
+spec:
+  clock:
+    preferredClockOffset:
+      utc: {}                         # Windows 使用 UTC
+    preferredTimer:
+      hpet:
+        present: false
+      hyperv: {}                      # 啟用 Hyper-V 擴充功能
+      pit:
+        tickPolicy: delay
+      rtc:
+        tickPolicy: catchup
+  cpu:
+    preferredCPUTopology: preferSockets  # 偏好以 socket 為單位展開 vCPU
+  devices:
+    preferredDiskBus: sata            # Windows 相容的磁碟匯流排
+    preferredInterfaceModel: e1000e   # Windows 內建驅動支援的網路卡
+    preferredInputBus: usb            # USB 滑鼠/鍵盤
+    preferredRng: {}                  # 啟用亂數產生器
+  features:
+    preferredHyperv:                  # Hyper-V 最佳化
+      relaxed:
+        enabled: true
+      spinlocks:
+        enabled: true
+        spinlocks: 8191
+      vapic:
+        enabled: true
+  firmware:
+    preferredUseEfi: true             # 使用 UEFI（Windows 需要）
+    preferredUseSecureBoot: true
+```
+
+Linux（virtio 最佳化）的 Preference 範例：
+
+```yaml
+apiVersion: instancetype.kubevirt.io/v1beta1
+kind: VirtualMachineClusterPreference
+metadata:
+  name: ubuntu
+spec:
+  cpu:
+    preferredCPUTopology: preferCores
+  devices:
+    preferredDiskBus: virtio          # virtio 磁碟效能最佳
+    preferredInterfaceModel: virtio   # virtio 網路效能最佳
+    preferredInputBus: virtio
+    preferredRng: {}
+```
+
+---
+
+## 在 VirtualMachine 中引用 Instancetype
+
+### 基本用法
+
+```yaml
+apiVersion: kubevirt.io/v1
+kind: VirtualMachine
+metadata:
+  name: my-vm
+  namespace: default
+spec:
+  instancetype:
+    kind: VirtualMachineClusterInstancetype   # 或 VirtualMachineInstancetype（命名空間）
+    name: u1.medium
+  preference:
+    kind: VirtualMachineClusterPreference
+    name: ubuntu
+  running: true
+  template:
+    spec:
+      domain:
+        # 不需要指定 CPU / memory，由 instancetype 決定
+        devices:
+          disks:
+            - name: root-disk
+              disk: {}             # bus 由 preference 決定（virtio）
+      volumes:
+        - name: root-disk
+          dataVolume:
+            name: ubuntu-22.04-root
+```
+
+### 衝突解析規則
+
+當 VM spec 中明確指定了 instancetype 也會設定的欄位時，admission webhook 會**拒絕**請求並返回錯誤，而不是靜默覆蓋。這確保了設定的一致性。
+
+| 情境 | 行為 |
+|------|------|
+| VM spec 指定 `domain.cpu.cores`，同時引用 instancetype | ❌ 被 webhook 拒絕 |
+| VM spec 指定 `domain.devices.disks[].disk.bus`，同時引用 preference | ✅ VM 設定優先，preference 被忽略 |
+| VM spec 完全不指定 CPU/memory，引用 instancetype | ✅ instancetype 值生效 |
+
+<Callout type="info" title="Preference 是建議，Instancetype 是強制">
+Instancetype 設定的欄位在 VM 中**不能被覆蓋**（會被拒絕）。Preference 設定的欄位只是「如果你沒設定，就用這個」的建議，VM 中的明確設定會優先。
+</Callout>
+
+---
+
+## ControllerRevision：版本快照機制
+
+當 VM 被建立時，KubeVirt 會自動為引用的 instancetype 和 preference 建立 **ControllerRevision**（Kubernetes 內建物件），儲存當時的完整規格快照。
+
+### 為什麼需要快照
+
+假設沒有快照機制：
+1. 叢集管理員將 `u1.medium` 從 4 vCPU 升級到 8 vCPU
+2. 已運行的 VM 突然「看到」不同的規格
+3. VM 重啟後行為改變，造成不一致
+
+有了快照機制：
+1. VM 建立時，快照記錄「建立當時」的 instancetype 規格
+2. 後續 instancetype 更新**不影響**已存在的 VM
+3. 只有明確更新 VM 的 `instancetype.revisionName` 才會採用新規格
+
+### ControllerRevision 結構
+
+```bash
+# 查看某 VM 使用的 instancetype 快照
+kubectl get controllerrevision -n default -l instancetype.kubevirt.io/name=u1.medium
+```
+
+```yaml
+apiVersion: apps/v1
+kind: ControllerRevision
+metadata:
+  name: u1.medium-v1234567890
+  namespace: default
+  labels:
+    instancetype.kubevirt.io/name: u1.medium
+    instancetype.kubevirt.io/uid: <uid>
+revision: 1
+data:
+  apiVersion: instancetype.kubevirt.io/v1beta1
+  kind: VirtualMachineClusterInstancetype
+  spec:
+    cpu:
+      guest: 4
+    memory:
+      guest: 8Gi
+```
+
+VM spec 中會記錄快照名稱：
+
+```yaml
+spec:
+  instancetype:
+    kind: VirtualMachineClusterInstancetype
+    name: u1.medium
+    revisionName: u1.medium-v1234567890   # 自動填入
+```
+
+---
+
+## 內建 Instancetype
+
+KubeVirt 社群維護一套標準 instancetype，透過 `common-instancetypes` 套件提供：
+
+### 通用規格（`u` 系列）
+
+| 名稱 | vCPU | 記憶體 | 適用場景 |
+|------|------|--------|---------|
+| `u1.nano` | 1 | 512Mi | 極輕量測試 |
+| `u1.micro` | 1 | 1Gi | 輕量服務 |
+| `u1.small` | 1 | 2Gi | 一般開發 |
+| `u1.medium` | 1 | 4Gi | 標準工作負載 |
+| `u1.large` | 2 | 8Gi | 中等工作負載 |
+| `u1.xlarge` | 4 | 16Gi | 較大工作負載 |
+| `u1.2xlarge` | 8 | 32Gi | 重量級服務 |
+
+### 記憶體優化系列（`m` 系列）
+
+| 名稱 | vCPU | 記憶體 | 適用場景 |
+|------|------|--------|---------|
+| `m1.xlarge` | 4 | 32Gi | 記憶體密集 |
+| `m1.2xlarge` | 8 | 64Gi | 大型資料庫 |
+
+### 安裝內建 Instancetype
+
+```bash
+# 安裝 common-instancetypes（需要先安裝 KubeVirt）
+kubectl apply -f https://github.com/kubevirt/common-instancetypes/releases/latest/download/common-clusterinstancetypes.yaml
+kubectl apply -f https://github.com/kubevirt/common-instancetypes/releases/latest/download/common-clusterpreferences.yaml
+```
+
+---
+
+## 完整範例：自訂企業規格
+
+### 建立命名空間級 Instancetype
+
+```yaml
+apiVersion: instancetype.kubevirt.io/v1beta1
+kind: VirtualMachineInstancetype
+metadata:
+  name: production-web
+  namespace: web-team
+  labels:
+    tier: production
+    team: web
+spec:
+  cpu:
+    guest: 4
+    model: host-passthrough
+    threads: 2
+    cores: 2
+    sockets: 1
+  memory:
+    guest: 16Gi
+  ioThreadsPolicy: auto
+---
+apiVersion: instancetype.kubevirt.io/v1beta1
+kind: VirtualMachineInstancetype
+metadata:
+  name: production-db
+  namespace: db-team
+spec:
+  cpu:
+    guest: 8
+    dedicatedCPUPlacement: true      # 資料庫需要獨佔 CPU
+    isolateEmulatorThread: true
+  memory:
+    guest: 64Gi
+    hugepages:
+      pageSize: "1Gi"                # 資料庫使用 1Gi hugepages
+  ioThreadsPolicy: auto
+```
+
+### 建立 Preference
+
+```yaml
+apiVersion: instancetype.kubevirt.io/v1beta1
+kind: VirtualMachinePreference
+metadata:
+  name: rhel9
+  namespace: web-team
+spec:
+  cpu:
+    preferredCPUTopology: preferCores
+  devices:
+    preferredDiskBus: virtio
+    preferredInterfaceModel: virtio
+    preferredRng: {}
+  clock:
+    preferredClockOffset:
+      utc: {}
+```
+
+### 建立使用自訂規格的 VM
+
+```yaml
+apiVersion: kubevirt.io/v1
+kind: VirtualMachine
+metadata:
+  name: web-server-01
+  namespace: web-team
+spec:
+  instancetype:
+    kind: VirtualMachineInstancetype   # 命名空間級，不需指定 kind 也可
+    name: production-web
+  preference:
+    kind: VirtualMachinePreference
+    name: rhel9
+  running: true
+  template:
+    metadata:
+      labels:
+        app: web-server
+    spec:
+      domain:
+        devices:
+          disks:
+            - name: rootdisk
+              disk: {}
+            - name: cloudinit
+              disk: {}
+          interfaces:
+            - name: default
+              masquerade: {}
+      networks:
+        - name: default
+          pod: {}
+      volumes:
+        - name: rootdisk
+          dataVolume:
+            name: rhel9-web-server-01
+        - name: cloudinit
+          cloudInitNoCloud:
+            userDataBase64: <base64-encoded-cloud-init>
+```
+
+---
+
+## 操作指令
+
+```bash
+# 列出所有叢集級 instancetype
+kubectl get virtualmachineclusterinstancetypes
+
+# 列出命名空間 instancetype
+kubectl get virtualmachineinstancetypes -n my-namespace
+
+# 查看 instancetype 詳情
+kubectl describe virtualmachineclusterinstancetype u1.large
+
+# 列出所有叢集級 preference
+kubectl get virtualmachineclusterpreferences
+
+# 查看 VM 使用的 instancetype 快照版本
+kubectl get vm my-vm -o jsonpath='{.spec.instancetype}'
+
+# 使用 virtctl 建立 VM 時指定 instancetype
+virtctl create vm --instancetype u1.medium --preference ubuntu --name my-vm
+```
+
+---
+
+## 設計建議
+
+| 情境 | 建議 |
+|------|------|
+| 多個 team 共用規格 | 使用 `ClusterInstancetype`，由平台團隊維護 |
+| 各 team 有自訂需求 | 使用命名空間級 `Instancetype`，team 自行管理 |
+| 跨 OS 需求 | 為每種 OS 建立對應的 `ClusterPreference` |
+| 生產環境效能 VM | 結合 `dedicatedCPUPlacement: true` + hugepages |
+| 成本控管 | 限制 team 只能使用特定 instancetype（RBAC + admission policy）|
+
+<Callout type="info" title="Instancetype 與 Quota 整合">
+KubeVirt Instancetype 目前不直接與 Kubernetes ResourceQuota 整合。若要限制 team 使用的 VM 規格，可搭配 OPA/Gatekeeper 或 Kyverno 設定 admission policy，限制 VM 只能引用特定的 instancetype 名稱。
+</Callout>

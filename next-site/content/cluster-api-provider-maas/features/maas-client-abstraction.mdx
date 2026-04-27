@@ -1,0 +1,293 @@
+---
+layout: doc
+title: Cluster API Provider MAAS — MAAS Client 介面
+description: 解析 CAPM 如何透過 maas-client-go SDK 抽象化對 MAAS API 的呼叫，以及 Mock client 在測試中的應用。
+---
+
+# MAAS Client 介面
+
+<Callout type="info" title="相關章節">
+- [Scope 設計模式](/cluster-api-provider-maas/features/scope-pattern)
+- [Machine 服務實作](/cluster-api-provider-maas/features/machine-service-implementation)
+- [架構概覽](/cluster-api-provider-maas/features/architecture)
+</Callout>
+
+<Callout type="tip" title="本文適用對象">
+- 🟢 **初學者**：了解 CAPM 如何與 MAAS 系統溝通，不需要了解底層 HTTP 細節。
+- 🟡 **中階工程師**：掌握 `ClientSetInterface` 介面方法與環境變數設定。
+- 🔴 **資深工程師**：分析 Mock client 架構與測試隔離策略。
+</Callout>
+
+> 📦 **類比**：MAAS Client 介面就像餐廳的服務生——廚房（controller）只需要把需求告訴服務生，服務生負責跟廚師（MAAS API）溝通，廚房不需要知道廚師說什麼語言或用什麼流程。
+
+## MAAS Client 架構概覽
+
+CAPM 不直接呼叫 MAAS HTTP API，而是透過第三方 Go SDK `github.com/spectrocloud/maas-client-go` 進行操作。整個呼叫鏈如下：
+
+```
+Controller
+    └── Service (pkg/maas/machine/machine.go)
+            └── ClientSetInterface (maas-client-go)
+                    └── MAAS REST API
+```
+
+## ClientSetInterface
+
+MAAS client SDK 的核心是 `ClientSetInterface`，在 `scope/client.go` 中取得實例：
+
+```go
+// pkg/maas/scope/client.go
+func NewMaasClient(_ *ClusterScope) maasclient.ClientSetInterface {
+    maasEndpoint := os.Getenv("MAAS_ENDPOINT")
+    if maasEndpoint == "" {
+        panic("missing env MAAS_ENDPOINT; e.g: MAAS_ENDPOINT=http://10.11.130.11:5240/MAAS")
+    }
+
+    maasAPIKey := os.Getenv("MAAS_API_KEY")
+    if maasAPIKey == "" {
+        panic("missing env MAAS_API_KEY; e.g: MAAS_API_KEY=x:y:z>")
+    }
+
+    maasClient := maasclient.NewAuthenticatedClientSet(maasEndpoint, maasAPIKey)
+    return maasClient
+}
+```
+
+<Callout type="warning" title="關鍵注意事項">
+`NewMaasClient` 使用 `panic` 而非 error return 來處理缺少必要環境變數的情況。這代表若 MAAS 設定不正確，controller 啟動時就會直接 crash，而不是在第一次 reconcile 時才回報錯誤。
+</Callout>
+
+## 環境變數設定
+
+| 環境變數 | 必要 | 說明 | 範例 |
+|----------|:----:|------|------|
+| `MAAS_ENDPOINT` | ✅ | MAAS API server URL | `http://10.11.130.11:5240/MAAS` |
+| `MAAS_API_KEY` | ✅ | MAAS API key（三段式格式） | `consumer_key:token_key:token_secret` |
+
+### API Key 格式說明
+
+MAAS 使用 OAuth 1.0 認證，API key 由三個部分組成，以冒號分隔：
+
+```
+consumer_key:token_key:token_secret
+```
+
+在 MAAS 管理介面的 `Settings → API keys` 可以產生，或透過 CLI：
+
+```bash
+sudo maas apikey --username=admin
+```
+
+## Machines() 介面方法
+
+`ClientSetInterface` 暴露 `Machines()` 方法，返回一個支援 fluent builder pattern 的介面：
+
+### 取得單一 machine
+
+```go
+// pkg/maas/machine/machine.go
+func (s *Service) GetMachine(systemID string) (*infrav1beta1.Machine, error) {
+    m, err := s.maasClient.Machines().Machine(systemID).Get(context.Background())
+    if err != nil {
+        return nil, err
+    }
+    return fromSDKTypeToMachine(m), nil
+}
+```
+
+對應的 MAAS API：`GET /MAAS/api/2.0/machines/{system_id}/`
+
+### 配置 machine（Allocate）
+
+```go
+allocator := s.maasClient.
+    Machines().
+    Allocator().
+    WithCPUCount(*mm.Spec.MinCPU).
+    WithMemory(*mm.Spec.MinMemoryInMB)
+
+if failureDomain != nil {
+    allocator.WithZone(*failureDomain)
+}
+if mm.Spec.ResourcePool != nil {
+    allocator.WithResourcePool(*mm.Spec.ResourcePool)
+}
+if len(mm.Spec.Tags) > 0 {
+    allocator.WithTags(mm.Spec.Tags)
+}
+
+m, err = allocator.Allocate(ctx)
+```
+
+對應的 MAAS API：`POST /MAAS/api/2.0/machines/?op=allocate`
+
+Allocator 支援的 constraint 方法：
+
+| 方法 | 對應 MAAS 參數 | 說明 |
+|------|--------------|------|
+| `WithCPUCount(n)` | `cpu_count` | 最少 CPU 核心數 |
+| `WithMemory(mb)` | `mem` | 最少記憶體（MB） |
+| `WithZone(zone)` | `zone` | 指定 availability zone |
+| `WithResourcePool(pool)` | `pool` | 指定 resource pool |
+| `WithTags(tags)` | `tags` | 要求 machine 必須有這些 tags |
+
+### 部署 machine（Deploy）
+
+```go
+deployingM, err := m.Deployer().
+    SetUserData(userDataB64).
+    SetOSSystem("custom").
+    SetEphemeralDeploy(mm.Spec.DeployInMemory).
+    SetDistroSeries(mm.Spec.Image).
+    Deploy(ctx)
+```
+
+對應的 MAAS API：`POST /MAAS/api/2.0/machines/{system_id}/?op=deploy`
+
+Deployer 支援的方法：
+
+| 方法 | 說明 |
+|------|------|
+| `SetUserData(b64)` | cloud-init user-data（Base64 編碼） |
+| `SetOSSystem("custom")` | 使用自訂 image |
+| `SetEphemeralDeploy(bool)` | 是否啟用 in-memory 部署 |
+| `SetDistroSeries(image)` | 指定 OS image 名稱 |
+
+### 釋放 machine（Release）
+
+```go
+func (s *Service) ReleaseMachine(systemID string) error {
+    _, err := s.maasClient.Machines().
+        Machine(systemID).
+        Releaser().
+        Release(ctx)
+    return errors.Wrapf(err, "Unable to release machine")
+}
+```
+
+對應的 MAAS API：`POST /MAAS/api/2.0/machines/{system_id}/?op=release`
+
+### 電源管理
+
+```go
+func (s *Service) PowerOnMachine() error {
+    _, err := s.maasClient.Machines().
+        Machine(s.scope.GetSystemID()).
+        PowerManagerOn().
+        WithPowerOnComment("maas provider power on").
+        PowerOn(context.Background())
+    return err
+}
+```
+
+## SDK 物件轉換
+
+SDK 的 `maasclient.Machine` 物件經過 `fromSDKTypeToMachine` 轉換為 CAPM 的內部類型：
+
+```go
+func fromSDKTypeToMachine(m maasclient.Machine) *infrav1beta1.Machine {
+    machine := &infrav1beta1.Machine{
+        ID:               m.SystemID(),
+        Hostname:         m.Hostname(),
+        State:            infrav1beta1.MachineState(m.State()),
+        Powered:          m.PowerState() == "on",
+        DeployedInMemory: m.DeployedInMemory(),
+        AvailabilityZone: m.Zone().Name(),
+    }
+
+    if m.FQDN() != "" {
+        machine.Addresses = append(machine.Addresses, clusterv1.MachineAddress{
+            Type:    clusterv1.MachineExternalDNS,
+            Address: m.FQDN(),
+        })
+    }
+
+    for _, v := range m.IPAddresses() {
+        machine.Addresses = append(machine.Addresses, clusterv1.MachineAddress{
+            Type:    clusterv1.MachineExternalIP,
+            Address: v.String(),
+        })
+    }
+
+    return machine
+}
+```
+
+SDK 方法與 CAPM 內部欄位對照：
+
+| SDK 方法 | 對應 CAPM 欄位 |
+|---------|--------------|
+| `m.SystemID()` | `Machine.ID` |
+| `m.Hostname()` | `Machine.Hostname` |
+| `m.State()` | `Machine.State` |
+| `m.PowerState() == "on"` | `Machine.Powered` |
+| `m.DeployedInMemory()` | `Machine.DeployedInMemory` |
+| `m.Zone().Name()` | `Machine.AvailabilityZone` |
+| `m.FQDN()` | `Addresses[ExternalDNS]` |
+| `m.IPAddresses()` | `Addresses[ExternalIP]` |
+
+## Mock Client 用於測試
+
+CAPM 在 `pkg/maas/client/mock/` 提供了 mock client，用於單元測試時替代真實的 MAAS 連線：
+
+```
+pkg/maas/client/mock/
+├── doc.go                 ← mockgen 產生說明
+└── clienset_mock.go       ← 自動產生的 mock 程式碼
+```
+
+```go
+// pkg/maas/client/mock/doc.go
+// Package mock is auto-generated by mockgen.
+// mockgen 指令會根據 ClientSetInterface 介面定義產生 mock 實作
+```
+
+### 在測試中使用 Mock
+
+```go
+// 測試示例（示意）
+import (
+    "github.com/golang/mock/gomock"
+    mockclient "github.com/spectrocloud/cluster-api-provider-maas/pkg/maas/client/mock"
+)
+
+func TestDeployMachine(t *testing.T) {
+    ctrl := gomock.NewController(t)
+    defer ctrl.Finish()
+
+    mockClient := mockclient.NewMockClientSetInterface(ctrl)
+
+    // 設定期望行為
+    mockClient.EXPECT().
+        Machines().
+        Return(mockMachinesInterface)
+
+    // 注入 mock client 進行測試
+    svc := &machine.Service{
+        maasClient: mockClient,
+        // ...
+    }
+}
+```
+
+## 完整呼叫流程圖
+
+```
+MaasMachine CR
+    │
+    ▼
+Service.DeployMachine(userDataB64)
+    │
+    ├─ ProviderID 為空？
+    │   ├─ 是：Allocator.Allocate()  ──→ MAAS POST /machines/?op=allocate
+    │   └─ 否：Machine(id).Get()     ──→ MAAS GET /machines/{id}/
+    │
+    ├─ Machine.Modifier().SetSwapSize(0).Update()
+    │   └─ MAAS PUT /machines/{id}/ (disable swap)
+    │
+    └─ Machine.Deployer().Deploy()   ──→ MAAS POST /machines/{id}/?op=deploy
+            ├─ SetUserData(cloud-init)
+            ├─ SetOSSystem("custom")
+            ├─ SetEphemeralDeploy(...)
+            └─ SetDistroSeries(image)
+```

@@ -1,0 +1,305 @@
+---
+layout: doc
+title: Cluster API Provider Metal3 — Webhook 驗證與版本轉換
+description: 說明 CAPM3 所有 webhook 的驗證規則、預設值注入，以及 v1beta1 ↔ v1beta2 轉換機制
+---
+
+# Webhook 驗證與版本轉換
+
+<Callout type="info" title="相關章節">
+- [API 版本遷移指南](/cluster-api-provider-metal3/features/api-version-migration)
+- [CRD：Metal3Machine](/cluster-api-provider-metal3/features/crds-machine)
+- [CRD：Metal3Cluster](/cluster-api-provider-metal3/features/crds-cluster)
+- [映像與部署配置](/cluster-api-provider-metal3/features/image-deployment-config)
+</Callout>
+
+<Callout type="tip" title="本文適用對象">
+- 🟢 **初學者**：了解什麼是 admission webhook，以及它在什麼時機被呼叫
+- 🟡 **中階工程師**：理解各資源的驗證規則與常見的 admission 錯誤
+- 🔴 **資深工程師**：掌握 v1beta1/v1beta2 轉換 webhook 的儲存版本機制
+</Callout>
+
+> 📦 **類比**：Webhook 就像是「API 閘道的守門員」——當你提交一份 Kubernetes 資源設定時，守門員先檢查表格是否填寫正確（Validation webhook），必要時幫你補填某些預設欄位（Mutation/Default webhook），然後才允許通過。版本轉換 webhook 則像「翻譯員」，負責在不同語言版本（v1beta1/v1beta2）之間自動轉換。
+
+## Webhook 架構概覽
+
+CAPM3 的 webhook 位於 `internal/webhooks/v1beta2/`，所有 webhook 都針對 v1beta2（hub version）執行。
+
+```
+使用者 kubectl apply
+         │
+         ▼
+Kubernetes API Server
+         │  HTTP(S) 呼叫
+         ▼
+CAPM3 Webhook Server（capm3-controller-manager）
+  ├── /validate-infrastructure-cluster-x-k8s-io-v1beta2-metal3machine
+  ├── /validate-infrastructure-cluster-x-k8s-io-v1beta2-metal3cluster
+  ├── /validate-infrastructure-cluster-x-k8s-io-v1beta2-metal3datatemplate
+  ├── /validate-infrastructure-cluster-x-k8s-io-v1beta2-metal3dataclaim
+  ├── /validate-infrastructure-cluster-x-k8s-io-v1beta2-metal3data
+  ├── /validate-infrastructure-cluster-x-k8s-io-v1beta2-metal3remediation
+  └── /convert（版本轉換 webhook）
+```
+
+## 各資源的 Webhook 一覽
+
+| 資源 | Webhook 類型 | 驗證動作 |
+|------|-------------|----------|
+| Metal3Machine | Validating | create, update |
+| Metal3MachineTemplate | Validating | create, update |
+| Metal3Cluster | Validating | create, update |
+| Metal3ClusterTemplate | Validating | create, update |
+| Metal3DataTemplate | Validating | create, update |
+| Metal3DataClaim | Validating | create, update |
+| Metal3Data | Validating | create, update |
+| Metal3Remediation | Validating | create, update |
+| Metal3RemediationTemplate | Validating | create, update |
+| 所有資源 | Conversion | v1beta1 ↔ v1beta2 |
+
+## Metal3Machine Webhook 驗證
+
+Metal3Machine webhook（`internal/webhooks/v1beta2/metal3machine_webhook.go`）的核心驗證：
+
+```go
+func (webhook *Metal3Machine) validate(newM3M *infrav1.Metal3Machine) error {
+    var allErrs field.ErrorList
+
+    // 若未設定 customDeploy，則 Image 欄位必須有效
+    if newM3M.Spec.CustomDeploy.Method == "" {
+        allErrs = append(allErrs, newM3M.Spec.Image.Validate(*field.NewPath("Spec", "Image"))...)
+    }
+
+    if len(allErrs) == 0 {
+        return nil
+    }
+    return apierrors.NewInvalid(...)
+}
+```
+
+### Image 欄位驗證規則（`common_types.go`）
+
+```go
+func (i *Image) Validate(base field.Path) field.ErrorList {
+    var errors field.ErrorList
+
+    // URL 必填
+    if i.URL == "" {
+        errors = append(errors, field.Required(base.Child("URL"), "cannot be empty"))
+    } else {
+        // URL 格式驗證
+        if _, err := url.ParseRequestURI(i.URL); err != nil {
+            errors = append(errors, field.Invalid(base.Child("URL"), i.URL, "not a valid URL"))
+        }
+    }
+
+    // Checksum 必填（live-iso 除外）
+    if i.DiskFormat == nil || *i.DiskFormat != LiveISODiskFormat {
+        if i.Checksum == "" {
+            errors = append(errors, field.Required(base.Child("Checksum"), "cannot be empty"))
+        }
+        // Checksum 若是 URL，需要合法 URL 格式
+        if strings.HasPrefix(i.Checksum, "http://") || strings.HasPrefix(i.Checksum, "https://") {
+            if _, err := url.ParseRequestURI(i.Checksum); err != nil {
+                errors = append(errors, field.Invalid(base.Child("Checksum"), i.Checksum, "not a valid URL"))
+            }
+        }
+    }
+    return errors
+}
+```
+
+Image 驗證規則整理：
+
+| 欄位 | 規則 | 例外 |
+|------|------|------|
+| `url` | 必填，且必須是合法 URL | 無 |
+| `checksum` | 必填 | `format: live-iso` 時可省略 |
+| `checksumType` | 選填，枚舉值：`md5`、`sha256`、`sha512` | 未填時 Ironic 自動偵測 |
+| `format` | 選填，枚舉值：`raw`、`qcow2`、`vdi`、`vmdk`、`live-iso` | 未填時 Ironic 依副檔名判斷 |
+
+### 常見 Admission 錯誤
+
+```
+# 錯誤 1：Image URL 為空
+Error from server (Invalid): error when applying patch:
+Metal3Machine.infrastructure.cluster.x-k8s.io "worker-0" is invalid:
+Spec.Image.URL: Required value: cannot be empty
+
+# 錯誤 2：Checksum 為空（非 live-iso）
+Metal3Machine.infrastructure.cluster.x-k8s.io "worker-0" is invalid:
+Spec.Image.Checksum: Required value: cannot be empty
+
+# 錯誤 3：URL 格式不正確
+Spec.Image.URL: Invalid value: "not-a-url": not a valid URL
+```
+
+## Metal3Cluster Webhook 驗證
+
+Metal3Cluster webhook 主要驗證 controlPlaneEndpoint 的不可變性：
+
+```go
+// metal3cluster_webhook.go
+func (webhook *Metal3Cluster) ValidateUpdate(_ context.Context,
+    oldObj *infrav1.Metal3Cluster, newObj *infrav1.Metal3Cluster) (admission.Warnings, error) {
+
+    // controlPlaneEndpoint 設定後不可更改
+    if oldObj.Spec.ControlPlaneEndpoint.Host != "" &&
+        oldObj.Spec.ControlPlaneEndpoint != newObj.Spec.ControlPlaneEndpoint {
+        return nil, field.Forbidden(
+            field.NewPath("spec", "controlPlaneEndpoint"),
+            "controlPlaneEndpoint is immutable",
+        )
+    }
+    return nil, nil
+}
+```
+
+不可變欄位：
+
+| 資源 | 不可變欄位 | 說明 |
+|------|-----------|------|
+| Metal3Cluster | `spec.controlPlaneEndpoint` | 設定後不可修改（IP 或 DNS 變更需重建 cluster） |
+| Metal3DataTemplate | `spec.metaData`、`spec.networkData` | template 結構不可變 |
+
+## Metal3DataClaim Webhook 驗證
+
+```go
+// metal3dataclaim_webhook.go：Template 欄位不可變
+func (webhook *Metal3DataClaim) ValidateUpdate(_ context.Context,
+    oldObj, newObj *infrav1.Metal3DataClaim) (admission.Warnings, error) {
+
+    if oldObj.Spec.Template != newObj.Spec.Template {
+        return nil, apierrors.NewBadRequest("Metal3DataClaim.Spec.Template is immutable")
+    }
+    return nil, nil
+}
+```
+
+## 版本轉換 Webhook（Conversion Webhook）
+
+CAPM3 使用 **hub-and-spoke** 轉換模型，v1beta2 是 hub（儲存版本），v1beta1 是 spoke（舊版本）。
+
+### 轉換流程
+
+```
+v1beta1 物件進入（kubectl apply）
+         │
+         ▼
+Conversion webhook: v1beta1 → v1beta2（ConvertTo）
+         │  自動欄位映射 + 儲存到 etcd
+         ▼
+etcd 中儲存 v1beta2 格式
+         │
+         ▼（讀取時若請求 v1beta1）
+Conversion webhook: v1beta2 → v1beta1（ConvertFrom）
+         │  反向映射
+         ▼
+v1beta1 格式返回給 client
+```
+
+### 轉換實作（`api/v1beta1/conversion.go`）
+
+```go
+// ConvertTo: v1beta1 → v1beta2（升版）
+func (src *Metal3Machine) ConvertTo(dstRaw conversion.Hub) error {
+    dst := dstRaw.(*infrav1.Metal3Machine)
+
+    // 自動生成的欄位對應
+    if err := Convert_v1beta1_Metal3Machine_To_v1beta2_Metal3Machine(src, dst, nil); err != nil {
+        return err
+    }
+
+    // 還原 v1beta2 獨有欄位（已存在於 annotation 中）
+    restored := &infrav1.Metal3Machine{}
+    if ok, err := utilconversion.UnmarshalData(src, restored); err != nil || !ok {
+        return err
+    }
+    // 還原只存在於 v1beta2 的欄位
+    // ...
+    return nil
+}
+
+// ConvertFrom: v1beta2 → v1beta1（降版）
+func (dst *Metal3Machine) ConvertFrom(srcRaw conversion.Hub) error {
+    src := srcRaw.(*infrav1.Metal3Machine)
+
+    if err := Convert_v1beta2_Metal3Machine_To_v1beta1_Metal3Machine(src, dst, nil); err != nil {
+        return err
+    }
+
+    // 將 v1beta2 獨有欄位儲存到 annotation，以免丟失
+    return utilconversion.MarshalData(src, dst)
+}
+```
+
+### 版本轉換的資料保留機制
+
+v1beta2 可能有一些 v1beta1 沒有的欄位。為了避免在降版（v1beta2 → v1beta1）時遺失這些欄位，CAPM3 使用 `utilconversion.MarshalData` 將完整的 v1beta2 資料序列化後存在 annotation 中：
+
+```yaml
+# v1beta1 物件的 annotations
+metadata:
+  annotations:
+    # 儲存 v1beta2 完整資料（base64 encoded JSON）
+    cluster.x-k8s.io/conversion-data: eyJhcGlWZXJzaW9uIjoiaW5mcmFzdHJ1Y3R1cmUu...
+```
+
+升版（v1beta1 → v1beta2）時，`utilconversion.UnmarshalData` 會從此 annotation 還原 v1beta2 獨有欄位，確保資料完整性。
+
+## Webhook 設定驗證
+
+確認 webhook 是否正常運作：
+
+```bash
+# 查看 webhook configuration
+kubectl get validatingwebhookconfigurations | grep metal3
+kubectl get mutatingwebhookconfigurations | grep metal3
+
+# 查看轉換 webhook 設定
+kubectl get crd metal3machines.infrastructure.cluster.x-k8s.io \
+  -o jsonpath='{.spec.conversion}' | jq .
+
+# 範例輸出
+{
+  "strategy": "Webhook",
+  "webhook": {
+    "clientConfig": {
+      "service": {
+        "name": "capm3-webhook-service",
+        "namespace": "capm3-system",
+        "path": "/convert"
+      }
+    },
+    "conversionReviewVersions": ["v1", "v1beta1"]
+  }
+}
+
+# 測試 webhook 是否在線（嘗試建立一個格式錯誤的資源）
+kubectl apply -f - <<EOF
+apiVersion: infrastructure.cluster.x-k8s.io/v1beta1
+kind: Metal3Machine
+metadata:
+  name: test-webhook
+  namespace: metal3
+spec:
+  image:
+    url: ""   # 空的 URL，應該被 webhook 拒絕
+    checksum: ""
+EOF
+```
+
+## 常見 Webhook 問題排查
+
+| 問題 | 診斷指令 | 可能原因 |
+|------|----------|----------|
+| webhook 無法連線 | `kubectl logs -n capm3-system deploy/capm3-controller-manager` | controller 崩潰或 TLS 憑證問題 |
+| 版本轉換失敗 | `kubectl get metal3machine -o yaml` 查看是否有 conversion error | conversion annotation 損壞 |
+| 驗證錯誤不明確 | `kubectl describe metal3machine <name>` 查看 Events | 欄位格式不符合 enum 值 |
+
+```bash
+# 查看 webhook 憑證是否有效
+kubectl get secret -n capm3-system capm3-webhook-service-cert \
+  -o jsonpath='{.data.tls\.crt}' | base64 -d | \
+  openssl x509 -text -noout | grep -A 2 "Validity"
+```

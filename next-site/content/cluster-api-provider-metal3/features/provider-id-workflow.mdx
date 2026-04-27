@@ -1,0 +1,275 @@
+---
+layout: doc
+title: Cluster API Provider Metal3 — ProviderID 工作流
+description: 說明 Metal3 ProviderID 的格式、設定時機，以及有無 cloud-provider 時的兩種 Node 註冊路徑
+---
+
+# ProviderID 工作流
+
+<Callout type="info" title="相關章節">
+- [主機選擇策略](/cluster-api-provider-metal3/features/host-selection-strategy)
+- [BareMetalHost 生命週期](/cluster-api-provider-metal3/features/bmh-lifecycle)
+- [Cluster API 整合契約](/cluster-api-provider-metal3/features/cluster-api-integration)
+</Callout>
+
+<Callout type="tip" title="本文適用對象">
+- 🟢 **初學者**：了解 ProviderID 是什麼、為什麼每個 Kubernetes Node 都需要它
+- 🟡 **中階工程師**：理解有無 cloud-provider 時的兩種不同設定流程
+- 🔴 **資深工程師**：掌握 legacy format 遷移時機與 Node label 查找機制的細節
+</Callout>
+
+> 📦 **類比**：ProviderID 就像是每台機器的「身分證字號」——Kubernetes 用它來唯一識別一個 Node 對應到哪台底層基礎設施機器，讓 CAPI 和 cloud-provider 能建立正確的關聯關係。
+
+## 什麼是 ProviderID
+
+ProviderID 是 Kubernetes Node 物件 `spec.providerID` 欄位的值，用來唯一識別這個 Node 對應到哪個底層基礎設施資源。
+
+在 Metal3 體系中，ProviderID 有兩種格式：
+
+| 格式 | 範例 | 狀態 |
+|------|------|------|
+| 新格式 | `metal3://metal3/worker-host-01/worker-machine-0` | 現行標準 |
+| 舊格式 (legacy) | `metal3://550e8400-e29b-41d4-a716-446655440000` | 即將棄用 |
+
+### 新格式解析
+
+```
+metal3://<namespace>/<bmh-name>/<m3m-name>
+   │          │           │           │
+ scheme   BMH 所在      BareMetalHost  Metal3Machine
+          namespace      的名稱         的名稱
+```
+
+程式碼定義（`baremetal/metal3machine_manager.go`）：
+
+```go
+const ProviderIDPrefix = "metal3://"
+
+func (m *MachineManager) SetDefaultProviderID() error {
+    namespace := m.Metal3Machine.Namespace
+    bmhName := m.Metal3Machine.Spec.BMH.Name   // 已關聯的 BMH
+    m3mName := m.Metal3Machine.Name
+
+    providerID := fmt.Sprintf("metal3://%s/%s/%s", namespace, bmhName, m3mName)
+    m.SetProviderID(providerID)
+    return nil
+}
+```
+
+<Callout type="warning" title="Legacy 格式棄用計畫">
+舊格式 `metal3://<bmh-uuid>` 將在 CAPM3 v1.13 中棄用，並在 v1.14 中移除。若你的叢集使用舊格式，請在升級前確認已完成遷移。
+</Callout>
+
+## ProviderID 設定的兩種模式
+
+CAPM3 支援兩種設定 ProviderID 的模式，取決於是否部署了 Metal3 cloud-provider：
+
+```
+無 cloud-provider 模式（直接模式）        有 cloud-provider 模式（間接模式）
+─────────────────────────────          ──────────────────────────────
+CAPM3 直接 patch Node.spec.providerID   cloud-provider 負責設定 Node.spec.providerID
+CAPM3 監控 Node hostname 來找到正確 Node  CAPM3 等待 cloud-provider 完成後同步 ProviderID
+```
+
+### 模式一：無 cloud-provider（直接模式）
+
+這是 bare-metal 環境最常見的模式。流程如下：
+
+```
+BMH 進入 Provisioned 狀態
+         │
+         ▼
+Metal3Machine controller: SetDefaultProviderID()
+→ 設定 Metal3Machine.Spec.ProviderID = "metal3://ns/bmh/m3m"
+→ 更新 Metal3Machine 物件
+         │
+         ▼
+Metal3Machine controller: SetNodeProviderIDByHostname()
+→ 透過 hostname 找到對應的 Kubernetes Node
+→ 直接 patch Node.Spec.ProviderID
+         │
+         ▼
+CAPI Machine controller 偵測到 Node.Spec.ProviderID 設定完成
+→ 設定 Machine.Status.NodeRef
+→ Machine 進入 Running 狀態
+```
+
+關鍵程式碼流程（`controllers/metal3machine_controller.go`）：
+
+```go
+// 步驟1：檢查 Metal3Machine 是否已有 ProviderID
+hasProviderID := machineMgr.Metal3MachineHasProviderID()
+if !hasProviderID {
+    err = machineMgr.SetDefaultProviderID()
+    // ... 更新 Metal3Machine
+}
+
+// 步驟2：透過 hostname 設定 Node 的 ProviderID
+err = machineMgr.SetNodeProviderIDByHostname(ctx, r.CapiClientGetter)
+```
+
+### 模式二：有 cloud-provider（間接模式）
+
+若部署了 `metal3-cloud-provider`，流程如下：
+
+```
+BMH 進入 Provisioned 狀態
+         │
+         ▼
+cloud-provider 使用 legacy ProviderID 格式（metal3://<bmh-uuid>）
+向 Kubernetes API Server 註冊 Node
+→ 設定 Node.Spec.ProviderID = "metal3://<uuid>"
+         │
+         ▼
+Metal3Machine controller: SetProviderIDFromCloudProviderNode()
+→ 計算可能的 legacy ProviderID 和新格式 ProviderID
+→ 尋找有對應 ProviderID 的 Node
+→ 將 Node 的 ProviderID 複製到 Metal3Machine.Spec.ProviderID
+         │
+         ▼
+Metal3Machine 標記為 Ready
+```
+
+```go
+// 有 cloud-provider 時的處理邏輯
+if machineMgr.NodeWithMatchingProviderIDExists(ctx, r.CapiClientGetter) {
+    // Node 已存在，等待 NodeRef
+    return ctrl.Result{RequeueAfter: requeueAfter}, nil
+}
+// cloud provider 模式：從 cloud-provider 建立的 Node 複製 ProviderID
+err = machineMgr.SetProviderIDFromCloudProviderNode(ctx, r.CapiClientGetter)
+```
+
+## 完整工作流：BMH Provisioned → Node Ready
+
+以下是一個完整的時序，從 BareMetalHost 完成 provisioning 到 Kubernetes Node 就緒：
+
+```
+時間軸：
+
+T+0:  BMH.Status.Provisioning.State = "provisioned"
+      BMH.Status.PoweredOn = true
+
+T+1:  Metal3Machine controller reconcile 觸發
+      → Metal3Machine.Status.BareMetalHostProvisioned = true
+
+T+2:  SetDefaultProviderID() 執行
+      → Metal3Machine.Spec.ProviderID = "metal3://metal3/worker-host-01/worker-0"
+
+T+3:  OS 啟動完成，kubelet 啟動
+      → Node 物件建立，Status.Ready = Unknown（bootstrap 中）
+
+T+4:  SetNodeProviderIDByHostname() 執行
+      → 透過 hostname "worker-host-01" 找到 Node 物件
+      → patch Node.Spec.ProviderID = "metal3://metal3/worker-host-01/worker-0"
+
+T+5:  CAPI Machine controller 偵測到 Node.Spec.ProviderID 相符
+      → Machine.Status.NodeRef 設定
+      → Metal3Machine.Status.Ready = true
+
+T+6:  kubelet 健康檢查通過
+      → Node.Status.Conditions[Ready] = True
+      → Node 可以接受 workload scheduling
+```
+
+## Node 查找機制
+
+`SetNodeProviderIDByHostname()` 使用以下策略找到對應的 Node：
+
+1. **hostname 查找**：比對 `Node.Status.Addresses` 中 type=Hostname 的值與 BMH 的 hostname
+2. **label 查找**：若 hostname 查找失敗，嘗試透過 node label 查找
+3. **ProviderID 查找**（`SetProviderIDFromNodeLabel`）：透過之前設定的 label 找到 Node
+
+```bash
+# 查看 Node 的 ProviderID 設定狀況
+kubectl get nodes -o custom-columns=\
+'NAME:.metadata.name,PROVIDER-ID:.spec.providerID,READY:.status.conditions[-1].type'
+
+# 範例輸出
+NAME             PROVIDER-ID                                        READY
+worker-host-01   metal3://metal3/worker-host-01/worker-machine-0   Ready
+worker-host-02   metal3://metal3/worker-host-02/worker-machine-1   Ready
+```
+
+## 雙格式相容性（getPossibleProviderIDs）
+
+為了相容 legacy 和新格式，CAPM3 在查找時會同時嘗試兩種格式：
+
+```go
+func (m *MachineManager) getPossibleProviderIDs(ctx context.Context) (
+    providerIDLegacy string,
+    providerIDNew string,
+    err error,
+) {
+    bmhUID := ... // BareMetalHost 的 UID
+    bmhName := ...
+    m3mName := m.Metal3Machine.Name
+    namespace := m.Metal3Machine.Namespace
+
+    providerIDLegacy = "metal3://" + bmhUID
+    providerIDNew = fmt.Sprintf("metal3://%s/%s/%s", namespace, bmhName, m3mName)
+    return
+}
+```
+
+查找 Node 時，會先嘗試 legacy 格式，再嘗試新格式，確保升級過程的相容性。
+
+## 故障排查：Node 沒有獲得 ProviderID
+
+### 症狀一：Metal3Machine 已 Ready，但 Node.Spec.ProviderID 為空
+
+```bash
+# 檢查 Metal3Machine 的 ProviderID
+kubectl get metal3machine worker-machine-0 -n metal3 \
+  -o jsonpath='{.spec.providerID}'
+
+# 檢查 Node 的 ProviderID
+kubectl get node worker-host-01 \
+  -o jsonpath='{.spec.providerID}'
+
+# 查看 Metal3Machine controller 日誌
+kubectl logs -n capm3-system deploy/capm3-controller-manager \
+  | grep "ProviderID" | tail -20
+```
+
+**可能原因**：
+
+| 原因 | 診斷方式 | 解決方法 |
+|------|----------|----------|
+| Node hostname 不匹配 BMH hostname | `kubectl get node -o wide` 對比 `kubectl get bmh` | 確保 BMH 的 hostname 設定與 Node 實際 hostname 一致 |
+| kubelet 尚未啟動 | `kubectl get node` 看是否有 Node 物件 | 等待機器 boot 完成 |
+| 權限不足 | controller 日誌有 RBAC 錯誤 | 檢查 ClusterRole 是否有 `nodes/patch` 權限 |
+| network policy 阻擋 | controller 無法連到 workload cluster | 檢查 management cluster 到 workload cluster 的網路 |
+
+### 症狀二：Node 存在但 CAPI Machine 沒有 NodeRef
+
+```bash
+# 檢查 CAPI Machine 狀態
+kubectl get machine worker-0 -n default \
+  -o jsonpath='{.status.nodeRef}'
+
+# 查看 CAPI Machine controller 日誌
+kubectl logs -n capi-system deploy/capi-controller-manager \
+  | grep "nodeRef" | tail -20
+```
+
+CAPI Machine controller 透過比對 `Node.Spec.ProviderID` 和 `Metal3Machine.Spec.ProviderID` 來設定 NodeRef。若兩者不一致（例如一個是 legacy 格式，另一個是新格式），NodeRef 將不會被設定。
+
+## 驗證 ProviderID 設定正確
+
+```bash
+# 完整驗證腳本
+NAMESPACE=metal3
+
+for machine in $(kubectl get metal3machine -n $NAMESPACE -o name); do
+    m3m_name=$(echo $machine | cut -d'/' -f2)
+    provider_id=$(kubectl get $machine -n $NAMESPACE \
+        -o jsonpath='{.spec.providerID}' 2>/dev/null)
+
+    if [ -z "$provider_id" ]; then
+        echo "❌ $m3m_name: ProviderID 未設定"
+    else
+        echo "✅ $m3m_name: $provider_id"
+    fi
+done
+```

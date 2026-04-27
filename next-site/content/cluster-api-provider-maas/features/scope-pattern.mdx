@@ -1,0 +1,292 @@
+---
+layout: doc
+title: Cluster API Provider MAAS — Scope 設計模式
+description: 深入解析 ClusterScope 與 MachineScope 的設計目的、欄位組成與在 reconcile 循環中的使用方式。
+---
+
+# Scope 設計模式
+
+<Callout type="info" title="相關章節">
+- [Controllers 運作原理](/cluster-api-provider-maas/features/controllers)
+- [MAAS Client 介面](/cluster-api-provider-maas/features/maas-client-abstraction)
+- [Machine 服務實作](/cluster-api-provider-maas/features/machine-service-implementation)
+</Callout>
+
+<Callout type="tip" title="本文適用對象">
+- 🟢 **初學者**：了解為什麼 CAPI providers 都用 Scope 物件，而不是直接把參數傳來傳去。
+- 🟡 **中階工程師**：掌握 ClusterScope 與 MachineScope 的完整欄位與輔助方法。
+- 🔴 **資深工程師**：分析 PatchHelper 在 deferred close pattern 中如何確保狀態一致性。
+</Callout>
+
+> 📦 **類比**：Scope 就像工廠的「工單」——一張工單包含了這次生產任務所需的所有資訊（客戶需求、物料清單、工具清單），讓每個工站的工人不需要再回去問管理員，直接從工單上取得所有必要資訊。
+
+## 什麼是 Scope 設計模式
+
+在 CAPI provider 的實作中，`Reconcile()` 函式需要同時存取多種資源：
+
+- Kubernetes API client（操作 CR 物件）
+- 結構化 logger（帶有 context 的日誌）
+- CAPI 原生物件（`Cluster`, `Machine`）
+- CAPM 自定義物件（`MaasCluster`, `MaasMachine`）
+- PatchHelper（確保 status/spec 能正確寫回 API server）
+
+如果把這些全部作為函式參數傳遞，會讓 function signature 變得冗長且難以維護。**Scope 模式**的解法是：在 reconcile 開始時建立一個 Scope 物件，封裝所有這次 reconcile 需要的上下文，後續所有輔助函式只需要接收 Scope 指標。
+
+## ClusterScope
+
+### 建立參數
+
+`ClusterScopeParams` 定義了建立 ClusterScope 所需的輸入：
+
+```go
+// pkg/maas/scope/cluster.go
+type ClusterScopeParams struct {
+    Client              client.Client
+    Logger              logr.Logger
+    Cluster             *clusterv1.Cluster
+    MaasCluster         *infrav1beta1.MaasCluster
+    ControllerName      string
+    Tracker             *remote.ClusterCacheTracker
+    ClusterEventChannel chan event.GenericEvent
+}
+```
+
+### 欄位說明
+
+| 欄位 | 類型 | 說明 |
+|------|------|------|
+| `Logger` | `logr.Logger` | 結構化 logger，帶有 cluster name 等 context |
+| `client` | `client.Client` | 管理 cluster 的 Kubernetes API client |
+| `patchHelper` | `*patch.Helper` | 用於將 MaasCluster 的變更 patch 回 API server |
+| `Cluster` | `*clusterv1.Cluster` | CAPI 原生 Cluster 物件 |
+| `MaasCluster` | `*infrav1beta1.MaasCluster` | CAPM 的 infrastructure cluster 物件 |
+| `tracker` | `*remote.ClusterCacheTracker` | 追蹤遠端 cluster 的 API server 連線 |
+| `clusterEventChannel` | `chan event.GenericEvent` | 傳送 generic event 以觸發 re-reconcile |
+
+### 建立流程
+
+```go
+// controllers/maascluster_controller.go
+clusterScope, err := scope.NewClusterScope(scope.ClusterScopeParams{
+    Client:              r.Client,
+    Logger:              log,
+    Cluster:             cluster,
+    MaasCluster:         maasCluster,
+    ClusterEventChannel: r.GenericEventChannel,
+    ControllerName:      "maascluster",
+    Tracker:             r.Tracker,
+})
+if err != nil {
+    return reconcile.Result{}, errors.Errorf("failed to create scope: %+v", err)
+}
+
+// defer 確保 reconcile 結束後一定執行 patch
+defer func() {
+    if err := clusterScope.Close(); err != nil && rerr == nil {
+        rerr = err
+    }
+}()
+```
+
+`NewClusterScope` 的關鍵動作是初始化 `patch.Helper`：
+
+```go
+func NewClusterScope(params ClusterScopeParams) (*ClusterScope, error) {
+    helper, err := patch.NewHelper(params.MaasCluster, params.Client)
+    if err != nil {
+        return nil, errors.Wrap(err, "failed to init patch helper")
+    }
+    return &ClusterScope{
+        // ...
+        patchHelper: helper,
+    }, nil
+}
+```
+
+### 主要輔助方法
+
+```go
+// 持久化 MaasCluster 的變更（含 conditions 彙整）
+func (s *ClusterScope) PatchObject() error
+
+// 關閉 scope，等同呼叫 PatchObject
+func (s *ClusterScope) Close() error
+
+// 取得 API Server port（預設 6443）
+func (s *ClusterScope) APIServerPort() int
+
+// 設定/取得 DNS name
+func (s *ClusterScope) SetDNSName(dnsName string)
+func (s *ClusterScope) GetDNSName() string
+
+// 列出此 cluster 下的所有 MaasMachine
+func (s *ClusterScope) GetClusterMaasMachines() ([]*infrav1beta1.MaasMachine, error)
+
+// 非同步輪詢 API server 是否上線
+func (s *ClusterScope) ReconcileMaasClusterWhenAPIServerIsOnline()
+func (s *ClusterScope) IsAPIServerOnline() (bool, error)
+```
+
+### PatchObject 中的 Conditions 彙整
+
+`PatchObject` 不只是單純寫入，它會先根據子 condition 彙整出 `ReadyCondition`：
+
+```go
+func (s *ClusterScope) PatchObject() error {
+    conditions.SetSummary(s.MaasCluster,
+        conditions.WithConditions(
+            infrav1beta1.DNSReadyCondition,
+            infrav1beta1.APIServerAvailableCondition,
+        ),
+        conditions.WithStepCounterIf(s.MaasCluster.ObjectMeta.DeletionTimestamp.IsZero()),
+    )
+
+    return s.patchHelper.Patch(
+        context.TODO(),
+        s.MaasCluster,
+        patch.WithOwnedConditions{Conditions: []clusterv1.ConditionType{
+            clusterv1.ReadyCondition,
+            infrav1beta1.DNSReadyCondition,
+            infrav1beta1.APIServerAvailableCondition,
+        }},
+    )
+}
+```
+
+## MachineScope
+
+### 建立參數
+
+```go
+// pkg/maas/scope/machine.go
+type MachineScopeParams struct {
+    Client         client.Client
+    Logger         logr.Logger
+    Cluster        *clusterv1.Cluster
+    ClusterScope   *ClusterScope    // 包含已建立的 ClusterScope
+    Machine        *clusterv1.Machine
+    MaasMachine    *infrav1beta1.MaasMachine
+    ControllerName string
+    Tracker        *remote.ClusterCacheTracker
+}
+```
+
+<Callout type="info" title="注意">
+`MachineScope` 內含一個 `ClusterScope` 參考，因此可以透過 machine scope 存取 cluster 層級的資訊，例如 DNS service。
+</Callout>
+
+### 欄位說明
+
+| 欄位 | 類型 | 說明 |
+|------|------|------|
+| `Logger` | `logr.Logger` | 結構化 logger |
+| `client` | `client.Client` | Kubernetes API client |
+| `patchHelper` | `*patch.Helper` | 用於 patch MaasMachine 物件 |
+| `Cluster` | `*clusterv1.Cluster` | 所屬 CAPI Cluster |
+| `ClusterScope` | `*ClusterScope` | 對應的 ClusterScope 參考 |
+| `Machine` | `*clusterv1.Machine` | 對應的 CAPI Machine |
+| `MaasMachine` | `*infrav1beta1.MaasMachine` | CAPM infrastructure machine |
+| `tracker` | `*remote.ClusterCacheTracker` | 遠端 cluster 連線追蹤 |
+
+### 主要輔助方法
+
+```go
+// ProviderID 相關
+func (m *MachineScope) GetProviderID() string
+func (m *MachineScope) SetProviderID(systemID, availabilityZone string)
+func (m *MachineScope) GetInstanceID() *string
+
+// SystemID（MAAS machine 識別碼）
+func (m *MachineScope) SetSystemID(systemID string)
+func (m *MachineScope) GetSystemID() string
+
+// 狀態管理
+func (m *MachineScope) SetReady()
+func (m *MachineScope) IsReady() bool
+func (m *MachineScope) SetFailureMessage(v error)
+func (m *MachineScope) SetFailureReason(v capierrors.MachineStatusError)
+func (m *MachineScope) SetMachineState(v infrav1beta1.MachineState)
+
+// machine 角色
+func (m *MachineScope) IsControlPlane() bool
+func (m *MachineScope) Role() string  // "control-plane" or "node"
+
+// Bootstrap data
+func (m *MachineScope) GetRawBootstrapData() ([]byte, error)
+
+// 將 ProviderID 同步到遠端 cluster 的 Node 物件
+func (m *MachineScope) SetNodeProviderID() error
+```
+
+### ProviderID 格式
+
+`SetProviderID` 方法將 MAAS systemID 與 zone 組合成標準格式：
+
+```go
+func (m *MachineScope) SetProviderID(systemID, availabilityZone string) {
+    providerID := fmt.Sprintf("maas:///%s/%s", availabilityZone, systemID)
+    m.MaasMachine.Spec.ProviderID = pointer.StringPtr(providerID)
+}
+```
+
+詳細說明請見 [ProviderID 格式](/cluster-api-provider-maas/features/provider-id-format)。
+
+## Scope 在 Reconcile 循環中的生命週期
+
+```
+┌─ Reconcile() 開始 ─────────────────────────────┐
+│                                                 │
+│  1. 取得 MaasCluster / MaasMachine CR           │
+│  2. 取得關聯的 Cluster / Machine CR              │
+│  3. NewClusterScope() / NewMachineScope()        │
+│     └─ 初始化 patchHelper（snapshot 當前狀態）   │
+│                                                 │
+│  defer scope.Close()  ← 確保結束時執行           │
+│                                                 │
+│  4. 執行 reconcile 邏輯（修改 scope 中的物件）   │
+│  5. return result, err                          │
+│                                                 │
+│  (defer 觸發) scope.Close()                     │
+│     └─ PatchObject()：比對 snapshot，僅 patch   │
+│        有變更的欄位，含 conditions 彙整          │
+└─────────────────────────────────────────────────┘
+```
+
+## 為什麼這個模式在 CAPI 生態被廣泛採用
+
+| 優點 | 說明 |
+|------|------|
+| **關注點分離** | Controller 只負責決策邏輯，Scope 負責資料存取與寫入 |
+| **測試友善** | 可注入 mock client 建立 Scope，不需要真實 cluster |
+| **避免遺漏 patch** | defer Close() 確保即使 reconcile 中途 return，狀態也能被持久化 |
+| **一致的 conditions** | PatchObject 統一彙整 conditions，避免分散在各處更新 ReadyCondition |
+| **減少 API call** | patchHelper 使用 strategic merge patch，只送出有差異的欄位 |
+
+## 實際使用範例：建立 MachineScope
+
+```go
+// controllers/maasmachine_controller.go (示意)
+machineScope, err := scope.NewMachineScope(scope.MachineScopeParams{
+    Client:         r.Client,
+    Logger:         log,
+    Cluster:        cluster,
+    ClusterScope:   clusterScope,
+    Machine:        machine,
+    MaasMachine:    maasMachine,
+    ControllerName: "maasmachine",
+    Tracker:        r.Tracker,
+})
+if err != nil {
+    return ctrl.Result{}, errors.Wrap(err, "failed to create machine scope")
+}
+defer func() {
+    if err := machineScope.Close(); err != nil && rerr == nil {
+        rerr = err
+    }
+}()
+
+// 現在可以呼叫所有輔助方法
+machineScope.SetReady()
+machineScope.SetProviderID(systemID, zone)
+// reconcile 結束時，defer 自動 patch 回 API server
+```

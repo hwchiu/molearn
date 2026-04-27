@@ -1,0 +1,265 @@
+---
+layout: doc
+title: Cluster API Provider Metal3 — 磁碟清理策略
+description: 說明 automatedCleaningMode 欄位的用途，以及在不同環境下如何選擇 metadata 或 disabled 模式
+---
+
+# 磁碟清理策略
+
+<Callout type="info" title="相關章節">
+- [映像與部署配置](/cluster-api-provider-metal3/features/image-deployment-config)
+- [Ironic 整合原理](/cluster-api-provider-metal3/features/ironic-integration)
+- [BareMetalHost 生命週期](/cluster-api-provider-metal3/features/bmh-lifecycle)
+</Callout>
+
+<Callout type="tip" title="本文適用對象">
+- 🟢 **初學者**：了解「automated cleaning」是什麼，以及為什麼它會讓 provisioning 變慢
+- 🟡 **中階工程師**：學習如何在 Metal3MachineTemplate 設定 cleaning 策略
+- 🔴 **資深工程師**：掌握不同 cleaning 模式的安全意涵與對 Ironic 行為的影響
+</Callout>
+
+> 📦 **類比**：就像租房子退房時的清潔標準——開發測試環境像是「短租」，只需要擦個桌子（metadata 模式）；生產環境像是「長期出租敏感辦公室」，退租時需要徹底清除所有資料（磁碟安全抹除），確保下一個租戶無法還原舊資料。
+
+## 什麼是 Automated Cleaning
+
+Automated Cleaning（自動清理）是 Ironic 的一個功能，用來在實體機器被重新分配之前，清除磁碟上的舊資料。這個清理步驟發生在兩個時機：
+
+1. **Provisioning 之前**：機器從 Available 狀態進入 Provisioning 前
+2. **Deprovisioning 之後**：機器被釋放，在回到 Available 狀態前
+
+清理流程：
+```
+BMH 進入 Provisioning 請求
+         │
+         ▼
+Ironic 啟動 IPA (Ironic Python Agent) ramdisk
+         │
+         ▼
+IPA 根據 automatedCleaningMode 執行清理：
+  ├── metadata 模式：清除磁碟 metadata（分割表等）
+  └── disabled 模式：跳過（不執行任何清理）
+         │
+         ▼
+清理完成後，繼續執行 OS image 部署
+```
+
+## Metal3Machine 的 automatedCleaningMode 欄位
+
+欄位定義（`api/v1beta1/metal3machine_types.go`）：
+
+```go
+const (
+    CleaningModeDisabled = "disabled"
+    CleaningModeMetadata = "metadata"
+)
+
+type Metal3MachineSpec struct {
+    // When set to disabled, automated cleaning of host disks will be skipped
+    // during provisioning and deprovisioning.
+    // +kubebuilder:validation:Enum:=metadata;disabled
+    // +optional
+    AutomatedCleaningMode *string `json:"automatedCleaningMode,omitempty"`
+    // ...
+}
+```
+
+| 值 | 行為 | 適用場景 |
+|----|------|----------|
+| `metadata`（預設） | 清除磁碟 metadata（MBR、GPT、partition table）| 生產環境標準設定 |
+| `disabled` | 完全跳過清理 | 開發/測試環境、加速 reprovisioning |
+| 未設定（nil） | 使用 Ironic 的預設設定 | 繼承 BMO 全域設定 |
+
+## 在 Metal3Machine 設定
+
+直接在 Metal3Machine spec 設定：
+
+```yaml
+apiVersion: infrastructure.cluster.x-k8s.io/v1beta1
+kind: Metal3Machine
+metadata:
+  name: worker-machine-0
+  namespace: metal3
+spec:
+  image:
+    url: "http://192.168.0.1/images/ubuntu-22.04.qcow2"
+    checksum: "sha256:abc123..."
+  automatedCleaningMode: metadata  # 或 disabled
+```
+
+## 在 Metal3MachineTemplate 設定（推薦）
+
+在生產環境中，建議透過 Metal3MachineTemplate 統一設定，確保所有由此 template 建立的 Metal3Machine 都有一致的 cleaning 策略：
+
+```yaml
+apiVersion: infrastructure.cluster.x-k8s.io/v1beta1
+kind: Metal3MachineTemplate
+metadata:
+  name: worker-machine-template
+  namespace: metal3
+spec:
+  template:
+    spec:
+      image:
+        url: "http://192.168.0.1/images/ubuntu-22.04.qcow2"
+        checksum: "sha256:abc123..."
+        checksumType: sha256
+        format: qcow2
+      automatedCleaningMode: metadata
+      hostSelector:
+        matchLabels:
+          environment: production
+```
+
+## 清理模式詳解
+
+### metadata 模式
+
+執行以下清理步驟（透過 Ironic shred）：
+
+| 步驟 | 動作 | 目的 |
+|------|------|------|
+| 1 | 清除每個磁碟的前 1MB 和後 1MB | 消滅 MBR、GPT、partition table |
+| 2 | 清除 LVM metadata | 避免 LVM 誤識別舊 volume group |
+| 3 | 清除 RAID metadata | 避免 RAID controller 誤識別舊陣列 |
+| 4 | 清除 iSCSI metadata | 清除 iSCSI 目標設定 |
+
+**不做**：逐一 overwrite 整個磁碟內容（這是 `data` 模式的行為，需要額外設定）
+
+時間估算（metadata 模式）：
+
+| 磁碟數量 | 類型 | 估計時間 |
+|----------|------|----------|
+| 1 顆 | SSD/NVMe | 1-2 分鐘 |
+| 2 顆 | SSD | 2-3 分鐘 |
+| 4 顆 | HDD | 3-5 分鐘 |
+| 6 顆 | HDD | 5-8 分鐘 |
+
+### disabled 模式
+
+完全跳過清理步驟，直接進入 OS image 部署：
+
+**優點**：
+- 大幅縮短 provisioning 時間（節省 5-30 分鐘）
+- 加速開發迭代和 CI/CD 流程
+
+**風險**：
+- 舊磁碟資料可能影響新部署（如舊的 LVM VG 被 OS 偵測到）
+- 上一個 workload 的磁碟資料未清除（安全風險）
+- 若舊分割表與新 image 格式衝突，可能導致部署失敗
+
+<Callout type="warning" title="生產環境安全建議">
+在生產環境中，建議使用 `metadata` 模式或更嚴格的清理設定。僅在開發/測試環境或所有機器都是全新未使用的情況下，才考慮 `disabled` 模式。若處理的是含有敏感資料的機器，應考慮使用 Ironic 的 `data` 清理模式（透過 BMO 全域設定），該模式會完整 overwrite 磁碟。
+</Callout>
+
+## 何時執行清理
+
+清理有兩個觸發時機：
+
+### 時機一：Provisioning 前（Pre-deployment Cleaning）
+
+```
+BMH state: available
+    │
+    ▼（Metal3Machine 選擇此 BMH）
+BMH state: preparing
+    │  Ironic 執行 cleaning（依 automatedCleaningMode）
+    ▼
+BMH state: provisioning
+    │  Ironic 寫入 OS image
+    ▼
+BMH state: provisioned
+```
+
+### 時機二：Deprovisioning 時（Release Cleaning）
+
+```
+Metal3Machine 刪除
+    │
+    ▼
+CAPM3 清除 BMH.Spec.Image、ConsumerRef 等欄位
+BMH state: deprovisioning
+    │  Ironic 清除 OS（擦除分割表等）
+    ▼
+BMH state: preparing（執行 cleaning）
+    │  Ironic 執行 cleaning（依 automatedCleaningMode）
+    ▼
+BMH state: available
+    │  機器回到可用池，等待下次分配
+```
+
+## 實際設定範例
+
+### 開發/測試叢集設定
+
+```yaml
+# 開發環境：停用清理，加速 reprovisioning
+apiVersion: infrastructure.cluster.x-k8s.io/v1beta1
+kind: Metal3MachineTemplate
+metadata:
+  name: dev-worker-template
+  namespace: dev-metal3
+spec:
+  template:
+    spec:
+      image:
+        url: "http://192.168.0.1/images/ubuntu-22.04.qcow2"
+        checksum: "sha256:abc123..."
+      automatedCleaningMode: disabled  # 開發環境可接受
+      hostSelector:
+        matchLabels:
+          environment: dev
+```
+
+### 生產叢集設定
+
+```yaml
+# 生產環境：啟用 metadata 清理
+apiVersion: infrastructure.cluster.x-k8s.io/v1beta1
+kind: Metal3MachineTemplate
+metadata:
+  name: prod-worker-template
+  namespace: metal3
+spec:
+  template:
+    spec:
+      image:
+        url: "http://192.168.0.1/images/ubuntu-22.04-hardened.qcow2"
+        checksum: "sha256:def456..."
+      automatedCleaningMode: metadata  # 生產環境建議
+      hostSelector:
+        matchLabels:
+          environment: production
+          security-cleared: "true"
+```
+
+## 查看清理進度
+
+```bash
+# 查看 BMH 當前狀態（preparing 表示正在清理）
+kubectl get baremetalhosts -n metal3 -w
+
+# 範例輸出（-w 表示 watch 模式）
+NAME             STATE         CONSUMER                 ERROR
+worker-host-01   available     <none>
+worker-host-02   preparing     worker-machine-1         # 正在清理
+worker-host-03   provisioning  worker-machine-2
+
+# 查看 BMH 詳細狀態和事件
+kubectl describe baremetalhost worker-host-02 -n metal3 | grep -A 20 "Events:"
+```
+
+清理完成後，BMH 會從 `preparing` 自動進入 `provisioning` 狀態，不需要人工介入。
+
+## 效能影響與取捨
+
+| 場景 | 建議設定 | 理由 |
+|------|----------|------|
+| 全新機器首次部署 | `disabled` 或 `metadata` | 機器乾淨，清理影響不大，但 metadata 清理可避免隱患 |
+| 重複 reprovisioning（CI/CD） | `disabled` | 縮短測試周期，機器只在可信環境使用 |
+| 機器輪換給不同叢集使用 | `metadata` | 避免舊分割表造成問題 |
+| 合規要求資料不得殘留 | BMO 全域啟用 `data` 模式 | 需要完整 overwrite（非 Metal3Machine 欄位控制） |
+| 混合新舊機器 | `metadata` | 防禦性設定，避免舊機器 metadata 干擾 |
+
+<Callout type="tip" title="快速驗證清理是否有效">
+部署完成後，可以 SSH 到機器執行 `lsblk` 確認分割表符合預期。若看到不明的 LVM volume group 或 RAID 陣列，表示舊 metadata 未被清除。
+</Callout>

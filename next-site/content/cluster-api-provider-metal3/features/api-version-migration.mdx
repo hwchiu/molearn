@@ -1,0 +1,247 @@
+---
+layout: doc
+title: Cluster API Provider Metal3 — API 版本遷移指南
+description: v1beta1 到 v1beta2 API 版本遷移完整指南，涵蓋欄位變更、自動轉換機制與手動遷移步驟
+---
+
+# API 版本遷移指南
+
+<Callout type="info" title="相關章節">
+- [Webhook 驗證與版本轉換](/cluster-api-provider-metal3/features/webhook-validation-conversion)
+- [架構總覽](/cluster-api-provider-metal3/features/architecture)
+- [CRD：Metal3Machine](/cluster-api-provider-metal3/features/crds-machine)
+</Callout>
+
+<Callout type="warning" title="重要版本資訊">
+- **v1beta2** 是目前的 storage version（hub），所有資源都以 v1beta2 格式儲存在 etcd
+- **v1beta1** 仍受支援，但為 deprecated，未來版本將移除
+- 自動轉換透過 conversion webhook 完成，不需要手動操作，但需了解欄位對應關係
+</Callout>
+
+## 版本概覽
+
+CAPM3 使用「**Hub and Spoke**」的 API 版本轉換模型：
+
+```
+v1beta1 (spoke)         v1beta2 (hub / storage version)
+   │                           │
+   │ ConvertTo()               │
+   │──────────────────────────►│  儲存在 etcd
+   │                           │
+   │ ConvertFrom()             │
+   │◄──────────────────────────│  讀取時轉換
+```
+
+所有 CAPM3 資源型別都遵循此模式：
+- `Metal3Cluster` / `Metal3ClusterTemplate`
+- `Metal3Machine` / `Metal3MachineTemplate`
+- `Metal3DataTemplate` / `Metal3DataClaim` / `Metal3Data`
+- `Metal3Remediation` / `Metal3RemediationTemplate`
+- `Metal3IPPool`（IPAddressClaim）
+
+## Metal3Machine 欄位變更
+
+### 新增欄位（v1beta2 only）
+
+| 欄位 | 類型 | 說明 |
+|------|------|------|
+| `spec.initialization` | InitializationSpec | 初始化設定 |
+| `status.initialization` | InitializationStatus | 初始化狀態 |
+| `status.conditions` | Conditions | Kubernetes 標準 condition 清單 |
+
+### 欄位重命名或調整
+
+| v1beta1 | v1beta2 | 說明 |
+|---------|---------|------|
+| `status.addresses` | `status.addresses` | 相同，但格式稍有調整 |
+| `spec.automatedCleaningMode` | `spec.automatedCleaningMode` | 相同 |
+
+### 轉換資料保留機制
+
+v1beta2 特有欄位在轉換到 v1beta1 時，會被序列化存入 annotation：
+
+```yaml
+# v1beta1 物件中保留 v1beta2 資料的 annotation
+metadata:
+  annotations:
+    cluster.x-k8s.io/conversion-data: |
+      {"spec":{"initialization":{...}},"status":{...}}
+```
+
+這確保了在讀取時（v1beta1 → v1beta2 轉換）能還原完整的 v1beta2 資料。
+
+## Metal3Cluster 欄位變更
+
+### v1beta2 新增欄位
+
+```yaml
+# v1beta2 Metal3Cluster spec 新增欄位
+spec:
+  failureDomains:              # 新增：failure domain 定義
+    zone-a:
+      controlPlane: true
+  initialization:              # 新增：初始化控制
+    provisioned: true
+
+status:
+  initialization:              # 新增：初始化狀態
+    provisioned: true
+  conditions:                  # 新增：標準 condition
+    - type: Ready
+      status: "True"
+```
+
+## ProviderID 格式變更
+
+<Callout type="warning" title="ProviderID 格式已更新">
+- **舊格式**（v1.12 以前）：`metal3://<uuid>` — 直接使用 BMH 的 UUID
+- **新格式**（v1.13+）：`metal3://<namespace>/<bmh-name>/<m3m-name>`
+- 舊格式在 v1.13 起 deprecated，v1.14 起不再支援
+</Callout>
+
+```yaml
+# 舊格式（deprecated）
+spec:
+  providerID: "metal3://a1b2c3d4-e5f6-7890-abcd-ef1234567890"
+
+# 新格式（建議使用）
+spec:
+  providerID: "metal3://metal3/worker-bmh-01/worker-machine-0"
+```
+
+### 遷移舊 ProviderID
+
+若叢集仍使用舊格式的 ProviderID，升級 CAPM3 後：
+
+1. 在升級前記錄所有 Metal3Machine 的 ProviderID：
+```bash
+kubectl get metal3machine -A \
+  -o jsonpath='{range .items[*]}{.metadata.namespace}{"\t"}{.metadata.name}{"\t"}{.spec.providerID}{"\n"}{end}'
+```
+
+2. 升級 CAPM3 controller
+3. 新建立的 Machine 會自動使用新格式
+4. 現有 Machine 不會自動更新 ProviderID（需要依賴 cloud-provider-metal3 的映射邏輯）
+
+## conversion webhook 運作機制
+
+### ConvertTo（v1beta1 → v1beta2）
+
+當 kube-apiserver 需要儲存 v1beta1 格式的請求時：
+
+```
+kubectl apply -f metal3machine-v1beta1.yaml
+         │
+         ▼
+kube-apiserver 呼叫 conversion webhook
+         │
+         ▼
+ConvertTo() 在 v1beta1 的 Go struct 上執行：
+  1. 複製共同欄位（1:1 對應）
+  2. 呼叫 utilconversion.MarshalData()
+     → 將完整 v1beta1 物件序列化到
+       v1beta2 annotation: cluster.x-k8s.io/conversion-data
+  3. 回傳 v1beta2 物件
+         │
+         ▼
+儲存 v1beta2 物件到 etcd
+```
+
+### ConvertFrom（v1beta2 → v1beta1）
+
+當使用者 `kubectl get metal3machine -o yaml`（使用 v1beta1 API）：
+
+```
+kube-apiserver 從 etcd 讀取 v1beta2 物件
+         │
+         ▼
+呼叫 conversion webhook
+         │
+         ▼
+ConvertFrom() 執行：
+  1. 複製共同欄位
+  2. 呼叫 utilconversion.UnmarshalData()
+     → 從 annotation 還原原始 v1beta1 欄位
+  3. 移除 conversion-data annotation（不顯示給使用者）
+  4. 回傳 v1beta1 物件
+         │
+         ▼
+使用者看到 v1beta1 格式
+```
+
+## 如何判斷目前使用的 API 版本
+
+```bash
+# 查看 CRD 定義的 storage version
+kubectl get crd metal3machines.infrastructure.cluster.x-k8s.io \
+  -o jsonpath='{.spec.versions[?(@.storage==true)].name}'
+# 輸出: v1beta2
+
+# 查看 CRD 所有支援的版本
+kubectl get crd metal3machines.infrastructure.cluster.x-k8s.io \
+  -o jsonpath='{.spec.versions[*].name}'
+# 輸出: v1beta1 v1beta2
+
+# 使用特定版本 API 存取資源
+kubectl get metal3machines.v1beta2.infrastructure.cluster.x-k8s.io -A
+kubectl get metal3machines.v1beta1.infrastructure.cluster.x-k8s.io -A
+```
+
+## 手動遷移步驟
+
+若需要將既有環境明確遷移到 v1beta2：
+
+### 步驟 1：確認目前狀態
+
+```bash
+# 確認 CAPM3 版本
+kubectl get deploy -n capm3-system capm3-controller-manager \
+  -o jsonpath='{.spec.template.spec.containers[0].image}'
+
+# 列出所有 Metal3 CRD 及其 storage version
+kubectl get crd | grep metal3
+```
+
+### 步驟 2：備份現有資源
+
+```bash
+# 匯出所有 CAPM3 資源（以 v1beta1 格式）
+for res in metal3clusters metal3machines metal3machinetemplates \
+           metal3datatemplates metal3dataclaims metal3datas \
+           metal3remediations metal3remediationtemplates; do
+  kubectl get ${res} -A -o yaml > backup-${res}.yaml
+done
+```
+
+### 步驟 3：升級 CAPM3
+
+```bash
+# 使用 clusterctl 升級
+clusterctl upgrade apply \
+  --infrastructure metal3:v1.9.0
+```
+
+### 步驟 4：驗證轉換
+
+```bash
+# 確認所有資源可以以 v1beta2 存取
+kubectl get metal3machines.v1beta2.infrastructure.cluster.x-k8s.io -A
+
+# 確認 conversion webhook 正常運作
+kubectl get validatingwebhookconfiguration | grep metal3
+kubectl get mutatingwebhookconfiguration | grep metal3
+```
+
+## 版本對應關係總整理
+
+| CAPM3 版本 | CAPI 版本 | Kubernetes 版本 | storage API |
+|-----------|---------|--------------|------------|
+| v1.5.x    | v1.5.x  | 1.24 - 1.26  | v1beta1    |
+| v1.6.x    | v1.6.x  | 1.25 - 1.27  | v1beta1    |
+| v1.7.x    | v1.7.x  | 1.26 - 1.28  | v1beta1    |
+| v1.8.x    | v1.8.x  | 1.27 - 1.29  | v1beta2    |
+| v1.9.x    | v1.9.x  | 1.28 - 1.30  | v1beta2    |
+
+<Callout type="tip" title="升級建議">
+建議在非生產環境先測試 API 版本遷移，並確認所有 GitOps 管道（Flux、ArgoCD）中的 YAML 清單都已更新為 v1beta2 API 版本。
+</Callout>

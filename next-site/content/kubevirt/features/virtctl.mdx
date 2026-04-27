@@ -1,0 +1,487 @@
+---
+layout: doc
+title: KubeVirt — virtctl CLI 完整指南
+description: virtctl 是 KubeVirt 的專屬 CLI 工具，提供 VM 生命週期管理、console/VNC/SSH 存取、映像上傳與熱插拔等 kubectl 無法直接支援的 VM 特有操作。
+---
+
+# virtctl CLI 完整指南
+
+<Callout type="info" title="相關章節">
+- [VMI 生命週期](/kubevirt/features/vmi-lifecycle)
+- [Live Migration](/kubevirt/features/live-migration)
+- [Hotplug 磁碟與網路介面](/kubevirt/features/hotplug)
+- [CDI 與 DataVolume](/kubevirt/features/cdi-datavolume)
+- [Snapshot 與 Restore](/kubevirt/features/snapshot-restore)
+</Callout>
+
+<Callout type="tip" title="本文適用對象">
+- 🟢 **初學者**：學習基本的 VM 啟動、停止與 console 連線指令
+- 🟡 **中階工程師**：掌握 SSH tunneling、port-forward、image-upload 等進階操作
+- 🔴 **資深工程師**：深入了解 virtctl 與 API server subresource 的互動機制與安全模型
+</Callout>
+
+> 📦 **類比**：如果說 `kubectl` 是 Kubernetes 的「萬用瑞士刀」，那麼 `virtctl` 就是專為 VM 設計的「精密外科手術刀」——當你需要連線到 VM 的序列終端機、透過 VNC 看到 BIOS 畫面、或在 VM 運行中熱插拔磁碟時，virtctl 是唯一的選擇。
+
+## 為什麼需要 virtctl
+
+`kubectl` 設計用於管理 Kubernetes 資源（Pod、Service、Deployment 等）。雖然 VM 和 VMI 也是 Kubernetes 資源（可以用 `kubectl get vm` 查看），但很多 VM 特有操作無法用一般的 kubectl 完成：
+
+| 操作 | kubectl 能做？ | virtctl 能做？ |
+|------|-------------|--------------|
+| 啟動/停止 VM | ❌（需要修改 spec.running）| ✅ `virtctl start/stop` |
+| 連線 serial console | ❌ | ✅ `virtctl console` |
+| VNC 圖形連線 | ❌ | ✅ `virtctl vnc` |
+| SSH 隧道存取 | ❌ | ✅ `virtctl ssh` |
+| Port forward 到 VM | ❌ | ✅ `virtctl port-forward` |
+| 上傳本地磁碟映像 | ❌ | ✅ `virtctl image-upload` |
+| 觸發 live migration | ❌ | ✅ `virtctl migrate` |
+| 熱插拔磁碟 | ❌ | ✅ `virtctl addvolume` |
+
+這些操作需要與 `virt-api` 的特殊 subresource 端點互動（如 `/subresources/v1/namespaces/.../virtualmachineinstances/.../console`），virtctl 封裝了這些底層 WebSocket 連線。
+
+---
+
+## 安裝 virtctl
+
+### 方式一：直接下載二進位檔
+
+```bash
+# 確認 KubeVirt 版本
+export KUBEVIRT_VERSION=$(kubectl get kubevirt kubevirt -n kubevirt -o jsonpath='{.status.observedKubeVirtVersion}')
+
+# Linux amd64
+curl -L -o virtctl \
+  https://github.com/kubevirt/kubevirt/releases/download/${KUBEVIRT_VERSION}/virtctl-${KUBEVIRT_VERSION}-linux-amd64
+chmod +x virtctl
+sudo mv virtctl /usr/local/bin/
+
+# macOS arm64（Apple Silicon）
+curl -L -o virtctl \
+  https://github.com/kubevirt/kubevirt/releases/download/${KUBEVIRT_VERSION}/virtctl-${KUBEVIRT_VERSION}-darwin-arm64
+chmod +x virtctl
+sudo mv virtctl /usr/local/bin/
+```
+
+### 方式二：kubectl 外掛（krew）
+
+```bash
+# 使用 krew 安裝
+kubectl krew install virt
+
+# 安裝後使用
+kubectl virt start my-vm
+kubectl virt console my-vm
+```
+
+### 驗證安裝
+
+```bash
+virtctl version
+# 輸出：
+# Client Version: v1.2.0
+# Server Version: v1.2.0
+```
+
+---
+
+## VM 生命週期指令
+
+### start — 啟動 VM
+
+```bash
+# 基本啟動
+virtctl start <vm-name>
+
+# 指定命名空間
+virtctl start my-vm -n production
+
+# 強制啟動（即使設定了 RunStrategy: Halted）
+virtctl start my-vm --force
+
+# 指定 dry-run
+virtctl start my-vm --dry-run
+```
+
+### stop — 停止 VM
+
+```bash
+# 正常停止（透過 ACPI 關機訊號，等待 guest OS 優雅關機）
+virtctl stop my-vm
+
+# 強制停止（立即停止，類似拔電源）
+virtctl stop my-vm --force
+
+# 指定超時（超過後強制停止）
+virtctl stop my-vm --grace-period=30
+```
+
+### restart — 重啟 VM
+
+```bash
+# 正常重啟
+virtctl restart my-vm
+
+# 強制重啟
+virtctl restart my-vm --force
+
+# 指定命名空間
+virtctl restart my-vm -n production
+```
+
+### pause / unpause — 暫停 VM
+
+```bash
+# 暫停 VM（VM 狀態凍結，保持記憶體內容，不回應任何請求）
+virtctl pause vm my-vm      # 暫停 VirtualMachine
+virtctl pause vmi my-vm     # 暫停 VirtualMachineInstance
+
+# 恢復暫停的 VM
+virtctl unpause vm my-vm
+virtctl unpause vmi my-vm
+```
+
+<Callout type="info" title="pause vs stop 的差異">
+`pause` 凍結 VM 的執行（QEMU 的 `pause` 操作），VM 保持在記憶體中但不執行任何指令，網路連線中斷但 TCP 連線狀態保留。`stop` 則是關機，VM 完全停止運行。`pause` 常用於除錯或建立一致性快照前的準備。
+</Callout>
+
+### migrate — 觸發 Live Migration
+
+```bash
+# 觸發 live migration（KubeVirt 選擇目標節點）
+virtctl migrate my-vm
+
+# 指定目標節點
+virtctl migrate my-vm --node=node2
+
+# 中止進行中的 migration
+virtctl migrate-cancel my-vm
+```
+
+### memorydump — 記憶體轉儲
+
+```bash
+# 取得 VM 記憶體轉儲（用於除錯）
+virtctl memory-dump get my-vm --claim-name=memdump-pvc --create-claim
+
+# 移除記憶體轉儲（清理）
+virtctl memory-dump remove my-vm
+```
+
+---
+
+## Console 存取
+
+### console — 序列主控台
+
+`virtctl console` 連線到 VM 的序列主控台（相當於接上 VM 的 COM1 埠）：
+
+```bash
+# 連線 serial console
+virtctl console my-vm
+
+# 指定命名空間
+virtctl console my-vm -n production
+
+# 指定超時
+virtctl console my-vm --timeout=5m
+```
+
+使用序列主控台的場景：
+- VM 無法 SSH（網路問題或 SSH 未啟動）
+- 進入 GRUB 選單（需要在 VM 內設定 serial console）
+- 查看 kernel panic 訊息
+- 系統啟動故障排除
+
+```bash
+# 在 guest 內設定 grub 使用序列主控台（以 Ubuntu 為例）
+# /etc/default/grub：
+GRUB_CMDLINE_LINUX="console=ttyS0,115200n8 console=tty0"
+GRUB_TERMINAL="serial console"
+GRUB_SERIAL_COMMAND="serial --speed=115200 --unit=0 --word=8 --parity=no --stop=1"
+update-grub
+```
+
+**退出 console**：按 `Ctrl+]`（或設定 `--escape=^]`）
+
+### vnc — 圖形主控台
+
+`virtctl vnc` 開啟 VNC 連線到 VM 的圖形介面：
+
+```bash
+# 開啟 VNC（自動啟動本地 VNC 客戶端）
+virtctl vnc my-vm
+
+# 指定 VNC 客戶端
+virtctl vnc my-vm --proxy-only   # 只開 proxy，手動用 VNC 客戶端連線
+
+# 指定本地連接埠
+virtctl vnc my-vm --port=5900
+
+# 查看連線資訊
+virtctl vnc my-vm --proxy-only
+# 輸出：VNC proxy is listening at 127.0.0.1:5900
+```
+
+VNC 使用場景：
+- Windows VM 的圖形桌面操作
+- 安裝 OS（從 ISO 啟動）
+- 需要圖形介面的設定工作
+- VM 的 BIOS/UEFI 設定
+
+<Callout type="info" title="VNC 安全性">
+virtctl vnc 連線會透過 Kubernetes API server 代理，所有流量都受 Kubernetes RBAC 保護。使用者需要有該 VMI 的 `virtualmachineinstances/vnc` subresource 權限。
+</Callout>
+
+---
+
+## SSH 存取
+
+### ssh — SSH 隧道
+
+`virtctl ssh` 透過 Kubernetes API server 建立 SSH 隧道，無需 VM 有公開 IP：
+
+```bash
+# 基本 SSH 連線
+virtctl ssh my-vm
+
+# 指定使用者
+virtctl ssh user@my-vm
+virtctl ssh --username=ubuntu my-vm
+
+# 指定 SSH 私鑰
+virtctl ssh --identity-file=~/.ssh/id_rsa my-vm
+
+# 執行指令（非互動式）
+virtctl ssh my-vm -- hostname
+virtctl ssh my-vm -- cat /etc/os-release
+
+# 傳遞額外 SSH 選項
+virtctl ssh my-vm -- -o StrictHostKeyChecking=no
+```
+
+SSH 隧道工作原理：
+```
+使用者 → virtctl → kube-apiserver → virt-api
+                                       ↓
+                                   WebSocket proxy
+                                       ↓
+                                   VMI SSH port (22)
+```
+
+### 配置 SSH 公鑰
+
+```yaml
+# 在 VM 中注入 SSH 公鑰（使用 cloud-init）
+apiVersion: kubevirt.io/v1
+kind: VirtualMachine
+spec:
+  template:
+    spec:
+      volumes:
+        - name: cloudinit
+          cloudInitNoCloud:
+            userData: |
+              #cloud-config
+              users:
+                - name: ubuntu
+                  sudo: ALL=(ALL) NOPASSWD:ALL
+                  ssh_authorized_keys:
+                    - ssh-rsa AAAA... user@workstation
+```
+
+---
+
+## Port Forward
+
+### port-forward — 連接埠轉發
+
+```bash
+# 將本地 8080 轉發到 VM 的 80 連接埠
+virtctl port-forward my-vm 8080:80
+
+# 轉發 VMI（直接指定 VMI）
+virtctl port-forward vmi/my-vm 8080:80
+
+# 轉發多個連接埠
+virtctl port-forward my-vm 8080:80 8443:443
+
+# 指定監聽地址（預設 127.0.0.1）
+virtctl port-forward my-vm 0.0.0.0:8080:80
+```
+
+使用場景：
+- 存取 VM 內部的 HTTP 服務（無需 NodePort 或 Ingress）
+- 臨時存取資料庫連接埠進行除錯
+- 存取 VM 內的開發伺服器
+
+---
+
+## 映像上傳
+
+### image-upload — 上傳本地映像
+
+```bash
+# 上傳到新 DataVolume
+virtctl image-upload dv my-disk-image \
+  --size=30Gi \
+  --image-path=/path/to/ubuntu-22.04.qcow2
+
+# 上傳到已存在的 PVC
+virtctl image-upload pvc my-existing-pvc \
+  --image-path=/path/to/disk.img
+
+# 指定 StorageClass
+virtctl image-upload dv my-disk \
+  --size=50Gi \
+  --storage-class=rook-ceph-block \
+  --image-path=/path/to/windows.qcow2
+
+# 上傳到特定命名空間
+virtctl image-upload dv my-disk -n production \
+  --size=30Gi \
+  --image-path=/path/to/image.qcow2
+
+# 使用不安全連線（測試環境）
+virtctl image-upload dv my-disk \
+  --size=20Gi \
+  --image-path=/path/to/image.qcow2 \
+  --insecure
+
+# 自訂 upload proxy URL
+virtctl image-upload dv my-disk \
+  --size=20Gi \
+  --uploadproxy-url=https://cdi-uploadproxy.cdi.svc \
+  --image-path=/path/to/image.qcow2
+```
+
+支援的映像格式：`.img`、`.qcow2`、`.iso`、`.vmdk`、`.ova`（壓縮格式：`.gz`、`.xz`、`.zst`）
+
+---
+
+## VM 建立指南
+
+### create vm — 互動式 VM 建立
+
+```bash
+# 互動式建立 VM
+virtctl create vm
+
+# 指定名稱與 instancetype
+virtctl create vm \
+  --name=my-new-vm \
+  --instancetype=u1.medium \
+  --preference=ubuntu
+
+# 指定映像來源
+virtctl create vm \
+  --name=web-server \
+  --instancetype=u1.large \
+  --volume-datasource=src:ubuntu-22.04-golden
+
+# 建立並立即應用
+virtctl create vm --name=my-vm | kubectl apply -f -
+```
+
+---
+
+## Hotplug 指令
+
+```bash
+# 熱插入 PVC
+virtctl addvolume my-vm --volume-name=extra-data-pvc
+
+# 熱插入並持久化
+virtctl addvolume my-vm --volume-name=extra-disk --persist
+
+# 熱移除磁碟
+virtctl removevolume my-vm --volume-name=extra-data-pvc
+
+# 熱插入網路介面（需要 HotplugNICs feature gate）
+virtctl addinterface my-vm \
+  --network-attachment-definition-name=sriov-net \
+  --name=eth1
+
+# 熱移除網路介面
+virtctl removeinterface my-vm --name=eth1
+```
+
+---
+
+## 完整指令參考表
+
+| 指令 | 子指令 | 說明 | 關鍵旗標 |
+|------|-------|------|---------|
+| `virtctl start` | - | 啟動 VM | `--force`, `-n` |
+| `virtctl stop` | - | 停止 VM | `--force`, `--grace-period` |
+| `virtctl restart` | - | 重啟 VM | `--force` |
+| `virtctl pause` | `vm`, `vmi` | 暫停 VM | - |
+| `virtctl unpause` | `vm`, `vmi` | 恢復暫停 | - |
+| `virtctl migrate` | - | 觸發 Live Migration | `--node` |
+| `virtctl migrate-cancel` | - | 取消 Migration | - |
+| `virtctl console` | - | Serial console | `--timeout`, `--escape` |
+| `virtctl vnc` | - | VNC 圖形連線 | `--proxy-only`, `--port` |
+| `virtctl ssh` | - | SSH 隧道 | `--username`, `--identity-file` |
+| `virtctl port-forward` | - | 連接埠轉發 | - |
+| `virtctl image-upload` | `dv`, `pvc` | 上傳磁碟映像 | `--size`, `--storage-class` |
+| `virtctl create vm` | - | 建立 VM | `--instancetype`, `--preference` |
+| `virtctl addvolume` | - | 熱插磁碟 | `--persist` |
+| `virtctl removevolume` | - | 熱移磁碟 | `--persist` |
+| `virtctl addinterface` | - | 熱插 NIC | `--persist` |
+| `virtctl removeinterface` | - | 熱移 NIC | `--persist` |
+| `virtctl memory-dump` | `get`, `remove` | 記憶體轉儲 | `--claim-name` |
+| `virtctl version` | - | 查看版本 | `--client`, `--server` |
+| `virtctl help` | - | 顯示說明 | - |
+
+---
+
+## RBAC 與安全模型
+
+virtctl 的每個操作對應不同的 Kubernetes RBAC 規則：
+
+```yaml
+# 賦予使用者完整的 VM 管理權限
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: vm-operator
+rules:
+  - apiGroups: ["kubevirt.io"]
+    resources:
+      - virtualmachines
+      - virtualmachineinstances
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: ["subresources.kubevirt.io"]
+    resources:
+      - virtualmachineinstances/console      # virtctl console
+      - virtualmachineinstances/vnc          # virtctl vnc
+      - virtualmachineinstances/ssh          # virtctl ssh
+      - virtualmachineinstances/portforward  # virtctl port-forward
+      - virtualmachines/start                # virtctl start
+      - virtualmachines/stop                 # virtctl stop
+      - virtualmachines/restart              # virtctl restart
+      - virtualmachines/migrate              # virtctl migrate
+      - virtualmachines/addvolume            # virtctl addvolume
+      - virtualmachines/removevolume         # virtctl removevolume
+    verbs: ["get", "update"]
+```
+
+```yaml
+# 唯讀使用者（只能查看和連線 console）
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: vm-viewer
+rules:
+  - apiGroups: ["kubevirt.io"]
+    resources: ["virtualmachines", "virtualmachineinstances"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["subresources.kubevirt.io"]
+    resources:
+      - virtualmachineinstances/console
+      - virtualmachineinstances/vnc
+    verbs: ["get", "update"]
+```
+
+<Callout type="info" title="virtctl 使用你的 kubeconfig">
+virtctl 使用與 kubectl 相同的 kubeconfig（`~/.kube/config` 或 `KUBECONFIG` 環境變數）。所有連線都透過 Kubernetes API server 代理，VM 不需要有可達的 IP 地址，RBAC 控制哪些使用者可以執行哪些操作。
+</Callout>

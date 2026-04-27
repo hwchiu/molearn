@@ -1,0 +1,264 @@
+---
+layout: doc
+title: Kube-OVN — DPDK 與硬體 Offload
+description: 透過 OVS-DPDK 或 SmartNIC 硬體 Offload 將封包處理移出 kernel，達到線速（wire-rate）網路效能
+---
+
+# DPDK 與硬體 Offload
+
+<Callout type="info" title="相關章節">
+- [整體架構](/kube-ovn/features/architecture)
+- [KubeVirt 虛擬機網路整合](/kube-ovn/features/kubevirt-integration)
+- [Underlay 網路](/kube-ovn/features/underlay)
+- [OVN 整合原理](/kube-ovn/features/ovn-integration)
+</Callout>
+
+<Callout type="tip" title="本文適用對象">
+- 🟢 **初學者**：理解 DPDK 的概念與它解決的問題
+- 🟡 **中階工程師**：掌握 DPDK 節點標籤、Hugepages 配置、KubeVirt vhostuser 整合
+- 🔴 **資深工程師**：深入理解 SmartNIC Offload 架構、SR-IOV 整合與效能調優
+</Callout>
+
+> 📦 **類比**：Kernel OVS 就像郵差每次都要進辦公室（kernel context switch）才能遞送信件；DPDK 是直接讓郵差繞過前台、直達收件人辦公桌（user-space 直接存取 NIC），速度快十倍以上。SmartNIC Offload 更進一步：讓 NIC 自己送信，郵差完全不需要出動。
+
+## 為什麼需要 DPDK 或硬體 Offload
+
+標準 Linux kernel 的網路棧在高封包率下存在效能瓶頸：
+
+| 效能指標 | Kernel OVS | OVS-DPDK | SmartNIC Offload |
+|---------|-----------|---------|----------------|
+| 小封包（64 byte）吞吐 | ~2–5 Mpps | ~15–20 Mpps | ~100+ Mpps（線速）|
+| 延遲（p99）| 50–200 μs | 5–20 μs | < 5 μs |
+| CPU 消耗 | 核心 + 中斷 | 輪詢（busy poll）| 接近 0（NIC 自處理）|
+| 主要瓶頸 | kernel context switch、中斷 | 記憶體複製（PMD 輪詢）| 無（硬體 pipeline）|
+
+主要使用場景：
+- **電信 UPF/vRAN**：5G 用戶平面功能需要 > 10 Mpps 小封包處理能力
+- **高頻交易（HFT）**：需要微秒級延遲
+- **儲存網路**：NVMe-oF、iSER 需要低延遲、高頻寬
+
+## OVS-DPDK 模式
+
+### 安裝：Hybrid DPDK 模式
+
+Kube-OVN 支援**混合模式（Hybrid DPDK）**：部分節點使用 DPDK，其餘節點使用標準 Kernel OVS。安裝時加入 `--with-hybrid-dpdk` 參數：
+
+```bash
+# 使用官方安裝腳本
+wget https://raw.githubusercontent.com/kubeovn/kube-ovn/release-1.13/dist/images/install.sh
+bash install.sh --with-hybrid-dpdk
+```
+
+### Hugepages 配置
+
+DPDK 需要 Hugepages（大頁記憶體）以減少 TLB miss：
+
+```bash
+# 在 DPDK 節點上配置 Hugepages（持久化設定）
+echo "vm.nr_hugepages = 1024" >> /etc/sysctl.conf
+sysctl -p
+
+# 確認 Hugepages 已分配
+cat /proc/meminfo | grep HugePages
+# HugePages_Total:    1024
+# HugePages_Free:      950
+# Hugepagesize:       2048 kB （2MB per page）
+```
+
+也可以透過 Kubernetes 的 Node Feature Discovery 在節點啟動時自動配置：
+
+```yaml
+# 在 kubelet 配置中預留 Hugepages 資源
+apiVersion: kubelet.config.k8s.io/v1beta1
+kind: KubeletConfiguration
+reservedSystemCPUs: "0-1"
+```
+
+### 節點標籤：區分 Kernel vs DPDK 節點
+
+使用 label 標識節點使用哪種 OVS 資料平面類型：
+
+```bash
+# 標準 Kernel OVS 節點（預設）
+kubectl label node worker-01 ovn.kubernetes.io/ovs_dp_type=kernel
+
+# DPDK 用戶空間 OVS 節點
+kubectl label node dpdk-worker-01 ovn.kubernetes.io/ovs_dp_type=userspace
+```
+
+Kube-OVN 的 `ovs-ovn` DaemonSet 會根據節點 label 選擇對應的 OVS 模式：
+
+```yaml
+# ovs-ovn DaemonSet 的 nodeSelector
+spec:
+  template:
+    spec:
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+            - matchExpressions:
+              - key: ovn.kubernetes.io/ovs_dp_type
+                operator: In
+                values: ["userspace"]   # 此 DS 只部署到 DPDK 節點
+```
+
+## KubeVirt + DPDK：vhostuser 介面
+
+KubeVirt 虛擬機在 DPDK 節點上可以使用 **vhostuser** 介面，讓 VM 內的 DPDK 應用直接與 OVS-DPDK 通訊，繞過 virtio 模擬層：
+
+```
+VM (DPDK app) ──vhostuser socket──► OVS-DPDK (userspace) ──DPDK PMD──► Physical NIC
+```
+
+設定步驟：
+
+```yaml
+# 1. 建立使用 vhostuser 的 NetworkAttachmentDefinition
+apiVersion: "k8s.cni.cncf.io/v1"
+kind: NetworkAttachmentDefinition
+metadata:
+  name: dpdk-net
+  namespace: kube-system
+spec:
+  config: '{
+    "cniVersion": "0.3.1",
+    "name": "dpdk-net",
+    "type": "kube-ovn",
+    "server_socket": "/run/openvswitch/kube-ovn-daemon.sock",
+    "provider": "dpdk-net.kube-system.ovn",
+    "vhostUserSocketPath": "/var/run/vhostuser"
+  }'
+```
+
+```yaml
+# 2. KubeVirt VM 使用 vhostuser 介面
+apiVersion: kubevirt.io/v1
+kind: VirtualMachine
+metadata:
+  name: dpdk-vm
+spec:
+  template:
+    spec:
+      domain:
+        devices:
+          interfaces:
+          - name: default
+            masquerade: {}
+          - name: dpdk-if
+            binding:
+              name: vhostuser            # 使用 vhostuser binding
+        resources:
+          requests:
+            cpu: "4"
+            memory: "4Gi"
+            hugepages-2Mi: "1Gi"        # 必須申請 Hugepages
+          limits:
+            hugepages-2Mi: "1Gi"
+      networks:
+      - name: default
+        pod: {}
+      - name: dpdk-if
+        multus:
+          networkName: kube-system/dpdk-net
+```
+
+<Callout type="warning" title="vhostuser 需要 Hugepages">
+VM 使用 vhostuser 介面必須申請 `hugepages-2Mi` 或 `hugepages-1Gi` 資源，否則 VM 無法啟動。Hugepages 資源需要在節點上預先配置並由 kubelet 上報。
+</Callout>
+
+## SmartNIC 硬體 Offload
+
+### 支援的硬體
+
+| 廠商 | 型號 | 支援特性 |
+|------|------|---------|
+| NVIDIA (Mellanox) | ConnectX-5 / ConnectX-6 Dx | OVS Offload、SR-IOV、ECMP |
+| Corigine (Netronome) | Agilio CX | OVS Offload、Flow 卸載 |
+| Intel | E810 | SR-IOV、部分 OVS Offload |
+
+### SmartNIC Offload 架構
+
+```
+CPU (kube-ovn-controller) ──OVN Logical Flow──► ovs-vswitchd
+                                                     │
+                                                     │ TC flower offload（透過 tc）
+                                                     ▼
+                                               NIC Firmware（SmartNIC）
+                                                     │
+                                               物理線路（wire）
+```
+
+OVS 通過 Linux `tc flower` 或 `devlink` 介面將 OVS flow table 下推到 SmartNIC 固件，CPU 只需處理 **miss path**（SmartNIC 未命中的 flow），命中的封包完全由 NIC 硬體轉發。
+
+### 啟用 SmartNIC Offload
+
+```bash
+# 步驟 1：確認 NIC 支援 switchdev 模式
+devlink dev show
+
+# 步驟 2：將 NIC 切換到 switchdev 模式
+devlink dev eswitch set pci/0000:04:00.0 mode switchdev
+
+# 步驟 3：綁定 VF（Virtual Function）
+echo 4 > /sys/class/net/ens3f0/device/sriov_numvfs
+
+# 步驟 4：為節點加上 Offload label
+kubectl label node smartnic-node ovn.kubernetes.io/offload=true
+```
+
+### SR-IOV 與 Kube-OVN 整合
+
+```yaml
+# Pod 使用 SR-IOV VF，透過 ovn.kubernetes.io/vendor annotation 指定
+apiVersion: v1
+kind: Pod
+metadata:
+  name: sriov-pod
+  annotations:
+    ovn.kubernetes.io/vendor: "mellanox"       # 指定 SmartNIC 廠商
+    k8s.v1.cni.cncf.io/networks: sriov-net    # 使用 SR-IOV NIC
+spec:
+  containers:
+  - name: app
+    image: dpdk-app:latest
+    resources:
+      requests:
+        intel.com/intel_sriov_netdevice: "1"   # 申請 SR-IOV VF
+      limits:
+        intel.com/intel_sriov_netdevice: "1"
+```
+
+## 效能基準測試
+
+以下為 Kube-OVN 社群公布的效能數據（基於特定測試環境，實際結果視硬體和封包大小而異）：
+
+| 測試場景 | 封包大小 | Kernel OVS | OVS-DPDK | SmartNIC Offload |
+|---------|---------|-----------|---------|----------------|
+| Pod to Pod（同節點）| 1518 byte | 9.4 Gbps | 9.8 Gbps | 9.9 Gbps |
+| Pod to Pod（同節點）| 64 byte | 1.2 Mpps | 14.6 Mpps | 28.4 Mpps |
+| Pod to Pod（跨節點）| 64 byte | 0.8 Mpps | 12.1 Mpps | 25.7 Mpps |
+| CPU 使用率（10Gbps 流量）| 1518 byte | 2 cores | 4 cores（忙等）| < 0.5 core |
+
+<Callout type="info" title="測試環境">
+上述數據基於：Intel Xeon 2.4GHz、25GbE NIC（ConnectX-5）、OVS 3.1、DPDK 22.11、Ubuntu 22.04 kernel 5.15。不同環境結果差異顯著。
+</Callout>
+
+## 排查與驗證
+
+```bash
+# 確認 DPDK 正常初始化
+kubectl exec -n kube-system ds/ovs-ovn -- ovs-vsctl show | grep -i dpdk
+
+# 查看 OVS DPDK port 統計
+kubectl exec -n kube-system ds/ovs-ovn -- ovs-ofctl dump-ports br-int
+
+# 確認 Hugepages 使用情況
+kubectl exec -n kube-system ds/ovs-ovn -- cat /proc/meminfo | grep HugePages
+
+# 查看 SmartNIC Offload 的 flow 統計
+kubectl exec -n kube-system ds/ovs-ovn -- ovs-dpctl dump-flows | grep -c "offloaded:yes"
+
+# 監控 DPDK PMD 的 CPU 使用率（per core）
+kubectl exec -n kube-system ds/ovs-ovn -- ovs-appctl dpif-netdev/pmd-stats-show
+```

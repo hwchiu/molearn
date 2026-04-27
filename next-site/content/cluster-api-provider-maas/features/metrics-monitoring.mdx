@@ -1,0 +1,336 @@
+---
+layout: doc
+title: Cluster API Provider MAAS — Prometheus Metrics 監控
+description: 解析 CAPM controller 暴露的 Prometheus metrics，以及如何設定監控告警與整合 Grafana dashboard。
+---
+
+# Prometheus Metrics 監控
+
+<Callout type="info" title="相關章節">
+- [架構概覽](/cluster-api-provider-maas/features/architecture)
+- [Controllers 運作原理](/cluster-api-provider-maas/features/controllers)
+- [RBAC 模型](/cluster-api-provider-maas/features/rbac-model-permissions)
+</Callout>
+
+<Callout type="tip" title="本文適用對象">
+- 🟢 **初學者**：了解 CAPM 暴露哪些 metrics，以及如何確認 controller 正常運作。
+- 🟡 **中階工程師**：設定 Prometheus scrape 並建立基本的健康告警規則。
+- 🔴 **資深工程師**：分析 controller-runtime metrics 的深層指標，用於效能調優。
+</Callout>
+
+> 📦 **類比**：Metrics 就像汽車的儀表板——轉速、油量、水溫一目了然。CAPM 的 metrics 讓你隨時知道 controller 的健康狀況：reconcile 速度、錯誤率、等待中的工作量。
+
+## Metrics 架構
+
+CAPM 的 metrics 分為兩層：
+
+| 層次 | 說明 | 暴露方式 |
+|------|------|---------|
+| **controller-runtime metrics** | reconcile 次數、時間、佇列深度等 | `:8080/metrics`（被 kube-rbac-proxy 保護） |
+| **健康檢查 endpoints** | liveness / readiness probe | `:9440/healthz` 和 `:9440/readyz` |
+
+## Metrics 端點設定
+
+在 `main.go` 中，metrics 端點透過 manager options 設定：
+
+```go
+// main.go
+mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), ctrl.Options{
+    Metrics: metricsserver.Options{
+        BindAddress: metricsBindAddr,  // 預設 ":8080"
+    },
+    HealthProbeBindAddress: healthAddr,  // 預設 ":9440"
+    // ...
+})
+```
+
+透過啟動參數可以自訂：
+
+```bash
+# 預設值
+--metrics-bind-addr=:8080
+--health-addr=:9440
+```
+
+## 健康檢查端點
+
+CAPM 同時設定了 readiness 和 liveness 檢查：
+
+```go
+// main.go
+if err := mgr.AddReadyzCheck("ping", healthz.Ping); err != nil {
+    setupLog.Error(err, "unable to create ready check")
+    os.Exit(1)
+}
+
+if err := mgr.AddHealthzCheck("ping", healthz.Ping); err != nil {
+    setupLog.Error(err, "unable to create health check")
+    os.Exit(1)
+}
+```
+
+| 端點 | 用途 | 成功條件 |
+|------|------|---------|
+| `:9440/readyz` | Readiness probe | controller 已完成初始化 |
+| `:9440/healthz` | Liveness probe | controller 程序正常執行 |
+
+## kube-rbac-proxy 保護 Metrics
+
+Metrics 端點透過 `kube-rbac-proxy` sidecar 保護，外部存取需要有效的 token：
+
+```yaml
+# config/rbac/auth_proxy_service.yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: controller-manager-metrics-service
+  namespace: system
+spec:
+  ports:
+    - name: https
+      port: 8443        # 外部存取 port（proxy）
+      targetPort: https
+  selector:
+    control-plane: controller-manager
+```
+
+存取 metrics 需要先取得有 `metrics-reader` ClusterRole 的 ServiceAccount token。
+
+## 主要 controller-runtime Metrics
+
+CAPM 使用 `controller-runtime` 框架，繼承以下標準 metrics：
+
+### Reconcile 相關
+
+| Metric 名稱 | 類型 | 說明 |
+|------------|------|------|
+| `controller_runtime_reconcile_total` | Counter | reconcile 總次數，含 result（success/error/requeue） |
+| `controller_runtime_reconcile_errors_total` | Counter | reconcile 失敗次數 |
+| `controller_runtime_reconcile_time_seconds` | Histogram | reconcile 耗時分佈 |
+
+### Work Queue 相關
+
+| Metric 名稱 | 類型 | 說明 |
+|------------|------|------|
+| `workqueue_depth` | Gauge | 當前 work queue 中的項目數量 |
+| `workqueue_adds_total` | Counter | 加入 queue 的總次數 |
+| `workqueue_queue_duration_seconds` | Histogram | 項目在 queue 中等待的時間 |
+| `workqueue_work_duration_seconds` | Histogram | 處理每個項目的耗時 |
+| `workqueue_retries_total` | Counter | 重試次數 |
+| `workqueue_unfinished_work_seconds` | Gauge | 未完成工作的累積時間 |
+
+### Go Runtime Metrics
+
+| Metric 名稱 | 說明 |
+|------------|------|
+| `go_goroutines` | 當前 goroutine 數量 |
+| `go_memstats_heap_inuse_bytes` | Heap 使用量 |
+| `process_cpu_seconds_total` | CPU 使用時間 |
+| `process_resident_memory_bytes` | 常駐記憶體使用量 |
+
+## 設定 Prometheus Scraping
+
+### 方法一：ServiceMonitor（Prometheus Operator）
+
+若使用 Prometheus Operator，建立 ServiceMonitor：
+
+```yaml
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: capmaas-controller-manager
+  namespace: capmaas-system
+  labels:
+    control-plane: controller-manager
+spec:
+  selector:
+    matchLabels:
+      control-plane: controller-manager
+  endpoints:
+    - port: https
+      scheme: https
+      tlsConfig:
+        insecureSkipVerify: false
+        caFile: /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+      bearerTokenFile: /var/run/secrets/kubernetes.io/serviceaccount/token
+      interval: 30s
+      path: /metrics
+```
+
+### 方法二：直接存取（開發環境）
+
+若關閉 kube-rbac-proxy（修改 `--metrics-bind-addr` 直接暴露），可以用 kubectl port-forward：
+
+```bash
+# 方法一：直接 port-forward 到 controller pod
+kubectl port-forward -n capmaas-system \
+  deploy/capmaas-controller-manager 8080:8080
+
+# 確認 metrics 可存取
+curl http://localhost:8080/metrics | head -50
+```
+
+### 方法三：透過 RBAC proxy 存取
+
+```bash
+# 取得 metrics 存取 token
+TOKEN=$(kubectl create token default -n capmaas-system)
+
+# 透過 kubectl proxy 存取
+kubectl proxy &
+curl -H "Authorization: Bearer $TOKEN" \
+  http://localhost:8001/api/v1/namespaces/capmaas-system/services/\
+https:capmaas-controller-manager-metrics-service:https/proxy/metrics
+```
+
+## 重要監控指標
+
+### 1. Reconcile 成功率
+
+```promql
+# MaasMachine reconcile 錯誤率（過去 5 分鐘）
+rate(controller_runtime_reconcile_errors_total{
+  controller="maasmachine"
+}[5m])
+```
+
+### 2. Reconcile 平均耗時
+
+```promql
+# MaasCluster reconcile p99 耗時
+histogram_quantile(0.99,
+  rate(controller_runtime_reconcile_time_seconds_bucket{
+    controller="maascluster"
+  }[5m])
+)
+```
+
+### 3. Work Queue 積壓
+
+```promql
+# 當前等待處理的 MaasMachine 數量
+workqueue_depth{name="maasmachine"}
+```
+
+### 4. Goroutine 洩漏偵測
+
+```promql
+# Controller goroutine 數量異常增長
+go_goroutines{namespace="capmaas-system"}
+```
+
+## 告警規則範例
+
+```yaml
+# PrometheusRule 設定
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: capmaas-alerts
+  namespace: capmaas-system
+spec:
+  groups:
+    - name: capmaas.rules
+      rules:
+        # Reconcile 錯誤率過高
+        - alert: CAPMAASSHighReconcileErrorRate
+          expr: |
+            rate(controller_runtime_reconcile_errors_total{
+              namespace="capmaas-system"
+            }[5m]) > 0.1
+          for: 10m
+          labels:
+            severity: warning
+          annotations:
+            summary: "CAPM reconcile error rate is high"
+            description: "Controller {{ $labels.controller }} error rate: {{ $value | humanizePercentage }}"
+
+        # Work queue 積壓嚴重
+        - alert: CAPMAASWorkQueueDepthHigh
+          expr: |
+            workqueue_depth{
+              namespace="capmaas-system"
+            } > 10
+          for: 15m
+          labels:
+            severity: warning
+          annotations:
+            summary: "CAPM work queue depth is high"
+            description: "Queue {{ $labels.name }} depth: {{ $value }}"
+
+        # Controller 停止處理（reconcile 次數長時間為 0）
+        - alert: CAPMAASControllerNotReconciling
+          expr: |
+            increase(controller_runtime_reconcile_total{
+              namespace="capmaas-system"
+            }[30m]) == 0
+          for: 30m
+          labels:
+            severity: critical
+          annotations:
+            summary: "CAPM controller has stopped reconciling"
+            description: "Controller {{ $labels.controller }} has not reconciled in 30 minutes"
+```
+
+## Controller 並發設定
+
+CAPM 支援設定 MaasMachine 的並發 reconcile 數量：
+
+```go
+// main.go
+fs.IntVar(&machineConcurrency, "machine-concurrency", 2,
+    "The number of maas machines to process simultaneously")
+```
+
+預設值為 `2`，這意味著最多同時處理 2 台 machine 的 reconcile。可透過啟動參數調整：
+
+```bash
+# 調高並發數（適合大型 cluster）
+--machine-concurrency=5
+```
+
+並發設定會影響 `workqueue_depth` 和 reconcile 速度的 metrics 讀取。
+
+## 與 CAPI 原生 metrics 整合
+
+CAPI 核心 controller 也暴露類似的 metrics。在同一個 Prometheus 中，可以一起監控：
+
+```promql
+# 同時查看 CAPI 和 CAPM 的 reconcile 錯誤
+controller_runtime_reconcile_errors_total{
+  namespace=~"capi-system|capmaas-system"
+}
+```
+
+## 常用 kubectl 診斷指令
+
+```bash
+# 確認 controller 健康狀態
+kubectl get pods -n capmaas-system
+kubectl describe pod -n capmaas-system \
+  $(kubectl get pod -n capmaas-system -o name | head -1)
+
+# 查看 liveness/readiness 狀態
+kubectl port-forward -n capmaas-system \
+  deploy/capmaas-controller-manager 9440:9440 &
+curl http://localhost:9440/healthz
+curl http://localhost:9440/readyz
+
+# 直接讀取 metrics（開發用途）
+kubectl port-forward -n capmaas-system \
+  deploy/capmaas-controller-manager 8080:8080 &
+curl -s http://localhost:8080/metrics \
+  | grep controller_runtime_reconcile
+```
+
+## Sync Period 設定
+
+除了 event-driven reconcile，CAPM 還有定期同步機制：
+
+```go
+// main.go
+fs.DurationVar(&syncPeriod, "sync-period", 120*time.Minute,
+    "The minimum interval at which watched resources are reconciled")
+```
+
+預設每 120 分鐘強制 reconcile 所有物件，確保 status 與實際狀態同步。在 metrics 中，這些定期 reconcile 會出現在 `controller_runtime_reconcile_total` 中，但 result 應為 success。

@@ -1,0 +1,345 @@
+---
+layout: doc
+title: Rook — Operator 與 Ceph 版本升級
+description: 完整解說 Rook operator 與 Ceph 版本的升級順序、rolling upgrade 行為、健康檢查步驟，以及重大版本變更注意事項。
+---
+
+# Operator 與 Ceph 版本升級
+
+<Callout type="info" title="相關章節">
+- [架構總覽](/rook/features/architecture)
+- [Ceph Cluster 設定](/rook/features/ceph-cluster)
+- [OSD 與 Monitor](/rook/features/osds-monitors)
+- [Prometheus 監控](/rook/features/monitoring-prometheus)
+</Callout>
+
+<Callout type="tip" title="本文適用對象">
+- 🟢 **初學者**：了解升級的基本概念與必須注意的順序。
+- 🟡 **中階工程師**：執行完整的 Rook operator 與 Ceph 版本升級流程。
+- 🔴 **資深工程師**：處理複雜升級場景、major version breaking changes、以及升級後問題排查。
+</Callout>
+
+> 📦 **類比**：升級 Rook 就像在不關店的情況下翻修餐廳廚房——必須先換好設備（operator），再一個爐灶一個爐灶地升級（OSD rolling），全程不能停止出餐（服務不中斷）。
+
+## 升級的兩個層次
+
+Rook 升級涉及兩個獨立的版本：
+
+| 層次 | 說明 | 控制方式 |
+|------|------|---------|
+| **Rook Operator 版本** | Rook controller 本身的版本 | operator Deployment image tag |
+| **Ceph 版本** | 底層 Ceph daemon 的版本 | CephCluster `spec.cephVersion.image` |
+
+這兩者可以分開升級，但有相依性：
+
+```
+Rook Operator v1.13 ← 支援 Ceph 17 (Quincy) 和 Ceph 18 (Reef)
+Rook Operator v1.14 ← 支援 Ceph 18 (Reef) 和 Ceph 19 (Squid)
+```
+
+## 升級順序（關鍵）
+
+<Callout type="warning" title="務必遵循此順序">
+升級順序錯誤可能導致 operator 無法管理叢集，甚至資料損毀。請嚴格按照以下順序執行。
+</Callout>
+
+```
+Step 1: 升級 Kubernetes（若需要）
+    ↓
+Step 2: 更新 Rook CRD（kubectl apply 新版 CRD）
+    ↓
+Step 3: 升級 Rook Operator image
+    ↓
+Step 4: 確認 operator 健康
+    ↓
+Step 5: 更新 CephCluster spec.cephVersion.image
+    ↓
+Step 6: 觀察 rolling upgrade 完成
+    ↓
+Step 7: 驗證叢集健康
+```
+
+## Step 1：升級前健康確認
+
+執行任何升級前，必須確認叢集處於健康狀態：
+
+```bash
+# 進入 toolbox 執行所有確認
+kubectl -n rook-ceph exec -it deploy/rook-ceph-tools -- bash
+
+# 1. 確認叢集整體健康
+ceph status
+# 期望輸出：health: HEALTH_OK
+
+# 2. 確認所有 OSD 在線
+ceph osd stat
+# 期望輸出：X osds: X up (since Xm), X in (since Xm)
+
+# 3. 確認沒有 degraded PG
+ceph pg stat
+# 期望：active+clean 狀態
+
+# 4. 確認沒有進行中的 backfill/recovery
+ceph health detail
+```
+
+如果叢集處於非 `HEALTH_OK` 狀態，**停止升級，先修復問題**。
+
+## Step 2：升級 CRD
+
+Rook 新版本通常會修改 CRD schema，必須先更新 CRD 才能升級 operator：
+
+### 使用 Helm 升級
+
+```bash
+# 更新 Helm repo
+helm repo update
+
+# 查看可用版本
+helm search repo rook-release/rook-ceph --versions | head -20
+
+# 升級 CRD（Rook 將 CRD 打包在獨立 chart）
+helm upgrade --install rook-ceph-crds rook-release/rook-ceph-crds \
+  --version 1.14.0 \
+  --namespace rook-ceph
+
+# 確認 CRD 更新
+kubectl get crd | grep rook
+```
+
+### 使用 kubectl 手動升級
+
+```bash
+# 下載新版本 CRD
+ROOK_VERSION=v1.14.0
+kubectl apply --server-side -f \
+  https://raw.githubusercontent.com/rook/rook/${ROOK_VERSION}/deploy/examples/crds.yaml
+```
+
+## Step 3：升級 Rook Operator
+
+### 使用 Helm 升級 Operator
+
+```bash
+# 升級 operator（CRD 已在上一步更新）
+helm upgrade rook-ceph rook-release/rook-ceph \
+  --version 1.14.0 \
+  --namespace rook-ceph \
+  --reuse-values              # 保留現有的 values 設定
+
+# 監控 operator rollout
+kubectl -n rook-ceph rollout status deployment/rook-ceph-operator
+```
+
+### 使用 kubectl 手動升級
+
+```bash
+# 更新 operator image
+kubectl -n rook-ceph set image deployment/rook-ceph-operator \
+  rook-ceph-operator=rook/ceph:v1.14.0
+
+# 觀察升級進度
+kubectl -n rook-ceph get pod -w -l app=rook-ceph-operator
+```
+
+### 確認 Operator 健康
+
+```bash
+# 查看 operator 是否成功啟動
+kubectl -n rook-ceph get pod -l app=rook-ceph-operator
+# NAME                                  READY   STATUS    RESTARTS   AGE
+# rook-ceph-operator-7d9f6b8b4d-xxxxx   1/1     Running   0          2m
+
+# 查看 operator log（確認無 error）
+kubectl -n rook-ceph logs -l app=rook-ceph-operator --tail=50
+```
+
+## Step 4：升級 Ceph 版本
+
+更新 CephCluster 的 `spec.cephVersion.image`：
+
+```yaml
+apiVersion: ceph.rook.io/v1
+kind: CephCluster
+metadata:
+  name: rook-ceph
+  namespace: rook-ceph
+spec:
+  cephVersion:
+    image: quay.io/ceph/ceph:v18.2.4    # 從 v17.x 升級到 v18.x
+    allowUnsupported: false
+```
+
+```bash
+# 套用更新
+kubectl -n rook-ceph patch cephcluster rook-ceph --type merge \
+  -p '{"spec":{"cephVersion":{"image":"quay.io/ceph/ceph:v18.2.4"}}}'
+```
+
+## Rolling Upgrade 行為
+
+Operator 收到 cephVersion 更新後，會以 **安全的滾動方式** 逐一升級各 Ceph daemon：
+
+### 升級順序
+
+```
+1. MON (Monitor)
+   → 逐一重啟，每次確認 quorum 維持
+   
+2. MGR (Manager)
+   → 先啟動新版 standby，再切換 active
+   
+3. OSD (Object Storage Daemon)
+   → 逐一重啟，每次確認 PG 回到 clean 狀態
+   → 預設同時最多 1 個 OSD 升級（serial）
+   
+4. MDS (Metadata Server)
+   → standby 先升級，再 failover active
+   
+5. RGW (RADOS Gateway)
+   → 逐一重啟
+```
+
+### 觀察升級進度
+
+```bash
+# 即時觀察 Pod 狀態
+watch kubectl -n rook-ceph get pod
+
+# 在 toolbox 內監控叢集狀態
+watch ceph status
+
+# 查看 operator 升級 log
+kubectl -n rook-ceph logs -l app=rook-ceph-operator -f | grep -E "upgrade|version|error"
+```
+
+### OSD 升級的安全機制
+
+每個 OSD 升級時，operator 會：
+
+1. 設定 `noout` flag（防止 OSD 下線觸發 rebalancing）
+2. 重啟 OSD Pod
+3. 確認 OSD 重新上線（`ceph osd up`）
+4. 確認 PG 回到 active+clean
+5. 移除 `noout` flag
+6. 進行下一個 OSD
+
+```bash
+# 監控 OSD 升級時的 flag 狀態
+ceph osd dump | grep -E "noout|norebalance"
+```
+
+## Kubernetes 版本需求
+
+| Rook 版本 | 最低 Kubernetes 版本 | 最低 Ceph 版本 |
+|---------|-------------------|--------------|
+| v1.12 | v1.22 | Ceph 16 (Pacific) |
+| v1.13 | v1.23 | Ceph 17 (Quincy) |
+| v1.14 | v1.25 | Ceph 17 (Quincy) |
+| v1.15 | v1.26 | Ceph 18 (Reef) |
+| v1.16 | v1.27 | Ceph 18 (Reef) |
+| v1.17 | v1.28 | Ceph 18 (Reef) |
+
+<Callout type="warning" title="一次只升一個 minor version">
+建議每次只升級一個 Rook minor version（例如 v1.13 → v1.14），不要跳版（v1.12 → v1.14）。Ceph 版本同樣建議只跨一個 major version（Pacific → Quincy，不要直接 Pacific → Reef）。
+</Callout>
+
+## 主要版本變更重點
+
+### Rook v1.12 → v1.13
+
+| 變更項目 | 說明 |
+|---------|------|
+| CSI Driver 版本 | ceph-csi v3.9 → v3.10 |
+| 移除 CephRBDMirror 舊 API | 請改用新的 spec 格式 |
+| OSD 升級預設行為 | 新增 `upgradeOSDRequiresHealthyPGs` 保護機制 |
+
+### Rook v1.13 → v1.14
+
+| 變更項目 | 說明 |
+|---------|------|
+| 最低 K8s 版本 | 升至 v1.25 |
+| Ceph Pacific 支援終止 | 需先升級至 Ceph Quincy |
+| Network spec 變更 | `hostNetwork` 移至 `network.connections` |
+
+### Rook v1.14 → v1.15
+
+| 變更項目 | 說明 |
+|---------|------|
+| 最低 K8s 版本 | 升至 v1.26 |
+| Ceph Quincy 為最低版本 | Reef 為建議版本 |
+| `mgr.modules` 預設值變更 | 確認自訂模組設定 |
+
+## Rollback 注意事項
+
+<Callout type="warning" title="Ceph 升級通常不可逆">
+Ceph daemon 升級後會更新 RADOS 的 on-disk format。**Ceph 官方不支援 rollback 到舊版**。如果升級後發現問題，解法是繼續修復，而非回滾。
+</Callout>
+
+### Rook Operator Rollback（限緊急情況）
+
+若 Rook operator 升級後出現嚴重問題（且 Ceph daemon 尚未升級），可以回滾 operator image：
+
+```bash
+# 回滾 operator image（僅在 Ceph 尚未升級時有效）
+kubectl -n rook-ceph set image deployment/rook-ceph-operator \
+  rook-ceph-operator=rook/ceph:v1.13.x
+
+# 注意：CRD 無法回滾，可能需要手動修正 spec 相容性
+```
+
+### 最佳實踐：先在測試叢集驗證
+
+```
+DEV cluster → 升級測試 → 確認 7 天穩定
+    ↓
+STAGING cluster → 升級測試 → 確認 3 天穩定
+    ↓
+PROD cluster → 正式升級（有回滾 operator 的準備）
+```
+
+## 升級後驗證 Checklist
+
+```bash
+# 完整的升級後健康確認
+kubectl -n rook-ceph exec -it deploy/rook-ceph-tools -- bash
+
+# 1. 叢集整體狀態
+ceph status
+
+# 2. 確認所有 daemon 版本已更新
+ceph versions
+
+# 3. 確認 OSD 都 up
+ceph osd stat
+
+# 4. 確認沒有 degraded PG
+ceph pg stat
+
+# 5. 確認空間充足
+ceph df
+
+# 6. 查看 health detail（應無重要 warning）
+ceph health detail
+```
+
+期望看到的輸出：
+
+```
+cluster:
+  id:     xxxxxxxx
+  health: HEALTH_OK     ← 升級成功後應為 OK
+
+services:
+  mon: 3 daemons, quorum a,b,c
+  mgr: a(active), standbys: b
+  osd: 9 osds: 9 up (since 2m), 9 in (since 2m)
+  
+data:
+  pools:   4 pools, 97 pgs
+  pgs:     97 active+clean    ← 全部 clean
+```
+
+## 小結
+
+Rook 與 Ceph 的升級需要嚴格遵循「CRD → Operator → Ceph」的順序，配合 rolling upgrade 的安全機制，確保在升級過程中服務不中斷。升級前的健康確認和升級後的驗證是不可省略的步驟。建議透過 [Prometheus 監控](/rook/features/monitoring-prometheus) 持續監控升級過程中的叢集狀態。

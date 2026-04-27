@@ -1,0 +1,441 @@
+---
+layout: doc
+title: KubeVirt — CPU Pinning 與 NUMA 拓樸
+description: 透過 dedicatedCPUPlacement、hugepages 與 NUMA topology hints，為效能敏感型工作負載（電信 VNF、金融交易、HPC）提供確定性延遲保障。
+---
+
+# CPU Pinning 與 NUMA 拓樸
+
+<Callout type="info" title="相關章節">
+- [Instancetypes 與 Preferences](/kubevirt/features/instancetypes)
+- [VMI 生命週期](/kubevirt/features/vmi-lifecycle)
+- [virt-handler](/kubevirt/features/virt-handler)
+- [GPU 與 Host Device Passthrough](/kubevirt/features/gpu-device-passthrough)
+- [virt-operator 與 KubeVirt CR](/kubevirt/features/virt-operator)
+</Callout>
+
+<Callout type="tip" title="本文適用對象">
+- 🟢 **初學者**：了解 CPU pinning 與 hugepages 的基本概念
+- 🟡 **中階工程師**：學習如何設定 dedicatedCPUPlacement 與 NUMA 拓樸 hints
+- 🔴 **資深工程師**：掌握 CPU Manager 與 Topology Manager 整合、I/O thread 策略與 real-time hint 設定
+</Callout>
+
+> 📦 **類比**：CPU Pinning 就像在開放式辦公室中為重要會議預訂「專屬會議室」——一般工作使用共享空間（CPU 時間片共享），而 CPU Pinning 確保 VM 獲得「專屬」的 CPU core，不與其他工作負載競爭，從而獲得可預測的低延遲效能。
+
+## 什麼是 CPU Pinning
+
+在預設的 KubeVirt 設定中，VM 的 vCPU 會在主機的多個物理 CPU core 間動態排程，與其他 Pod 和 VM 競爭 CPU 時間。這對一般工作負載沒有問題，但對以下場景造成問題：
+
+| 場景 | 問題 |
+|------|------|
+| 電信 VNF（虛擬網路功能）| 封包處理需要微秒級確定性延遲 |
+| 金融交易系統 | 市場資料處理不能因 CPU 搶佔而延遲 |
+| 即時音視訊處理 | jitter 導致音質/畫質問題 |
+| HPC 科學計算 | 效能可重現性要求 |
+
+**CPU Pinning（dedicatedCPUPlacement）** 解決方案：
+- VM 的每個 vCPU 獨佔一個物理 CPU core
+- 該 core 不分配給其他任何工作負載
+- 搭配 hugepages 消除 TLB miss 開銷
+- 搭配 NUMA 對齊消除跨 NUMA 存取延遲
+
+---
+
+## 先決條件：Kubernetes CPU Manager
+
+CPU pinning 需要 Kubernetes **CPU Manager** 以 `static` policy 運行。
+
+### 設定 kubelet CPU Manager
+
+```bash
+# 方式一：修改 kubelet 設定（需要重啟 kubelet）
+cat > /etc/kubernetes/kubelet-config.yaml << 'EOF'
+apiVersion: kubelet.config.k8s.io/v1beta1
+kind: KubeletConfiguration
+cpuManagerPolicy: static
+cpuManagerReconcilePeriod: 5s
+reservedSystemCPUs: "0,1"      # 保留給系統使用的 CPU
+topologyManagerPolicy: single-numa-node   # 搭配 NUMA 使用
+EOF
+
+systemctl restart kubelet
+```
+
+```bash
+# 確認 CPU Manager 狀態
+kubectl get node <node-name> -o jsonpath='{.status.allocatable.cpu}'
+cat /var/lib/kubelet/cpu_manager_state   # 查看 CPU 分配狀態
+```
+
+<Callout type="warning" title="reservedSystemCPUs 很重要">
+使用 CPU Manager static policy 時，必須設定 `reservedSystemCPUs`（或 `systemReserved`）為系統程序（kernel、systemd、kubelet 自身）保留 CPU。若不保留，CPU pinning 的 VM 可能會搶佔系統關鍵 CPU，導致節點不穩定。
+</Callout>
+
+### Node 標籤確認
+
+```bash
+# 確認 node 具備 CPU Manager static policy 能力
+kubectl get node -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.status.allocatable}{"\n"}{end}'
+
+# KubeVirt 會自動在支援 CPU pinning 的 node 上加上標籤
+kubectl get node -l cpumanager=true
+```
+
+---
+
+## dedicatedCPUPlacement 設定
+
+### VMI Spec 設定
+
+```yaml
+apiVersion: kubevirt.io/v1
+kind: VirtualMachineInstance
+metadata:
+  name: pinned-vm
+spec:
+  domain:
+    cpu:
+      cores: 2                         # 每個 socket 的 core 數
+      sockets: 1                       # socket 數
+      threads: 2                       # 每個 core 的執行緒數（SMT/Hyper-Threading）
+      dedicatedCPUPlacement: true      # ★ 啟用 CPU Pinning
+      isolateEmulatorThread: true      # QEMU 模擬器執行緒使用獨立 CPU（建議搭配）
+      model: host-passthrough          # 暴露主機完整 CPU 功能給 guest
+      numa:
+        guestMappingPassthrough: {}    # 將主機 NUMA 拓樸映射到 guest
+    resources:
+      requests:
+        cpu: "4"            # 必須等於 sockets × cores × threads
+        memory: "8Gi"
+      limits:
+        cpu: "4"            # requests 必須等於 limits（CPU Manager 要求）
+        memory: "8Gi"
+```
+
+### CPU 拓樸計算規則
+
+| 欄位 | 說明 | 範例值 |
+|------|------|--------|
+| `sockets` | CPU socket 數量 | 1 |
+| `cores` | 每個 socket 的 core 數 | 4 |
+| `threads` | 每個 core 的執行緒數（SMT）| 2 |
+| **Total vCPU** | sockets × cores × threads | 1×4×2 = **8** |
+
+```yaml
+# 範例：8 vCPU VM（1 socket, 4 cores, 2 threads）
+cpu:
+  sockets: 1
+  cores: 4
+  threads: 2
+  dedicatedCPUPlacement: true
+# 需要申請 resources.requests.cpu: "8"
+```
+
+### CPU Model 選擇
+
+| CPU Model | 說明 | 建議場景 |
+|-----------|------|---------|
+| `host-passthrough` | 暴露主機完整 CPU 功能（包含所有 feature flags）| Live migration 限制較多（目標主機需相同 CPU）|
+| `host-model` | 使用主機 CPU 的基準型號 | 同一廠牌 CPU 間可 live migration |
+| 特定型號（如 `Skylake-Server`）| 固定 CPU 型號 | 跨廠牌 CPU 集群 |
+
+```yaml
+cpu:
+  model: host-passthrough
+  features:
+    - name: "avx512f"      # 強制啟用 AVX-512（如主機支援）
+      policy: require
+    - name: "mpx"          # 停用特定 feature
+      policy: disable
+```
+
+---
+
+## Hugepages 設定
+
+Hugepages 是 CPU Pinning VM 的標準配件，消除 TLB（Translation Lookaside Buffer）miss 開銷。
+
+### Linux 預設記憶體頁面
+
+- 標準頁面大小：**4KB**
+- 4GB 記憶體 = 1,048,576 個頁面 = TLB 需要追蹤超過百萬個映射
+
+### Hugepages 選項
+
+| Hugepage 大小 | 適用場景 | 記憶體節省率 |
+|--------------|---------|------------|
+| **2Mi** | 一般效能最佳化 VM | 中 |
+| **1Gi** | 大型記憶體 VM（資料庫、HPC）| 高 |
+
+### 主機預先配置 Hugepages
+
+```bash
+# 在節點上設定 2Mi hugepages（臨時，重啟後失效）
+echo 1024 > /sys/kernel/mm/hugepages/hugepages-2048kB/nr_hugepages
+
+# 設定 1Gi hugepages
+echo 16 > /sys/kernel/mm/hugepages/hugepages-1048576kB/nr_hugepages
+
+# 永久設定（修改 grub 或 sysctl）
+# 在 /etc/default/grub 中加入 hugepagesz=2M hugepages=1024
+# 或
+echo "vm.nr_hugepages = 1024" >> /etc/sysctl.conf
+```
+
+```bash
+# 確認節點 hugepages 可用量
+kubectl get node <node-name> -o jsonpath='{.status.allocatable}' | jq 'with_entries(select(.key | startswith("hugepages")))'
+# 範例輸出：
+# {"hugepages-1Gi":"16Gi","hugepages-2Mi":"2Gi"}
+```
+
+### VMI Hugepages 設定
+
+```yaml
+spec:
+  domain:
+    cpu:
+      dedicatedCPUPlacement: true
+    memory:
+      hugepages:
+        pageSize: "1Gi"        # 使用 1Gi hugepages
+    resources:
+      requests:
+        memory: "16Gi"          # 必須是 pageSize 的整數倍
+        cpu: "8"
+      limits:
+        memory: "16Gi"
+        cpu: "8"
+```
+
+<Callout type="warning" title="Hugepages 記憶體不計入 requests.memory">
+啟用 hugepages 時，`resources.requests.memory` 應設為 0 或使用 `domain.memory.hugepages` 指定。實際上，hugepages 的大小會轉換為對應的 Kubernetes resource（`hugepages-2Mi` 或 `hugepages-1Gi`），這與一般 `memory` resource 是分開計算的。
+</Callout>
+
+---
+
+## NUMA 拓樸設定
+
+現代伺服器通常有多個 NUMA（Non-Uniform Memory Access）節點。跨 NUMA 存取記憶體的延遲顯著高於本地 NUMA 存取。
+
+### NUMA 問題示意
+
+```
+NUMA Node 0: CPU 0-15, Memory 0-127GB  (本地存取：快)
+NUMA Node 1: CPU 16-31, Memory 128-255GB
+
+若 VM vCPU 在 NUMA 0 的 CPU core，
+但記憶體分配在 NUMA 1 → 跨 NUMA 存取 → 延遲增加 30-40%
+```
+
+### Topology Manager 整合
+
+```bash
+# kubelet 設定中啟用 Topology Manager
+topologyManagerPolicy: single-numa-node   # 強制所有資源在同一 NUMA node
+# 選項：none | best-effort | restricted | single-numa-node
+```
+
+### VMI NUMA 設定
+
+```yaml
+spec:
+  domain:
+    cpu:
+      sockets: 1
+      cores: 8
+      threads: 2
+      dedicatedCPUPlacement: true
+      numa:
+        guestMappingPassthrough: {}    # 將主機 NUMA 拓樸直接映射到 guest
+    memory:
+      hugepages:
+        pageSize: "1Gi"
+    resources:
+      requests:
+        cpu: "16"
+        memory: "32Gi"
+      limits:
+        cpu: "16"
+        memory: "32Gi"
+```
+
+`guestMappingPassthrough` 效果：
+- Guest OS 可以看到主機的 NUMA 拓樸
+- Guest 的 NUMA-aware 應用程式（如 DPDK、數據庫）可以正確分配本地記憶體
+- 需要搭配 `dedicatedCPUPlacement: true`
+
+---
+
+## I/O Thread 策略
+
+I/O thread 是 QEMU 處理磁碟 I/O 的執行緒。不同策略影響效能與資源分配：
+
+```yaml
+spec:
+  domain:
+    ioThreadsPolicy: auto   # 或 shared
+```
+
+| 策略 | 說明 | 適用場景 |
+|------|------|---------|
+| `shared`（預設）| 所有磁碟共享一個 I/O 執行緒 | 一般 VM |
+| `auto` | 每個磁碟有獨立的 I/O 執行緒 | 多磁碟高 I/O VM |
+
+搭配 `dedicatedCPUPlacement` 時，auto 策略的 I/O 執行緒也會獲得獨立 CPU：
+
+```yaml
+spec:
+  domain:
+    cpu:
+      dedicatedCPUPlacement: true
+      isolateEmulatorThread: true    # 模擬器執行緒用獨立 CPU
+    ioThreadsPolicy: auto            # I/O 執行緒也用獨立 CPU
+```
+
+---
+
+## Real-Time Hint
+
+對需要 real-time Linux kernel 效能的 VM，可啟用 real-time hint：
+
+```yaml
+spec:
+  domain:
+    cpu:
+      dedicatedCPUPlacement: true
+      realtime:
+        mask: "0-3"    # 哪些 vCPU 用於 real-time（其餘用於 non-real-time）
+    resources:
+      requests:
+        cpu: "4"
+        memory: "4Gi"
+```
+
+Real-time hint 效果：
+- QEMU 將對應的 vCPU 執行緒設定為 `SCHED_FIFO` 排程策略
+- 這些 vCPU 可搶佔非 real-time 執行緒
+- 需要節點安裝 real-time Linux kernel（RHEL RT kernel 或 Ubuntu RT kernel）
+
+---
+
+## 節點設定最佳實踐
+
+### 節點 Kernel 參數（電信 VNF 場景）
+
+```bash
+# /etc/default/grub 中加入
+GRUB_CMDLINE_LINUX="... 
+  isolcpus=2-31              # 隔離 CPU 2-31（保留 0,1 給系統）
+  nohz_full=2-31             # 關閉隔離 CPU 的 timer tick
+  rcu_nocbs=2-31             # 隔離 CPU 不處理 RCU callback
+  hugepagesz=1G hugepages=32 # 預配置 32 個 1Gi hugepages
+  default_hugepagesz=1G
+  intel_iommu=on iommu=pt   # 啟用 IOMMU（passthrough 模式）
+  tuned.non_isolcpus=3      # tuned 管理的非隔離 CPU mask
+"
+```
+
+### KubeVirt Feature Gate
+
+```yaml
+apiVersion: kubevirt.io/v1
+kind: KubeVirt
+metadata:
+  name: kubevirt
+spec:
+  configuration:
+    developerConfiguration:
+      featureGates:
+        - NUMA           # 啟用 NUMA topology hints
+        - CPUManager     # 確認 CPU Manager 整合
+```
+
+---
+
+## 完整範例：電信 VNF VM
+
+```yaml
+apiVersion: kubevirt.io/v1
+kind: VirtualMachine
+metadata:
+  name: dpdk-vnf-01
+  namespace: telco
+spec:
+  running: true
+  template:
+    spec:
+      domain:
+        cpu:
+          sockets: 1
+          cores: 4
+          threads: 2                   # SMT 啟用
+          dedicatedCPUPlacement: true  # 獨佔 CPU
+          isolateEmulatorThread: true  # 模擬器執行緒隔離
+          model: host-passthrough      # 暴露完整 CPU 功能（DPDK 需要）
+          numa:
+            guestMappingPassthrough: {}  # NUMA 拓樸傳遞
+          realtime:
+            mask: "2-7"                  # vCPU 2-7 使用 real-time 排程
+        memory:
+          hugepages:
+            pageSize: "1Gi"              # DPDK 需要 1Gi hugepages
+        ioThreadsPolicy: auto
+        devices:
+          disks:
+            - name: rootdisk
+              disk:
+                bus: virtio
+          interfaces:
+            - name: default
+              masquerade: {}
+            - name: dpdk-net-0
+              sriov: {}                  # SR-IOV 直通給 VM
+        resources:
+          requests:
+            cpu: "8"
+            memory: "8Gi"
+            hugepages-1Gi: "8Gi"
+          limits:
+            cpu: "8"
+            memory: "8Gi"
+            hugepages-1Gi: "8Gi"
+      networks:
+        - name: default
+          pod: {}
+        - name: dpdk-net-0
+          multus:
+            networkName: sriov-dpdk-net
+      volumes:
+        - name: rootdisk
+          dataVolume:
+            name: dpdk-vnf-root
+      nodeSelector:
+        cpumanager: "true"             # 只排程到啟用 CPU Manager 的 node
+        feature.node.kubernetes.io/memory-numa: "true"
+```
+
+---
+
+## 效能驗證
+
+```bash
+# 在 guest 內確認 CPU 拓樸
+virtctl console dpdk-vnf-01
+# 在 guest 內執行：
+lscpu | grep -E 'CPU|Thread|Core|Socket|NUMA'
+numactl --hardware   # 查看 NUMA 拓樸
+
+# 確認 hugepages 已被使用
+grep HugePages /proc/meminfo
+
+# 確認 CPU pinning（在主機上）
+cat /var/lib/kubelet/cpu_manager_state | jq .
+```
+
+| 驗證項目 | 指令 | 期望結果 |
+|---------|------|---------|
+| vCPU 拓樸 | `lscpu` | sockets/cores/threads 符合設定 |
+| Hugepages 啟用 | `/proc/meminfo` | HugePages_Total > 0 |
+| NUMA 對齊 | `numactl --hardware` | 所有記憶體在同一 NUMA 節點 |
+| CPU 隔離 | `taskset -c -p <qemu-pid>` | 只使用分配的 CPU core |

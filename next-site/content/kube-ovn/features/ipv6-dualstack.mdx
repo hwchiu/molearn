@@ -1,0 +1,279 @@
+---
+layout: doc
+title: Kube-OVN — IPv6 與 Dual-Stack 網路
+description: 設定 IPv6-only 或 IPv4/IPv6 雙棧 Subnet，讓 Pod 同時擁有 IPv4 與 IPv6 地址
+---
+
+# IPv6 與 Dual-Stack 網路
+
+<Callout type="info" title="相關章節">
+- [VPC 與 Subnet 設計](/kube-ovn/features/vpc-subnet)
+- [IPAM 設計](/kube-ovn/features/ipam)
+- [整體架構](/kube-ovn/features/architecture)
+- [OVN 整合原理](/kube-ovn/features/ovn-integration)
+</Callout>
+
+<Callout type="tip" title="本文適用對象">
+- 🟢 **初學者**：了解 IPv6 Subnet 與雙棧的基本概念
+- 🟡 **中階工程師**：掌握 dual-stack Subnet 設定、Service 雙棧配置
+- 🔴 **資深工程師**：深入理解 IPv6 Gateway 路由、CoreDNS 雙棧配置與已知限制
+</Callout>
+
+> 📦 **類比**：Dual-Stack 就像同時持有兩張名片（一張中文、一張英文）——Pod 同時擁有 IPv4 和 IPv6 地址，任何協定的客戶端都能直接聯繫它，無需 NAT64 或中轉。
+
+## 前置需求
+
+在啟用 IPv6 或 Dual-Stack 之前，請確認以下環境條件：
+
+| 需求項目 | 最低版本 / 設定 |
+|---------|--------------|
+| Linux Kernel | 4.18+（完整 IPv6 OVS 支援）|
+| OVN | 22.06+（Kube-OVN v1.11+ 內建）|
+| Kube-OVN | v1.10+（完整 dual-stack 支援）|
+| Kubernetes | v1.21+（`IPv6DualStack` feature gate 預設啟用）|
+| kube-apiserver | `--service-cluster-ip-range=10.96.0.0/12,fd00::/112` |
+| kubelet | `--cluster-dns` 需包含 IPv6 DNS 地址（若有）|
+| 節點 IPv6 | 節點本身需有可路由的 IPv6 地址（或 ULA）|
+
+```bash
+# 確認節點支援 IPv6
+ip -6 addr show
+sysctl net.ipv6.conf.all.forwarding   # 應為 1
+```
+
+## Subnet protocol 欄位
+
+Kube-OVN Subnet CRD 的 `spec.protocol` 決定此 Subnet 的 IP 協定模式：
+
+| 值 | 說明 |
+|----|------|
+| `IPv4` | 僅 IPv4（預設）|
+| `IPv6` | 僅 IPv6 |
+| `Dual` | IPv4 + IPv6 雙棧 |
+
+## 建立 IPv6-only Subnet
+
+```yaml
+apiVersion: kubeovn.io/v1
+kind: Subnet
+metadata:
+  name: ipv6-subnet
+spec:
+  protocol: IPv6
+  cidrBlock: "fd00:10:16::/112"     # IPv6 ULA 前綴，/112 提供 65536 個地址
+  gateway: "fd00:10:16::1"
+  namespaces:
+  - ipv6-ns
+  natOutgoing: false                 # IPv6 通常不做 NAT，直接路由
+  excludeIps:
+  - "fd00:10:16::1"                  # 排除 gateway IP
+```
+
+<Callout type="info" title="IPv6 Prefix 長度建議">
+OVN 的 Logical Switch Port 使用 /128 分配給每個 Pod。建議 Subnet CIDR 使用 /112（65536 個地址）或 /96，避免因 /64 過大導致 IPAM bitmap 佔用過多記憶體。
+</Callout>
+
+Pod 建立後會自動分配 IPv6 地址：
+
+```bash
+kubectl get pod -o wide
+# NAME      READY   STATUS    IP
+# test-pod  1/1     Running   fd00:10:16::a
+
+kubectl get ip
+# NAME                    V6IP              SUBNET
+# test-pod.ipv6-ns        fd00:10:16::a     ipv6-subnet
+```
+
+## 建立 Dual-Stack Subnet
+
+Dual-Stack Subnet 使用兩個 CIDR 欄位，以逗號分隔（IPv4,IPv6 順序）：
+
+```yaml
+apiVersion: kubeovn.io/v1
+kind: Subnet
+metadata:
+  name: dual-stack-subnet
+spec:
+  protocol: Dual
+  cidrBlock: "10.16.10.0/24,fd00:10:16:10::/112"   # IPv4,IPv6 順序
+  gateway: "10.16.10.1,fd00:10:16:10::1"            # 逗號分隔雙 gateway
+  namespaces:
+  - dual-ns
+  natOutgoing: true              # IPv4 出口 SNAT，IPv6 通常不需要
+  excludeIps:
+  - "10.16.10.1"
+  - "fd00:10:16:10::1"
+```
+
+<Callout type="warning" title="Gateway 順序需與 cidrBlock 一致">
+`gateway` 欄位的 IPv4/IPv6 順序必須與 `cidrBlock` 完全對應，否則 Kube-OVN controller 會設定 gateway 失敗。
+</Callout>
+
+### Dual-Stack Pod 的 IP 分配
+
+Dual-Stack Subnet 中的 Pod 同時獲得 IPv4 和 IPv6 地址：
+
+```bash
+kubectl get pod test-dual -o jsonpath='{.metadata.annotations}'
+# {
+#   "ovn.kubernetes.io/ip_address": "10.16.10.5,fd00:10:16:10::5",
+#   "ovn.kubernetes.io/mac_address": "00:00:00:ab:cd:ef"
+# }
+```
+
+Pod 內部的網路介面同時配置兩個地址：
+
+```bash
+kubectl exec test-dual -- ip addr show eth0
+# inet  10.16.10.5/24 brd 10.16.10.255 scope global eth0
+# inet6 fd00:10:16:10::5/112 scope global
+# inet6 fe80::200:ff:feab:cdef/64 scope link
+```
+
+## IPv6 Gateway 配置
+
+### Underlay 模式（直接路由）
+
+在 Underlay 模式下，IPv6 Gateway 需要物理交換機或路由器支援 IPv6 路由：
+
+```yaml
+spec:
+  protocol: IPv6
+  cidrBlock: "2001:db8:1::/64"   # 可路由的 IPv6 公網或 GUA 前綴
+  gateway: "2001:db8:1::1"       # 實際存在於上游路由器的 IPv6 gateway
+  underlay: true
+```
+
+### Overlay 模式（OVN 路由）
+
+Overlay 模式下，OVN Logical Router 充當 IPv6 Gateway，節點只需支援 IPv6 即可：
+
+```yaml
+spec:
+  protocol: IPv6
+  cidrBlock: "fd00:10:16::/112"  # ULA（唯一本地位址）
+  gateway: "fd00:10:16::1"       # OVN LR 虛擬 gateway
+  natOutgoing: false
+```
+
+此模式下，Pod 到外部的 IPv6 流量需要節點有可路由的 IPv6 地址，或透過 IPv6 前綴委派（DHCPv6-PD）取得。
+
+## Service 雙棧配置
+
+Kubernetes Service 在雙棧環境中需要明確指定 IP Family Policy：
+
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: my-dual-service
+spec:
+  selector:
+    app: my-app
+  ipFamilyPolicy: PreferDualStack   # 優先雙棧，單棧環境自動降級
+  ipFamilies:
+  - IPv4
+  - IPv6
+  ports:
+  - port: 80
+    targetPort: 8080
+```
+
+| `ipFamilyPolicy` 值 | 說明 |
+|--------------------|------|
+| `SingleStack` | 僅使用主要 IP Family（預設）|
+| `PreferDualStack` | 優先雙棧，若環境不支援則 fallback |
+| `RequireDualStack` | 強制雙棧，不支援則建立失敗 |
+
+```bash
+kubectl get svc my-dual-service
+# NAME              CLUSTER-IP          EXTERNAL-IP   PORT(S)
+# my-dual-service   10.96.1.10,fd00::1  <none>        80/TCP
+```
+
+## CoreDNS 雙棧配置
+
+在雙棧環境中，CoreDNS 需要同時提供 A（IPv4）和 AAAA（IPv6）記錄：
+
+```yaml
+# ConfigMap: coredns / kube-system
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: coredns
+  namespace: kube-system
+data:
+  Corefile: |
+    .:53 {
+        errors
+        health
+        ready
+        kubernetes cluster.local in-addr.arpa ip6.arpa {
+            pods insecure
+            fallthrough in-addr.arpa ip6.arpa
+            ttl 30
+        }
+        prometheus :9153
+        forward . /etc/resolv.conf
+        cache 30
+        loop
+        reload
+        loadbalance
+    }
+```
+
+關鍵點：`ip6.arpa` 需要加入 `kubernetes` plugin 的 zone 列表，否則 IPv6 反向解析（PTR）會失敗。
+
+```bash
+# 驗證 AAAA 記錄解析
+kubectl exec test-pod -- nslookup -type=AAAA kubernetes.default.svc.cluster.local
+```
+
+## IPv6 路由通告
+
+若需要將 Pod IPv6 地址宣告到外部路由器，可搭配 Kube-OVN 的 BGP 功能：
+
+```yaml
+# 在 Subnet 啟用 IPv6 BGP 宣告
+spec:
+  protocol: IPv6
+  enableGatewayIntercept: false
+  # 搭配 ovn-speaker 的 BGP 設定宣告 fd00:10:16::/112
+```
+
+詳細設定請參考 [BGP 整合](/kube-ovn/features/bgp)。
+
+## 已知限制
+
+| 限制項目 | 說明 |
+|---------|------|
+| NDP Proxy | OVN 不支援 NDP（Neighbor Discovery Protocol）Proxy，Underlay IPv6 需手動處理 |
+| DHCPv6 | Kube-OVN 內建 DHCP 僅支援 IPv4，IPv6 地址通過 SLAAC 或靜態分配 |
+| IPv6 NAT66 | OVN 支援但 Kube-OVN 尚未完整封裝 NAT66 CRD |
+| Windows 節點 | Windows CNI 目前僅支援 IPv4 |
+| 與舊版 iptables 整合 | iptables-legacy 對 IPv6 支援有限，建議使用 nftables 或 iptables-nft |
+
+## 驗證與排查
+
+```bash
+# 確認 Pod 有雙棧地址
+kubectl get pod -o custom-columns='NAME:.metadata.name,IPs:.status.podIPs[*].ip'
+
+# 測試 IPv6 連通性
+kubectl exec test-pod -- ping6 fd00:10:16::1    # ping IPv6 gateway
+kubectl exec test-pod -- ping6 <另一個pod的IPv6>
+
+# 查看 OVN NB 中的 IPv6 Logical Switch Port
+ovn-nbctl show | grep -A5 "fd00:"
+
+# 確認節點有 IPv6 路由
+ip -6 route show
+
+# 查看 Kube-OVN controller 的雙棧處理日誌
+kubectl logs -n kube-system deployment/kube-ovn-controller | grep -i "ipv6\|dual"
+```
+
+<Callout type="tip" title="ULA vs GUA">
+開發環境建議使用 **ULA（fc00::/7）**，如 `fd00::/8`，不需要申請公網 IPv6 段即可測試雙棧。生產環境若需對外通訊，使用 ISP 分配的 **GUA（Global Unicast Address）**。
+</Callout>

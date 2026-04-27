@@ -1,0 +1,485 @@
+---
+layout: doc
+title: KubeVirt — virt-operator 與 KubeVirt CR
+description: virt-operator 是 KubeVirt 的自我管理 operator，透過 KubeVirt CR 控制整個 KubeVirt 平台的安裝、升級、Feature Gate 設定與 TLS 憑證輪換。
+---
+
+# virt-operator 與 KubeVirt CR
+
+<Callout type="info" title="相關章節">
+- [架構總覽](/kubevirt/features/architecture)
+- [virt-controller](/kubevirt/features/virt-controller)
+- [virt-handler](/kubevirt/features/virt-handler)
+- [Live Migration](/kubevirt/features/live-migration)
+- [CPU Pinning 與 NUMA 拓樸](/kubevirt/features/cpu-pinning-numa)
+</Callout>
+
+<Callout type="tip" title="本文適用對象">
+- 🟢 **初學者**：了解如何透過 KubeVirt CR 設定基本選項（Feature Gate、image 版本）
+- 🟡 **中階工程師**：掌握升級流程、workload update 策略與元件健康監控
+- 🔴 **資深工程師**：深入 virt-operator 的 reconciliation 邏輯、憑證輪換機制與 Leader Election
+</Callout>
+
+> 📦 **類比**：virt-operator 就像 KubeVirt 的「基礎設施團隊」——你告訴它想要什麼版本的 KubeVirt（透過 KubeVirt CR），它負責部署 virt-api、virt-controller、virt-handler 等所有元件，並確保它們保持在正確的版本和狀態。就像 Kubernetes 管理 Pod 一樣，virt-operator 管理整個 KubeVirt 平台。
+
+## 什麼是 virt-operator
+
+virt-operator 是 KubeVirt 的 **Kubernetes Operator**，實作了 [Operator Pattern](https://kubernetes.io/docs/concepts/extend-kubernetes/operator/)：
+
+- **自動安裝**：部署所有 KubeVirt 元件（CRD、RBAC、Deployment、DaemonSet）
+- **自動升級**：協調版本升級，確保在不影響正在運行的 VM 的情況下升級
+- **狀態監控**：持續監控所有元件的健康狀態，並回報到 KubeVirt CR status
+- **憑證管理**：自動輪換 virt-api、virt-controller、virt-handler 之間的 TLS 憑證
+- **設定同步**：將 KubeVirt CR 中的設定同步到各元件
+
+### 部署位置
+
+```bash
+# virt-operator 部署在 kubevirt namespace
+kubectl get deployment virt-operator -n kubevirt
+kubectl get pods -n kubevirt -l kubevirt.io=virt-operator
+
+# virt-operator 通常運行兩個副本（Leader Election 確保只有一個主動）
+kubectl get pods -n kubevirt -l kubevirt.io=virt-operator
+# 輸出：
+# virt-operator-7d9b4f6c9b-abc12   1/1   Running   0   10d
+# virt-operator-7d9b4f6c9b-def34   1/1   Running   0   10d
+```
+
+---
+
+## KubeVirt CR：頂層設定物件
+
+KubeVirt CR（`kubevirt.io/v1/KubeVirt`）是整個 KubeVirt 平台的「設定面板」，所有全域設定都在這裡管理。
+
+### 基本結構
+
+```yaml
+apiVersion: kubevirt.io/v1
+kind: KubeVirt
+metadata:
+  name: kubevirt           # 名稱固定為 kubevirt
+  namespace: kubevirt      # 命名空間固定為 kubevirt
+spec:
+  imageTag: "v1.2.0"                   # KubeVirt 版本
+  imageRegistry: "quay.io/kubevirt"    # 映像倉庫
+  imagePullPolicy: IfNotPresent        # 映像拉取策略
+  imagePullSecrets:                    # 私有倉庫憑證
+    - name: registry-credentials
+  configuration: {}                    # 詳細設定（見下方）
+  workloadUpdateStrategy: {}           # 升級時的工作負載更新策略
+  certificateRotateStrategy: {}        # 憑證輪換策略
+  customizeComponents: {}              # 自訂元件設定
+```
+
+---
+
+## Feature Gates 設定
+
+Feature Gate 控制 KubeVirt 的實驗性或選用功能。預設情況下，只有穩定功能啟用。
+
+### 在 KubeVirt CR 中設定 Feature Gates
+
+```yaml
+apiVersion: kubevirt.io/v1
+kind: KubeVirt
+metadata:
+  name: kubevirt
+  namespace: kubevirt
+spec:
+  configuration:
+    developerConfiguration:
+      featureGates:
+        # 效能與硬體功能
+        - NUMA                    # NUMA topology hints
+        - CPUManager              # CPU Manager 整合
+        - HypervStrictCheck       # 嚴格的 Hyper-V 功能檢查
+        - GPU                     # GPU passthrough
+        - HostDevices             # Host Device passthrough
+        # 網路功能
+        - HotplugNICs             # NIC 熱插拔
+        - Passt                   # Passt 網路堆疊
+        - NetworkBindingPlugins   # 自訂網路 binding
+        # 儲存功能
+        - HotplugVolumes          # Volume 熱插拔（預設已啟用）
+        - ExpandDisks             # 線上磁碟擴容
+        # 高可用功能
+        - LiveMigration           # Live Migration（預設已啟用）
+        - VMExport                # VM export 功能
+        - VMLiveUpdateFeatures    # 允許更新運行中 VM 的部分設定
+        # 開發者功能
+        - Sidecar                 # Sidecar hook（注入額外容器）
+```
+
+### 常用 Feature Gates 說明
+
+| Feature Gate | 預設 | 說明 |
+|-------------|------|------|
+| `LiveMigration` | 啟用 | VM live migration 支援 |
+| `HotplugVolumes` | 啟用 | Volume 熱插拔 |
+| `NUMA` | 關閉 | NUMA 拓樸 hints |
+| `CPUManager` | 關閉 | 與 k8s CPU Manager 整合 |
+| `GPU` | 關閉 | GPU passthrough |
+| `HostDevices` | 關閉 | Host Device passthrough |
+| `HotplugNICs` | 關閉 | NIC 熱插拔 |
+| `Passt` | 關閉 | Passt 使用者空間網路 |
+| `ExpandDisks` | 關閉 | 線上磁碟擴容 |
+| `Sidecar` | 關閉 | Hook sidecar 容器 |
+
+---
+
+## KubeVirt CR 完整設定參考
+
+### 網路設定
+
+```yaml
+spec:
+  configuration:
+    network:
+      defaultNetworkInterface: "masquerade"   # 預設網路介面類型
+      permitSlirpInterface: false             # 是否允許 SLIRP 網路
+      permitBridgeInterfaceOnPodNetwork: true # 是否允許 bridge 介面
+```
+
+### 記憶體過量分配
+
+```yaml
+spec:
+  configuration:
+    developerConfiguration:
+      memoryOvercommit: 100   # 100% 表示不過量分配；200% 表示可分配 2 倍物理記憶體
+      nodeSelectors:
+        cpumanager: "true"    # 全域 node selector（所有 VM 都套用）
+      minimumReservePVCBytes: 131072   # PVC 保留空間（bytes）
+      pvcTolerateLessSpaceUpToPercent: 10  # PVC 容許的空間不足百分比
+```
+
+### 遷移設定
+
+```yaml
+spec:
+  configuration:
+    migrations:
+      parallelMigrationsPerCluster: 5      # 叢集同時進行的最大 migration 數
+      parallelOutboundMigrationsPerNode: 2 # 每個節點同時輸出的最大 migration 數
+      bandwidthPerMigration: "64Mi"        # 每個 migration 的頻寬限制
+      completionTimeoutPerGiB: 800         # 每 GiB 記憶體的 migration 超時（秒）
+      progressTimeout: 150                 # migration 進度超時（秒，無進展則取消）
+      nodeDrainTaintKey: "kubevirt.io/drain" # Node drain 使用的 taint key
+      disableTLS: false                    # 是否停用 migration 流量 TLS 加密
+```
+
+### 映像設定
+
+```yaml
+spec:
+  imageTag: "v1.2.0"
+  imageRegistry: "quay.io/kubevirt"
+  imagePullPolicy: IfNotPresent
+  imagePullSecrets:
+    - name: registry-credentials    # 引用 Secret，類型為 kubernetes.io/dockerconfigjson
+```
+
+---
+
+## Workload Update Strategy
+
+升級 KubeVirt 時，正在運行的 VM 需要特殊處理。`workloadUpdateStrategy` 控制這個行為：
+
+```yaml
+spec:
+  workloadUpdateStrategy:
+    workloadUpdateMethods:
+      - LiveMigrate    # 優先：透過 live migration 在線升級 VM
+      - Evict          # 備用：若 VM 不支援 migration，則驅逐（需要 VM 允許 eviction）
+    batchEvictionSize: 10        # 每批次驅逐的 VM 數量
+    batchEvictionInterval: "1m"  # 每批次之間的等待時間
+```
+
+| 方法 | 說明 | VM 中斷 |
+|------|------|---------|
+| `LiveMigrate` | 將 VM live migrate 到新版本 virt-handler 的 node | 無中斷 |
+| `Evict` | 停止 VM，讓 virt-handler 升級後重啟 | 有中斷（需要 RunStrategy: Always）|
+
+<Callout type="warning" title="Evict 策略需要 RunStrategy: Always">
+使用 `Evict` 方法時，被驅逐的 VM 只有在設定了 `spec.runStrategy: Always`（或等效的 `spec.running: true`）時才會自動重啟。否則 VM 被停止後不會自動恢復。
+</Callout>
+
+---
+
+## 元件生命週期
+
+### virt-operator 管理的元件
+
+| 元件 | 類型 | 副本數（預設）|
+|------|------|------------|
+| `virt-api` | Deployment | 2 |
+| `virt-controller` | Deployment | 2 |
+| `virt-handler` | DaemonSet | 每個 node 1 個 |
+| `virt-exportproxy` | Deployment | 1（需要 VMExport feature gate）|
+
+### 升級流程
+
+```
+1. 使用者更新 KubeVirt CR 的 imageTag
+     ↓
+2. virt-operator 偵測到版本變更
+     ↓
+3. virt-operator 更新 virt-api Deployment（滾動更新）
+     ↓
+4. virt-operator 更新 virt-controller Deployment（滾動更新）
+     ↓
+5. virt-operator 更新 virt-handler DaemonSet（依 workloadUpdateStrategy）
+     ↓
+6. 若使用 LiveMigrate：virt-controller 觸發 VMI live migration 到新 virt-handler 的 node
+     ↓
+7. 舊版 virt-handler Pod 終止
+     ↓
+8. KubeVirt CR status 更新為新版本
+```
+
+```bash
+# 升級 KubeVirt（更新 imageTag）
+kubectl patch kubevirt kubevirt -n kubevirt \
+  --type=json \
+  -p='[{"op":"replace","path":"/spec/imageTag","value":"v1.3.0"}]'
+
+# 監控升級進度
+kubectl get kubevirt kubevirt -n kubevirt -w
+```
+
+---
+
+## KubeVirt CR Status 條件
+
+`status.conditions` 欄位反映 KubeVirt 平台的健康狀態：
+
+```yaml
+status:
+  phase: Deployed     # 整體 phase：Deploying / Deployed / Deleting / Deleted / Error
+  conditions:
+    - type: Available
+      status: "True"
+      reason: AllComponentsReady
+      message: "All KubeVirt components are available"
+    - type: Progressing
+      status: "False"
+      reason: AllComponentsReady
+    - type: Degraded
+      status: "False"
+      reason: AllComponentsReady
+  observedKubeVirtVersion: "v1.2.0"  # 目前運行的版本
+  targetKubeVirtVersion: "v1.2.0"    # 目標版本
+  observedKubeVirtRegistry: "quay.io/kubevirt"
+  operatorVersion: "v1.2.0"
+  generations:
+    - group: apps
+      resource: deployments
+      name: virt-api
+      lastGeneration: 3
+```
+
+| Condition | True 代表 | False 代表 |
+|-----------|----------|----------|
+| `Available` | 所有元件運行正常 | 一個或多個元件不可用 |
+| `Progressing` | 正在升級或更改 | 沒有進行中的變更 |
+| `Degraded` | 部分功能降級（但仍可用）| 完全健康 |
+
+```bash
+# 快速查看 KubeVirt 健康狀態
+kubectl get kubevirt kubevirt -n kubevirt -o jsonpath='{.status.conditions}' | jq .
+
+# 查看所有元件 Pod 狀態
+kubectl get pods -n kubevirt
+```
+
+---
+
+## 憑證輪換
+
+virt-operator 管理 KubeVirt 內部元件之間的 TLS 憑證（CA、Webhook 憑證、API server 憑證）。
+
+### 憑證輪換設定
+
+```yaml
+spec:
+  certificateRotateStrategy:
+    selfSigned:
+      ca:
+        duration: "48h"              # CA 憑證有效期
+        renewBefore: "24h"           # 在過期前多久開始輪換
+      server:
+        duration: "24h"              # Server 憑證有效期
+        renewBefore: "12h"           # 在過期前多久開始輪換
+```
+
+### 憑證輪換流程
+
+```
+CA 憑證即將到期（距過期 < renewBefore）
+     ↓
+virt-operator 產生新 CA 憑證
+     ↓
+virt-operator 同時保留舊 CA + 新 CA（信任期重疊）
+     ↓
+各元件使用新 CA 更新 Server 憑證
+     ↓
+舊 CA 信任期結束後移除
+     ↓
+所有連線使用新 CA 憑證體系
+```
+
+```bash
+# 查看目前的憑證 Secret
+kubectl get secrets -n kubevirt | grep cert
+
+# 強制觸發憑證輪換（刪除 CA Secret，operator 會重建）
+kubectl delete secret kubevirt-ca -n kubevirt
+```
+
+---
+
+## 自訂元件設定
+
+透過 `customizeComponents` 可以在不 fork 的情況下覆蓋元件設定：
+
+```yaml
+spec:
+  customizeComponents:
+    patches:
+      - resourceType: Deployment
+        resourceName: virt-controller
+        patch: |
+          {
+            "spec": {
+              "template": {
+                "spec": {
+                  "containers": [
+                    {
+                      "name": "virt-controller",
+                      "resources": {
+                        "requests": {
+                          "memory": "512Mi"
+                        },
+                        "limits": {
+                          "memory": "1Gi"
+                        }
+                      }
+                    }
+                  ]
+                }
+              }
+            }
+          }
+        type: strategic
+      - resourceType: DaemonSet
+        resourceName: virt-handler
+        patch: |
+          {
+            "spec": {
+              "template": {
+                "spec": {
+                  "tolerations": [
+                    {
+                      "key": "special-node",
+                      "operator": "Exists"
+                    }
+                  ]
+                }
+              }
+            }
+          }
+        type: strategic
+```
+
+---
+
+## 監控與告警
+
+### 建議監控指標
+
+```bash
+# KubeVirt 元件 Pod 狀態
+kubectl get pods -n kubevirt
+
+# KubeVirt CR 狀態
+kubectl get kubevirt kubevirt -n kubevirt -o yaml | grep -A 20 status
+
+# virt-operator 日誌
+kubectl logs -n kubevirt -l kubevirt.io=virt-operator --tail=100
+
+# 升級進度（監控）
+watch kubectl get pods -n kubevirt
+```
+
+### Prometheus 整合
+
+KubeVirt 預設提供 Prometheus 指標：
+
+| 指標 | 說明 |
+|------|------|
+| `kubevirt_info` | KubeVirt 版本資訊 |
+| `kubevirt_vmi_phase_count` | 各 phase 的 VMI 數量 |
+| `kubevirt_vmi_migrations_in_pending_phase` | 待處理的 migration 數量 |
+| `kubevirt_vmi_migrations_in_running_phase` | 進行中的 migration 數量 |
+| `kubevirt_virt_controller_ready` | virt-controller 是否就緒 |
+| `kubevirt_virt_handler_error_vmi_evictions_total` | virt-handler 驅逐失敗次數 |
+
+```yaml
+# ServiceMonitor（若使用 Prometheus Operator）
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: kubevirt
+  namespace: kubevirt
+spec:
+  selector:
+    matchLabels:
+      prometheus.kubevirt.io: ""
+  endpoints:
+    - port: metrics
+      scheme: https
+      tlsConfig:
+        insecureSkipVerify: true
+```
+
+---
+
+## 常見操作
+
+```bash
+# 查看 KubeVirt 完整設定
+kubectl get kubevirt kubevirt -n kubevirt -o yaml
+
+# 啟用單一 Feature Gate
+kubectl patch kubevirt kubevirt -n kubevirt --type=json -p='
+[{
+  "op": "add",
+  "path": "/spec/configuration/developerConfiguration/featureGates/-",
+  "value": "NUMA"
+}]'
+
+# 設定 Migration 頻寬限制
+kubectl patch kubevirt kubevirt -n kubevirt --type=merge -p='
+{
+  "spec": {
+    "configuration": {
+      "migrations": {
+        "bandwidthPerMigration": "128Mi"
+      }
+    }
+  }
+}'
+
+# 強制重啟所有 KubeVirt 元件（排障用）
+kubectl rollout restart deployment -n kubevirt
+kubectl rollout restart daemonset virt-handler -n kubevirt
+
+# 查看 operator reconciliation 日誌
+kubectl logs -n kubevirt -l kubevirt.io=virt-operator \
+  --tail=200 | grep -i reconcil
+```
+
+<Callout type="info" title="不要直接修改 virt-api/virt-controller/virt-handler 的 Deployment">
+virt-operator 持續 reconcile 這些元件。如果直接修改 virt-api 的 Deployment，virt-operator 會在下次 reconciliation 時還原你的修改。若需要自訂元件設定，應透過 KubeVirt CR 的 `customizeComponents` 機制。
+</Callout>

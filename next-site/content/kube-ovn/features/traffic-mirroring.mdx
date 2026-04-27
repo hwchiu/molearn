@@ -1,0 +1,233 @@
+---
+layout: doc
+title: Kube-OVN — 流量鏡像
+description: 透過 mirror0 虛擬介面複製 Pod 流量到監控工具，實現非侵入式網路流量分析
+---
+
+# 流量鏡像
+
+<Callout type="info" title="相關章節">
+- [整體架構](/kube-ovn/features/architecture)
+- [QoS 與安全](/kube-ovn/features/qos-security)
+- [Controllers 設計](/kube-ovn/features/controllers)
+</Callout>
+
+<Callout type="tip" title="本文適用對象">
+- 🟢 **初學者**：了解流量鏡像的概念與 mirror0 介面的作用
+- 🟡 **中階工程師**：掌握全局與 Per-Pod 鏡像的設定方式
+- 🔴 **資深工程師**：深入理解鏡像的效能影響、與 IDS/NPM 工具的整合架構
+</Callout>
+
+> 📦 **類比**：流量鏡像就像在辦公室網路交換機上設定 SPAN（Switched Port Analyzer）——所有進出 Port 的封包都會複製一份傳送到監控電腦，而不影響原本的網路流量。Kube-OVN 的 `mirror0` 就是那台「監控電腦的接收介面」。
+
+## 什麼是流量鏡像
+
+流量鏡像（Traffic Mirroring）是一種**非侵入式**的網路監控技術：
+
+- 原始流量路徑完全不受影響（封包仍正常傳送）
+- 每個封包產生一份副本，傳送到 `mirror0` 虛擬介面
+- 監控工具（tcpdump、Wireshark、IDS agent）在 `mirror0` 上捕捉副本
+
+```
+Pod A ──封包──► OVS br-int ──原始流量──► Pod B
+                    │
+                    └──副本流量──► mirror0 ──► tcpdump / IDS
+```
+
+## mirror0 虛擬介面
+
+Kube-OVN 在每個 worker node 上自動建立一個名為 `mirror0` 的虛擬網路介面（類型為 OVS internal port）。此介面：
+
+- **僅接收**鏡像流量（不主動傳送封包）
+- 預設不分配 IP 地址（原始 mirror 模式）
+- 需要監控工具在此介面上監聽
+
+```bash
+# 確認 mirror0 介面存在
+ip link show mirror0
+# 4: mirror0: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 qdisc noqueue state UNKNOWN
+
+# 在 mirror0 上捕捉流量
+tcpdump -i mirror0 -n
+```
+
+## 全局鏡像（Global Mirroring）
+
+全局鏡像在 `kube-ovn-cni` DaemonSet 的啟動參數中設定，影響**該節點上所有 Pod** 的流量：
+
+```yaml
+# 編輯 kube-ovn-cni DaemonSet
+kubectl edit ds -n kube-system kube-ovn-cni
+```
+
+在 `containers[0].command` 中加入 `--enable-mirror=true`：
+
+```yaml
+containers:
+- name: cni-server
+  command:
+  - /kube-ovn/start-cni.sh
+  args:
+  - --enable-mirror=true          # 啟用全局鏡像
+  - --mirror-iface=mirror0        # 指定鏡像目標介面（預設 mirror0）
+```
+
+<Callout type="warning" title="全局鏡像的效能影響">
+全局鏡像會對節點上**所有 Pod** 的流量進行複製，在高流量場景（如儲存節點、ingress 節點）會顯著增加 CPU 使用率（通常增加 15–30%）。生產環境建議使用 Per-Pod 鏡像，僅對需要監控的 Pod 啟用。
+</Callout>
+
+重啟 DaemonSet 後，使用以下命令驗證：
+
+```bash
+# 確認 OVS mirror 規則已建立
+kubectl exec -n kube-system ds/ovs-ovn -- ovs-vsctl list mirror
+```
+
+## Per-Pod 鏡像
+
+Per-Pod 鏡像透過 Pod annotation 精確控制，只鏡像特定 Pod 的流量：
+
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: monitored-pod
+  annotations:
+    ovn.kubernetes.io/mirror: "true"    # 啟用此 Pod 的流量鏡像
+spec:
+  containers:
+  - name: app
+    image: nginx:alpine
+```
+
+也可以使用 `kubectl annotate` 對執行中的 Pod 動態啟用：
+
+```bash
+kubectl annotate pod monitored-pod ovn.kubernetes.io/mirror=true
+
+# 取消鏡像
+kubectl annotate pod monitored-pod ovn.kubernetes.io/mirror-
+```
+
+### Per-Pod 鏡像的實作機制
+
+當 Kube-OVN daemon 偵測到 Pod 的 mirror annotation 為 `true` 時：
+
+1. 在 OVS 中建立一條 Mirror 規則，`select_src_port` 設定為該 Pod 的 OVS port
+2. Mirror 的 `output_port` 指向 `mirror0` internal port
+3. 所有從該 Pod 的 OVS port 進出的封包都會被複製到 `mirror0`
+
+```bash
+# 查看特定 Pod 的 OVS mirror 設定
+kubectl exec -n kube-system ds/ovs-ovn -- ovs-vsctl list mirror | grep <pod-port-name>
+```
+
+## 與監控工具的整合
+
+### tcpdump（即時抓包）
+
+```bash
+# 在節點上監聽 mirror0，過濾特定 Pod 的流量
+ssh <node-ip>
+tcpdump -i mirror0 -n host <pod-ip> -w /tmp/capture.pcap
+
+# 使用 kubectl 在 ovs-ovn pod 中執行
+kubectl exec -n kube-system ds/ovs-ovn -- tcpdump -i mirror0 -n -c 100
+```
+
+### Wireshark（遠端抓包）
+
+```bash
+# 透過 SSH 將 mirror0 流量傳輸到本機 Wireshark
+ssh user@<node-ip> "tcpdump -i mirror0 -U -w -" | wireshark -k -i -
+```
+
+### IDS 整合（Suricata / Snort）
+
+在每個 node 上部署 Suricata DaemonSet，監聽 `mirror0`：
+
+```yaml
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: suricata-ids
+  namespace: security
+spec:
+  template:
+    spec:
+      hostNetwork: true             # 需要 hostNetwork 存取 mirror0
+      containers:
+      - name: suricata
+        image: jasonish/suricata:latest
+        command: ["suricata", "-i", "mirror0", "-c", "/etc/suricata/suricata.yaml"]
+        securityContext:
+          capabilities:
+            add: ["NET_ADMIN", "SYS_NICE"]
+```
+
+### NPM（Network Performance Monitor）工具
+
+流量鏡像也常與 NPM 工具（如 ntopng、Zeek）整合：
+
+```bash
+# ntopng 監聽 mirror0
+ntopng -i mirror0 --community
+
+# Zeek 被動分析
+zeek -i mirror0
+```
+
+## 使用場景
+
+| 場景 | 說明 | 推薦模式 |
+|------|------|---------|
+| **安全審計** | 記錄特定 Pod 的所有網路存取行為 | Per-Pod 鏡像 |
+| **合規監控** | 金融/醫療環境要求記錄所有東西向流量 | 全局鏡像（隔離節點）|
+| **網路排查** | 生產環境無法重現的偶發封包異常 | Per-Pod 鏡像（按需啟用）|
+| **IDS 入侵偵測** | 偵測惡意流量模式 | 全局鏡像 + Suricata |
+| **效能分析** | 分析應用層協定延遲與吞吐 | Per-Pod 鏡像 + Wireshark/ntopng |
+
+## 效能影響
+
+| 場景 | CPU 增加 | 記憶體影響 | 說明 |
+|------|---------|----------|------|
+| Per-Pod 鏡像（低流量 Pod）| < 5% | 可忽略 | 封包複製開銷極小 |
+| Per-Pod 鏡像（高流量 Pod，1Gbps+）| 10–15% | OVS buffer | 需預留 CPU headroom |
+| 全局鏡像（普通節點）| 15–30% | OVS buffer 增大 | 視節點 Pod 密度而定 |
+| 全局鏡像 + 主動 IDS 分析 | 30–50% | IDS 記憶體 | 需獨立部署監控節點 |
+
+<Callout type="tip" title="減少效能影響的最佳實踐">
+1. 在生產環境使用 Per-Pod 鏡像，避免全局鏡像
+2. 為 IDS/NPM 工具指定 `resources.limits`，避免搶佔 Pod 資源
+3. 在專用監控節點（`node-role: monitoring`）上部署分析工具，與業務 Pod 隔離
+4. 使用 `--mirror-iface` 指定獨立的鏡像介面，避免與 `mirror0` 混用
+</Callout>
+
+## 限制
+
+| 限制項目 | 說明 |
+|---------|------|
+| 僅同節點鏡像 | 鏡像只能複製到**本節點**的 `mirror0`，無法跨節點傳送到集中式分析器（需在每個節點部署分析工具）|
+| 加密流量 | 若應用層使用 TLS，鏡像到的流量仍是加密狀態（需在 Pod 內做 SSL 解密）|
+| IPv6 鏡像 | OVN mirror 支援 IPv6，但部分 NPM 工具對 IPv6 解析支援有限 |
+| 高速網路 | 萬兆（10Gbps+）環境下全局鏡像可能導致 `mirror0` 丟包，需調整 OVS buffer |
+
+## 設定驗證
+
+```bash
+# 完整驗證鏡像是否正常工作
+# 步驟 1：確認 mirror0 存在且 UP
+ip link show mirror0 | grep "state UP"
+
+# 步驟 2：確認 OVS mirror 規則
+kubectl exec -n kube-system ds/ovs-ovn -- ovs-vsctl list mirror
+
+# 步驟 3：在 mirror0 上確認有流量
+kubectl exec -n kube-system ds/ovs-ovn -- timeout 10 tcpdump -i mirror0 -c 5
+
+# 步驟 4：從 Pod 發送測試流量
+kubectl exec <monitored-pod> -- ping 8.8.8.8 -c 3
+
+# 步驟 5：確認 mirror0 上能看到對應封包
+kubectl exec -n kube-system ds/ovs-ovn -- tcpdump -i mirror0 host 8.8.8.8 -c 3
+```

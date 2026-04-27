@@ -1,0 +1,358 @@
+---
+layout: doc
+title: Rook — CephBlockPool 與 RBD Block Storage
+description: 深入解析 CephBlockPool CRD 設計、replicated 與 erasure-coded 策略，以及如何透過 RBD CSI 提供 ReadWriteOnce Block Storage。
+---
+
+# CephBlockPool 與 RBD Block Storage
+
+<Callout type="info" title="相關章節">
+- [架構總覽](/rook/features/architecture)
+- [CSI Driver](/rook/features/csi-driver)
+- [StorageClass 設定](/rook/features/storage-classes)
+- [OSD 與 Monitor](/rook/features/osds-monitors)
+</Callout>
+
+<Callout type="tip" title="本文適用對象">
+- 🟢 **初學者**：了解 CephBlockPool 是什麼、如何建立第一個 Block Storage PVC。
+- 🟡 **中階工程師**：深入 replicated vs erasure-coded 的選型考量，以及 failureDomain 設定。
+- 🔴 **資深工程師**：掌握 RBD image features、pool mirroring、以及 CRUSH hierarchy 映射策略。
+</Callout>
+
+> 📦 **類比**：CephBlockPool 就像在倉庫裡劃出一個獨立的儲物區，每個 PVC 就是這個區域裡的一個有編號的箱子，只有一個人（Pod）能同時打開使用。
+
+## 什麼是 CephBlockPool
+
+CephBlockPool 是 Rook 提供的 CRD（Custom Resource Definition），代表 Ceph 叢集中的一個 **storage pool**。Ceph pool 是資料存放的邏輯單元，所有的 RBD（RADOS Block Device）image 都存放在某個 pool 裡。
+
+透過 CephBlockPool，運維人員可以：
+
+- 定義資料複寫策略（replicated 或 erasure-coded）
+- 控制容錯範圍（failure domain：host、rack、zone）
+- 設定資料壓縮、加密等屬性
+- 為不同應用分配獨立的 pool（隔離 I/O）
+
+### Pool 與 StorageClass 的關係
+
+```
+CephBlockPool (pool)
+    └── StorageClass (rook-ceph-block)
+            └── PVC → PV (RBD image)
+                    └── 掛載到 Pod
+```
+
+## CephBlockPool CRD Spec 概覽
+
+```yaml
+apiVersion: ceph.rook.io/v1
+kind: CephBlockPool
+metadata:
+  name: replicapool
+  namespace: rook-ceph
+spec:
+  failureDomain: host          # 容錯粒度
+  replicated:
+    size: 3                    # 副本數
+    requireSafeReplicaSize: true
+  parameters:
+    compression_mode: none     # none | aggressive | passive | force
+```
+
+| 欄位 | 說明 | 預設值 |
+|------|------|--------|
+| `failureDomain` | 容錯範圍（host/rack/zone/datacenter） | `host` |
+| `replicated.size` | 副本數量 | `3` |
+| `replicated.requireSafeReplicaSize` | 是否拒絕 size < 3 的設定 | `true` |
+| `erasureCoded.dataChunks` | EC 資料分片數 | — |
+| `erasureCoded.codingChunks` | EC 校驗分片數 | — |
+| `parameters.compression_mode` | 壓縮模式 | `none` |
+
+## Replicated Pool（複寫模式）
+
+Replicated pool 是最常見的部署方式，將每份資料寫入多個 OSD，提供資料可靠性。
+
+### 關鍵參數
+
+```yaml
+spec:
+  replicated:
+    size: 3                      # 總副本數（寫入幾份）
+    requireSafeReplicaSize: true # 強制安全副本數（size >= 3）
+    targetSizeRatio: 0.5         # 此 pool 預期使用整體容量的 50%
+```
+
+### 副本數選擇指南
+
+| size | 可容錯 OSD 數 | 適用場景 |
+|------|-------------|---------|
+| 1 | 0（無容錯）| 測試環境、快取 pool |
+| 2 | 1 | 小型環境，接受一定風險 |
+| 3 | 2 | **生產環境推薦** |
+
+<Callout type="warning" title="requireSafeReplicaSize">
+設定 `requireSafeReplicaSize: true` 時，Ceph 會拒絕將 pool size 設為 1 或 2，避免運維失誤導致資料遺失。在生產環境中應保持開啟。
+</Callout>
+
+## Erasure-Coded Pool（糾刪碼模式）
+
+Erasure-coded（EC）pool 使用類似 RAID 的數學算法，以較少的額外空間達到高資料可靠性，但寫入延遲比 replicated pool 高。
+
+### EC 空間效率對比
+
+| 模式 | dataChunks | codingChunks | 最小 OSD 數 | 空間放大倍數 | 可容錯 |
+|------|-----------|-------------|-----------|------------|-------|
+| replicated-3 | — | — | 3 | 3x | 2 OSD |
+| EC 4+2 | 4 | 2 | 6 | 1.5x | 2 OSD |
+| EC 8+3 | 8 | 3 | 11 | 1.375x | 3 OSD |
+| EC 8+4 | 8 | 4 | 12 | 1.5x | 4 OSD |
+
+```yaml
+spec:
+  erasureCoded:
+    dataChunks: 4
+    codingChunks: 2
+    algorithm: jerasure    # jerasure | isa | lrc | shec | clay
+```
+
+### EC 演算法說明
+
+| Algorithm | 說明 | 特點 |
+|-----------|------|------|
+| `jerasure` | 預設，通用型 | CPU 效率中等 |
+| `isa` | Intel ISA-L 加速 | 需要 Intel CPU |
+| `lrc` | Locally Repairable Code | 減少修復時讀取的 OSD 數 |
+
+<Callout type="warning" title="EC Pool 限制">
+EC pool 不能單獨使用，必須搭配一個 replicated metadata pool。RBD 使用 EC pool 時，block header（metadata）仍存放在 replicated pool 中。
+</Callout>
+
+## Failure Domain 與 CRUSH Hierarchy
+
+CRUSH（Controlled Replication Under Scalable Hashing）是 Ceph 的資料分佈演算法。`failureDomain` 決定了不同副本會被分散到哪個層級的硬體單元。
+
+### CRUSH 層級結構
+
+```
+root
+└── datacenter (zone)
+    └── rack
+        └── host (node)
+            └── osd
+```
+
+### Failure Domain 設定效果
+
+| failureDomain | 副本分散單位 | 最少需要的單位數 | 適用場景 |
+|---------------|------------|---------------|---------|
+| `osd` | 每個 OSD 各一份 | size 個 OSD | 測試環境 |
+| `host` | 每台 node 各一份 | size 個 node | **單機房標準設定** |
+| `rack` | 每個機架各一份 | size 個機架 | 大型機房 |
+| `zone` | 每個可用區各一份 | size 個 AZ | 多 AZ 部署 |
+
+### Kubernetes Node Labels 映射
+
+Rook 透過 node labels 來識別拓樸位置：
+
+```bash
+# 設定 node 的機架資訊
+kubectl label node worker-1 topology.rook.io/rack=rack-a
+kubectl label node worker-2 topology.rook.io/rack=rack-a
+kubectl label node worker-3 topology.rook.io/rack=rack-b
+```
+
+對應的 CephCluster topology 設定請參考 [拓樸感知](/rook/features/topology-zone-awareness)。
+
+## StorageClass 與 RBD CSI
+
+建立 CephBlockPool 後，需要建立對應的 StorageClass，讓 Kubernetes 能夠動態佈建 PV。
+
+```yaml
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: rook-ceph-block
+provisioner: rook-ceph.rbd.csi.ceph.com
+parameters:
+  clusterID: rook-ceph
+  pool: replicapool
+  imageFormat: "2"
+  imageFeatures: layering,exclusive-lock,object-map,fast-diff,deep-flatten
+  csi.storage.k8s.io/provisioner-secret-name: rook-csi-rbd-provisioner
+  csi.storage.k8s.io/provisioner-secret-namespace: rook-ceph
+  csi.storage.k8s.io/controller-expand-secret-name: rook-csi-rbd-provisioner
+  csi.storage.k8s.io/controller-expand-secret-namespace: rook-ceph
+  csi.storage.k8s.io/node-stage-secret-name: rook-csi-rbd-node
+  csi.storage.k8s.io/node-stage-secret-namespace: rook-ceph
+reclaimPolicy: Delete
+allowVolumeExpansion: true
+mountOptions:
+  - discard
+```
+
+### RBD Image Features
+
+`imageFeatures` 控制 RBD image 的功能特性，影響效能與功能：
+
+| Feature | 說明 | 建議 |
+|---------|------|------|
+| `layering` | 支援 snapshot/clone，CoW（Copy-on-Write） | **必要** |
+| `exclusive-lock` | 確保同時只有一個 client 寫入 | **必要** |
+| `object-map` | 追蹤哪些 object 已使用，加速 diff/export | 推薦 |
+| `fast-diff` | 快速計算 snapshot 差異 | 推薦 |
+| `deep-flatten` | 展平所有 parent snapshot 的依賴 | 推薦 |
+| `journaling` | 寫入 journal（用於 mirroring） | 僅 mirror 場景 |
+
+<Callout type="warning" title="Kernel 版本相容性">
+部分 `imageFeatures` 需要較新的 Linux kernel 支援。若使用舊版 kernel（< 5.4），建議只開啟 `layering`，避免掛載失敗。
+</Callout>
+
+## ReadWriteOnce (RWO) 語意
+
+RBD Block Storage 只支援 `ReadWriteOnce` 存取模式：
+
+| AccessMode | 說明 | 支援 |
+|------------|------|------|
+| `ReadWriteOnce` | 單一 node 讀寫 | ✅ |
+| `ReadOnlyMany` | 多 node 唯讀 | ✅ |
+| `ReadWriteMany` | 多 node 讀寫 | ❌（需 CephFS） |
+
+這與 `exclusive-lock` feature 直接相關：Ceph 會透過 exclusive lock 機制確保只有一個 Pod 能同時寫入同一個 RBD image，防止資料損毀。
+
+```yaml
+# RBD PVC 範例
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: mysql-data
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 20Gi
+  storageClassName: rook-ceph-block
+```
+
+## Volume Expansion（線上擴容）
+
+設定 `allowVolumeExpansion: true` 後，可以在 Pod 不停機的情況下擴充 PVC 容量：
+
+```bash
+# 修改 PVC 的 storage request
+kubectl patch pvc mysql-data -p '{"spec":{"resources":{"requests":{"storage":"50Gi"}}}}'
+
+# 確認擴容完成
+kubectl get pvc mysql-data
+```
+
+擴容流程：
+1. Kubernetes 呼叫 CSI `ControllerExpandVolume`，Ceph 調整 RBD image 大小
+2. Node 上的 CSI node plugin 執行 `NodeExpandVolume`，通知 OS 重新掃描 block device
+3. 檔案系統（ext4/xfs）自動 resize
+
+## Block Pool Mirroring（DR 容災複寫）
+
+Rook v1.6+ 支援 RBD Mirroring，可在兩個 Ceph 叢集間非同步複寫 RBD image，用於 DR（Disaster Recovery）場景。
+
+```yaml
+apiVersion: ceph.rook.io/v1
+kind: CephBlockPool
+metadata:
+  name: mirrored-pool
+  namespace: rook-ceph
+spec:
+  replicated:
+    size: 3
+  mirroring:
+    enabled: true
+    mode: image          # pool | image
+    snapshotSchedules:
+      - interval: 24h
+        startTime: "14:00:00-05:00"
+```
+
+搭配使用 `CephBlockPoolRadosNamespace` CRD 和 `rbd mirror` daemon 可實現跨叢集同步。
+
+## 完整範例
+
+### Step 1：建立 CephBlockPool
+
+```yaml
+apiVersion: ceph.rook.io/v1
+kind: CephBlockPool
+metadata:
+  name: replicapool
+  namespace: rook-ceph
+spec:
+  failureDomain: host
+  replicated:
+    size: 3
+    requireSafeReplicaSize: true
+  parameters:
+    compression_mode: none
+```
+
+### Step 2：建立 StorageClass
+
+```yaml
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: rook-ceph-block
+provisioner: rook-ceph.rbd.csi.ceph.com
+parameters:
+  clusterID: rook-ceph
+  pool: replicapool
+  imageFormat: "2"
+  imageFeatures: layering,exclusive-lock,object-map,fast-diff
+  csi.storage.k8s.io/provisioner-secret-name: rook-csi-rbd-provisioner
+  csi.storage.k8s.io/provisioner-secret-namespace: rook-ceph
+  csi.storage.k8s.io/controller-expand-secret-name: rook-csi-rbd-provisioner
+  csi.storage.k8s.io/controller-expand-secret-namespace: rook-ceph
+  csi.storage.k8s.io/node-stage-secret-name: rook-csi-rbd-node
+  csi.storage.k8s.io/node-stage-secret-namespace: rook-ceph
+reclaimPolicy: Delete
+allowVolumeExpansion: true
+```
+
+### Step 3：建立 PVC
+
+```yaml
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: postgres-data
+  namespace: default
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 50Gi
+  storageClassName: rook-ceph-block
+```
+
+### 驗證 Pool 狀態
+
+```bash
+# 確認 CephBlockPool 建立成功
+kubectl -n rook-ceph get cephblockpool
+
+# 進入 toolbox 檢查 pool 狀態
+kubectl -n rook-ceph exec -it deploy/rook-ceph-tools -- bash
+ceph osd pool ls detail
+ceph osd pool stats replicapool
+```
+
+## 常見問題排查
+
+| 問題 | 原因 | 解法 |
+|------|------|------|
+| PVC 停在 Pending | StorageClass 設定錯誤或 Pool 不存在 | 檢查 CSI provisioner log |
+| Pod 掛載失敗 | Node kernel 不支援 imageFeatures | 降低 imageFeatures 設定 |
+| Pool 無法建立 | OSD 數量不足以滿足 failureDomain | 增加 node/rack 數量 |
+| 擴容後容量未增加 | Node plugin 未執行 resize | 確認 allowVolumeExpansion: true |
+
+## 小結
+
+CephBlockPool 是 Rook RBD Block Storage 的核心設定單元。正確選擇 replicated 或 erasure-coded 策略、設定適當的 `failureDomain`，以及啟用合適的 RBD `imageFeatures`，是建立可靠 Block Storage 服務的關鍵。進一步了解 CSI 層的細節請參考 [CSI Driver](/rook/features/csi-driver)，StorageClass 的完整設定請參考 [StorageClass](/rook/features/storage-classes)。

@@ -1,0 +1,364 @@
+---
+layout: doc
+title: Rook — 拓樸感知與 Stretch Cluster
+description: 深入解析 CRUSH hierarchy 如何映射 Kubernetes node 拓樸，以及如何設定跨資料中心的 Stretch Cluster 實現真正的地理冗余。
+---
+
+# 拓樸感知與 Stretch Cluster
+
+<Callout type="info" title="相關章節">
+- [架構總覽](/rook/features/architecture)
+- [OSD 與 Monitor](/rook/features/osds-monitors)
+- [CephBlockPool 與 RBD](/rook/features/ceph-block-pool)
+- [Ceph Cluster 設定](/rook/features/ceph-cluster)
+</Callout>
+
+<Callout type="tip" title="本文適用對象">
+- 🟢 **初學者**：了解為什麼「把副本放在不同機架/機房」很重要，以及如何設定。
+- 🟡 **中階工程師**：設定 failureDomain、Kubernetes topology labels，以及 zone-aware CSI。
+- 🔴 **資深工程師**：設計跨資料中心的 Stretch Cluster，掌握 arbiter node 機制與 2+1 replication 策略。
+</Callout>
+
+> 📦 **類比**：CRUSH 拓樸就像銀行設計金庫位置——重要資料（金幣）分別鎖在不同城市的分行（datacenter），就算某一家分行發生火災（機房故障），其他分行的副本依然完整。
+
+## 什麼是拓樸感知（Topology Awareness）
+
+預設情況下，Ceph 會盡量將同一份資料的不同副本分散到 **不同的 node（host）**。但在真實的生產環境中，我們通常希望更進一步：
+
+- 同一機架的多台 server 共用同一個 ToR（Top-of-Rack）交換器，機架整體下線時，所有 node 同時失去連接
+- 同一機房的 server 共用電力供應，機房電力故障時所有資料同時不可達
+- 多個 AZ（Available Zone）的 server 提供地理冗余
+
+拓樸感知讓 Ceph 的 CRUSH 演算法理解這些硬體層級的依賴關係，並據此分散副本。
+
+## CRUSH Hierarchy（CRUSH 層級結構）
+
+CRUSH（Controlled Replication Under Scalable Hashing）是 Ceph 的核心資料分佈演算法。它維護一個硬體拓樸樹（CRUSH Map）：
+
+```
+root (default)
+├── datacenter: dc-east
+│   ├── rack: rack-east-1
+│   │   ├── host: worker-east-1
+│   │   │   ├── osd.0 (nvme, weight: 1.0)
+│   │   │   └── osd.1 (nvme, weight: 1.0)
+│   │   └── host: worker-east-2
+│   │       ├── osd.2
+│   │       └── osd.3
+│   └── rack: rack-east-2
+│       └── host: worker-east-3
+│           └── osd.4
+└── datacenter: dc-west
+    └── rack: rack-west-1
+        └── host: worker-west-1
+            ├── osd.5
+            └── osd.6
+```
+
+### CRUSH Rule 與 failureDomain
+
+`failureDomain` 決定了 CRUSH rule 在哪個層級做副本分散：
+
+| failureDomain | 效果 | 最少硬體需求（size=3）|
+|---------------|------|-------------------|
+| `osd` | 每個 OSD 各放一份 | 3 個 OSD |
+| `host` | 每台 node 各放一份 | 3 台 node |
+| `rack` | 每個機架各放一份 | 3 個機架 |
+| `datacenter` / `zone` | 每個機房各放一份 | 3 個機房 |
+
+## Kubernetes Node Labels 映射
+
+Rook 透過 Kubernetes node labels 自動建立 CRUSH 層級：
+
+### 標準 Kubernetes 拓樸 Labels
+
+```bash
+# 查看 node 現有 topology labels
+kubectl get nodes --show-labels | grep topology
+
+# cloud provider 通常自動設定（例如 AWS）
+topology.kubernetes.io/zone=us-east-1a
+topology.kubernetes.io/region=us-east-1
+```
+
+### Rook 自訂拓樸 Labels
+
+Rook 支援 `topology.rook.io/` 前綴的 labels：
+
+```bash
+# 設定機架資訊
+kubectl label node worker-1 topology.rook.io/rack=rack-a
+kubectl label node worker-2 topology.rook.io/rack=rack-a
+kubectl label node worker-3 topology.rook.io/rack=rack-b
+kubectl label node worker-4 topology.rook.io/rack=rack-b
+kubectl label node worker-5 topology.rook.io/rack=rack-c
+
+# 設定 datacenter 資訊（Stretch Cluster 用）
+kubectl label node worker-{1,2,3} topology.rook.io/datacenter=dc-east
+kubectl label node worker-{4,5,6} topology.rook.io/datacenter=dc-west
+kubectl label node arbiter-1 topology.rook.io/datacenter=dc-arbiter
+```
+
+### CephCluster topology 設定
+
+```yaml
+apiVersion: ceph.rook.io/v1
+kind: CephCluster
+metadata:
+  name: rook-ceph
+  namespace: rook-ceph
+spec:
+  placement:
+    all:
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: topology.rook.io/rack
+          whenUnsatisfiable: DoNotSchedule
+          labelSelector:
+            matchLabels:
+              app: rook-ceph-osd
+  storage:
+    useAllNodes: true
+    useAllDevices: true
+    config:
+      osdsPerDevice: "1"
+  labels:
+    osd:
+      topology.rook.io/rack: ""    # OSD Pod 繼承 node 的 rack label
+```
+
+### 在 CephCluster 中明確設定 topology
+
+```yaml
+spec:
+  storage:
+    nodes:
+      - name: worker-1
+        config:
+          location: "rack=rack-a"       # 明確指定 CRUSH location
+          locationClass: "nvme"
+      - name: worker-2
+        config:
+          location: "rack=rack-a"
+```
+
+## Pool 的 failureDomain 設定
+
+設定 CRUSH 層級後，在 CephBlockPool 和 CephFilesystem 中指定 failureDomain：
+
+```yaml
+# 機架層級容錯（需 3 個以上機架）
+apiVersion: ceph.rook.io/v1
+kind: CephBlockPool
+metadata:
+  name: rack-replicated-pool
+  namespace: rook-ceph
+spec:
+  failureDomain: rack              # 副本分散到不同機架
+  replicated:
+    size: 3
+    requireSafeReplicaSize: true
+```
+
+```yaml
+# Zone 層級容錯（需 3 個以上 zone）
+apiVersion: ceph.rook.io/v1
+kind: CephBlockPool
+metadata:
+  name: zone-replicated-pool
+  namespace: rook-ceph
+spec:
+  failureDomain: zone              # 副本分散到不同 AZ
+  replicated:
+    size: 3
+```
+
+## Zone-Aware CSI Topology
+
+CSI topology 讓 Kubernetes 在建立 PV 時，優先選擇與 Pod 所在 zone 相同的 volume，減少跨 zone 的 I/O 延遲：
+
+### StorageClass topology 設定
+
+```yaml
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: rook-ceph-block-topology
+provisioner: rook-ceph.rbd.csi.ceph.com
+parameters:
+  clusterID: rook-ceph
+  pool: zone-replicated-pool
+  # ... 其他 secrets
+volumeBindingMode: WaitForFirstConsumer    # 等待 Pod 被 schedule 後再建立 PV
+allowedTopologies:
+  - matchLabelExpressions:
+      - key: topology.kubernetes.io/zone
+        values:
+          - us-east-1a
+          - us-east-1b
+          - us-east-1c
+```
+
+`WaitForFirstConsumer` 確保 PV 建立在與 Pod 相同的 zone，避免跨 zone 資料存取。
+
+## Stretch Cluster（跨資料中心伸展叢集）
+
+Stretch Cluster 是 Ceph 的進階功能，讓叢集跨越 **2 個資料中心** 並搭配一個 **arbiter（仲裁者）節點**，實現真正的地理冗余。
+
+### Stretch Cluster 架構
+
+```
+DC-East (site-a)           DC-West (site-b)        DC-Arbiter
+┌──────────────────┐       ┌──────────────────┐    ┌──────────┐
+│  OSD × 3         │       │  OSD × 3         │    │ MON × 1  │
+│  MON × 2         │       │  MON × 2         │    │(arbiter) │
+│  MGR (active)    │       │  MGR (standby)   │    └──────────┘
+└──────────────────┘       └──────────────────┘
+         │                          │
+         └──────────────────────────┘
+              資料同步複寫（2+1 replication）
+```
+
+### Stretch Cluster 設計原則
+
+| 元件 | DC-East | DC-West | Arbiter DC |
+|------|---------|---------|------------|
+| OSD | ✅ 主要資料 | ✅ 副本 | ❌（不放 OSD）|
+| MON | 2 個 | 2 個 | **1 個**（仲裁用）|
+| MGR | Active | Standby | ❌ |
+
+Arbiter DC 的 MON 只負責投票仲裁，**不儲存任何 OSD 資料**，因此可以使用一台很小的 VM。
+
+### Stretch Cluster CRUSH Rule
+
+Stretch Cluster 使用特殊的 CRUSH rule，確保資料在兩個 DC 各寫一份：
+
+```
+寫入策略（2+1）：
+- DC-East: 放 2 個副本（同 host 上的不同 OSD）
+- DC-West: 放 1 個副本
+```
+
+### Stretch Cluster CephCluster 設定
+
+```yaml
+apiVersion: ceph.rook.io/v1
+kind: CephCluster
+metadata:
+  name: rook-ceph
+  namespace: rook-ceph
+spec:
+  mon:
+    count: 5                      # 2 (east) + 2 (west) + 1 (arbiter) = 5
+    allowMultiplePerNode: false
+    stretchCluster:
+      failureDomainLabel: topology.kubernetes.io/zone
+      subFailureDomain: host      # zone 內的副失敗域
+      zones:
+        - name: dc-east           # 對應 node label 的 zone 值
+          arbiter: false
+        - name: dc-west
+          arbiter: false
+        - name: dc-arbiter
+          arbiter: true           # 標記 arbiter zone
+  storage:
+    useAllNodes: true
+    useAllDevices: true
+```
+
+### Stretch Cluster Node Labels
+
+```bash
+# DC-East nodes
+kubectl label node east-worker-{1,2,3} topology.kubernetes.io/zone=dc-east
+
+# DC-West nodes
+kubectl label node west-worker-{1,2,3} topology.kubernetes.io/zone=dc-west
+
+# Arbiter node（只需要一台）
+kubectl label node arbiter-1 topology.kubernetes.io/zone=dc-arbiter
+```
+
+### Stretch Cluster Pool 設定
+
+Stretch Cluster 下的 pool 使用特殊的 stretch CRUSH rule：
+
+```yaml
+apiVersion: ceph.rook.io/v1
+kind: CephBlockPool
+metadata:
+  name: stretch-pool
+  namespace: rook-ceph
+spec:
+  failureDomain: datacenter        # 使用 datacenter 層級
+  replicated:
+    size: 2                        # 每個 DC 放 1 份（2 DC = 2 副本）
+    replicasPerFailureDomain: 1
+    subFailureDomain: host         # DC 內進一步分散到不同 host
+```
+
+## Stretch Cluster 容錯行為
+
+| 故障場景 | 是否可繼續服務 | 說明 |
+|---------|-------------|------|
+| 單個 OSD 故障 | ✅ 繼續服務 | 另一個 DC 有副本 |
+| 單個 DC 所有 OSD 故障 | ✅ 繼續服務（degraded）| 另一個 DC 有完整副本 |
+| 單個 DC 完全斷線（OSD + MON）| ✅ 繼續服務 | Arbiter 投票維持 quorum |
+| 兩個 DC 同時故障 | ❌ 服務中斷 | quorum 不足（< 3/5 MON）|
+| Arbiter DC 斷線 | ✅ 繼續服務 | 2 個 DC 的 4 個 MON 保持 quorum |
+
+## 實際部署建議
+
+### 硬體資源規劃
+
+| 元件 | DC-East | DC-West | Arbiter |
+|------|---------|---------|---------|
+| OSD 節點 | 最少 3 台 | 最少 3 台 | 無 |
+| MON 節點 | 2 台（可共用 OSD 節點）| 2 台 | 1 台（小型 VM 即可）|
+| 網路 | 10Gbps+ | 10Gbps+ | 1Gbps（僅 MON 流量）|
+| 延遲要求 | DC 間 RTT < 10ms | — | — |
+
+### 網路延遲考量
+
+```
+DC-East ←→ DC-West：< 10ms RTT（推薦 < 5ms）
+DC-East/West ←→ Arbiter：< 100ms RTT（只有 MON 通訊）
+```
+
+<Callout type="warning" title="Stretch Cluster 延遲要求">
+Stretch Cluster 要求兩個主要 DC 間的網路延遲低於 10ms（推薦 5ms 以下）。超過此限制會嚴重影響寫入延遲，因為每次寫入都需要等待兩個 DC 的 ACK。
+</Callout>
+
+## 驗證拓樸設定
+
+```bash
+# 進入 toolbox 驗證 CRUSH map
+kubectl -n rook-ceph exec -it deploy/rook-ceph-tools -- bash
+
+# 查看 CRUSH hierarchy
+ceph osd tree
+
+# 驗證 pool 的 CRUSH rule
+ceph osd pool ls detail | grep crush_rule
+
+# 查看 CRUSH rule 詳情
+ceph osd crush rule ls
+ceph osd crush rule dump stretched-pool-rule
+
+# 模擬 CRUSH placement（驗證副本分佈）
+crushtool -c /tmp/crushmap.bin --test --show-mappings \
+  --num-rep=2 --rule=stretched-pool-rule --weight 1.0
+```
+
+## 常見問題排查
+
+| 問題 | 原因 | 解法 |
+|------|------|------|
+| Pool 無法建立（insufficient nodes）| node 不足以滿足 failureDomain | 確認各 zone/rack 的 node 數量 |
+| Stretch Cluster quorum 異常 | Arbiter node label 錯誤 | 確認 `topology.kubernetes.io/zone` 設定 |
+| PG 持續 degraded | 副本找不到符合 CRUSH rule 的位置 | 確認 failureDomain 對應的 OSD 數量 |
+| CSI volume 跨 zone 存取 | StorageClass 未設 WaitForFirstConsumer | 改用 `volumeBindingMode: WaitForFirstConsumer` |
+
+## 小結
+
+拓樸感知讓 Ceph 的資料分佈策略與真實的硬體依賴關係對齊，從機架容錯到跨資料中心的 Stretch Cluster，提供不同層次的可用性保障。Stretch Cluster 是最高等級的資料可靠性設計，適合對 RTO（Recovery Time Objective）和 RPO（Recovery Point Objective）有嚴格要求的業務系統。更多關於 OSD 分佈的基礎知識，請參考 [OSD 與 Monitor](/rook/features/osds-monitors)。

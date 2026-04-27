@@ -1,0 +1,266 @@
+---
+layout: doc
+title: Cluster API — CRD Migration 系統
+description: 深入解析 CAPI 的 CRD Migration 機制，了解 CRDMigrator controller 如何在升級時自動遷移儲存版本並清理 managedFields，確保無縫的 API 版本轉換。
+---
+
+# CRD Migration 系統
+
+<Callout type="info" title="相關章節">
+- [API 版本轉換系統](/cluster-api/features/api-conversion)
+- [架構總覽](/cluster-api/features/architecture)
+- [Feature Gates 完整指南](/cluster-api/features/feature-gates)
+- [Controller Core](/cluster-api/features/controller-core)
+</Callout>
+
+<Callout type="tip" title="本文適用對象">
+- 🟢 **初學者**：了解什麼是 CRD storage version，以及為什麼升級 CAPI 後需要遷移
+- 🟡 **中階工程師**：掌握 CRDMigrator 的兩個 migration phase，以及如何監控遷移進度
+- 🔴 **資深工程師**：深入理解 storedVersions 機制、managedFields 清理的必要性，以及大規模環境的遷移策略
+</Callout>
+
+> 📦 **類比**：CRD Migration 就像圖書館的書目系統升級。舊版目錄卡（v1beta1 格式）仍存放在書架上（etcd），即使已啟用新版系統（v1beta2）。CRDMigrator 相當於圖書館員，在夜間自動將每張舊目錄卡重新列印成新格式，並更新總目錄（CRD.status.storedVersions），確保日後的查閱系統能正確運作。
+
+## 什麼是 CRD Migration
+
+當 CAPI 發布新版本並將 API storage version 從 `v1beta1` 升級到 `v1beta2` 時，etcd 中已存在的物件仍以舊版本格式儲存。這造成兩個問題：
+
+### 問題 1：storedVersions 不一致
+
+`CRD.status.storedVersions` 記錄了 etcd 中實際儲存的 API 版本清單。只有當所有物件都已轉換為新 storage version 後，舊版本才能從 `storedVersions` 中移除，進而在未來版本中**停止支援**（remove）舊版本。
+
+```yaml
+# 未遷移前：etcd 中同時存在 v1beta1 和 v1beta2 物件
+status:
+  storedVersions:
+  - v1beta1   # ← 仍有舊格式物件在 etcd
+  - v1beta2
+
+# 遷移後：所有物件已轉換為 v1beta2
+status:
+  storedVersions:
+  - v1beta2   # ← 可以安全移除 v1beta1 支援
+```
+
+### 問題 2：managedFields 包含舊 API version
+
+Kubernetes 的 Server Side Apply (SSA) 在每個物件上維護 `managedFields`，記錄各個 manager 使用哪個 API version 修改了哪些欄位。若舊 API version 已不再 served，`managedFields` 中殘留的舊版本引用會造成問題（參考 [kubernetes#111937](https://github.com/kubernetes/kubernetes/issues/111937)）。
+
+## CRDMigrator 架構
+
+```go
+// 來源：controllers/crdmigrator/crd_migrator.go
+type CRDMigrator struct {
+    // Client：快取 client（Get/List/Patch 使用）
+    Client client.Client
+
+    // APIReader：即時 client（需要最新資料時使用）
+    APIReader client.Reader
+
+    // SkipCRDMigrationPhases：跳過特定 migration phase
+    // 有效值：All, StorageVersionMigration, CleanupManagedFields
+    SkipCRDMigrationPhases []Phase
+
+    // Config：設定哪些物件需要遷移
+    Config map[client.Object]ByObjectConfig
+
+    // storageVersionMigrationCache：避免重複遷移同一物件
+    storageVersionMigrationCache cache.Cache[objectEntry]
+}
+```
+
+### Migration Phase
+
+CRDMigrator 執行兩個 phase：
+
+#### Phase 1：StorageVersionMigration
+
+對每個 CRD 中所有物件執行 **no-op patch**（空更新），強制 API server 將物件以當前 storage version 寫回 etcd：
+
+```go
+// StorageVersionMigration phase 的核心邏輯
+// 1. 檢查 CRD.status.storedVersions 是否已是 [storageVersion]
+// 2. 若不是，遍歷所有物件並執行空 patch
+// 3. 完成後更新 CRD.status.storedVersions = [storageVersion]
+
+// no-op patch 範例
+patchHelper.Patch(ctx, obj)  // 若物件無變更，仍會觸發 etcd 寫入並轉換格式
+```
+
+#### Phase 2：CleanupManagedFields
+
+清理 `managedFields` 中包含已不再 served 的 API version 的條目：
+
+```go
+// CleanupManagedFields phase 的核心邏輯
+// 對每個物件的 managedFields：
+// 遍歷所有 entry，移除 apiVersion 不在 served versions 清單中的 entry
+```
+
+### ByObjectConfig
+
+每個需要遷移的 CRD 類型可以有獨立設定：
+
+```go
+type ByObjectConfig struct {
+    // UseCache：是否使用快取 client 執行 Get/List
+    // 建議：只對 controller 已使用快取的物件啟用，以節省記憶體
+    UseCache bool
+
+    // UseStatusForStorageVersionMigration：是否透過 status 子資源執行空更新
+    // 若 webhook 會阻擋 spec 更新，設為 true 可繞過 spec webhook
+    UseStatusForStorageVersionMigration bool
+}
+```
+
+## CRDMigrator 在 main.go 中的初始化
+
+CRDMigrator 在 controller manager 啟動時初始化，早於其他 controllers：
+
+```go
+// 來源：main.go（示意）
+crdMigrator := &crdmigrator.CRDMigrator{
+    Client:    mgr.GetClient(),
+    APIReader: mgr.GetAPIReader(),
+    Config: map[client.Object]crdmigrator.ByObjectConfig{
+        &clusterv1.Cluster{}: {
+            UseCache: true,
+        },
+        &clusterv1.Machine{}: {
+            UseCache: true,
+        },
+        &clusterv1.MachineSet{}: {
+            UseCache: true,
+        },
+        // ... 所有 CAPI CRD 類型
+        &ipamv1.IPAddress{}: {
+            UseCache: false,  // IPAM 物件通常不在 controller cache 中
+            UseStatusForStorageVersionMigration: true,
+        },
+    },
+}
+
+if err := crdMigrator.SetupWithManager(ctx, mgr, controller.Options{
+    MaxConcurrentReconciles: 1,  // 序列化執行，避免過高負載
+}); err != nil {
+    setupLog.Error(err, "unable to create controller", "controller", "CRDMigrator")
+    os.Exit(1)
+}
+```
+
+## 遷移流程詳解
+
+```
+CAPI 升級（新版本部署）
+         │
+         ▼
+CRDMigrator SetupWithManager 執行
+         │
+         ▼
+檢查 SkipCRDMigrationPhases 設定
+  ├── "All" → 完全跳過
+  ├── "StorageVersionMigration" → 只跑 CleanupManagedFields
+  └── "CleanupManagedFields" → 只跑 StorageVersionMigration
+         │
+         ▼
+對每個設定的 CRD 類型執行 Reconcile
+         │
+Phase 1：StorageVersionMigration
+  ├── 讀取 CRD.status.storedVersions
+  ├── 若已是 [newVersion] → 跳過
+  └── 對所有物件執行 no-op patch（批次處理）
+       └── 更新 CRD.status.storedVersions = [newVersion]
+         │
+Phase 2：CleanupManagedFields
+  ├── 讀取每個物件的 managedFields
+  ├── 找出包含舊 API version 的 entry
+  └── 移除這些 entry（patch managedFields）
+         │
+         ▼
+遷移完成，CRD 完全使用新版本
+```
+
+## 升級時的注意事項
+
+### 遷移期間的 API 行為
+
+在 CRDMigrator 執行遷移期間：
+
+1. **CAPI controller 正常運作**：遷移不需要停機
+2. **同時存在兩種格式**：部分物件可能暫時以舊格式儲存
+3. **Conversion webhook 持續工作**：讀取舊格式物件時自動轉換
+
+### 遷移進度監控
+
+```bash
+# 查看 CRD 的 storedVersions 狀態
+kubectl get crd clusters.cluster.x-k8s.io \
+  -o jsonpath='{.status.storedVersions}'
+
+# 遷移前輸出：["v1beta1","v1beta2"]
+# 遷移後輸出：["v1beta2"]
+
+# 查看 CRDMigrator 日誌
+kubectl logs -n capi-system deployment/capi-controller-manager \
+  | grep -i "crdmigrator\|migration"
+```
+
+### 跳過遷移的情況
+
+在某些特殊情況下，可能需要跳過特定 migration phase：
+
+```bash
+# 方式：設定 CAPI controller 的啟動參數
+--skip-crd-migration-phases=StorageVersionMigration
+```
+
+<Callout type="warning" title="跳過遷移的風險">
+跳過 `StorageVersionMigration` 會導致舊版本格式的物件持續存在於 etcd。當 CAPI 後續版本移除舊 API version 時，這些物件將無法被讀取。建議只在有充分理由的情況下跳過。
+</Callout>
+
+## 大規模環境的遷移策略
+
+在有數千個 CRD 物件的環境中，CRDMigrator 可能需要較長時間完成遷移：
+
+### 記憶體使用
+
+CRDMigrator 使用內建的 `storageVersionMigrationCache` 避免重複遷移同一物件。此 cache 有記憶體開銷，但可避免在 controller 重啟後重複遷移。
+
+### 批次處理
+
+CRDMigrator 以批次方式遍歷物件（使用 `List` + pagination），避免一次載入所有物件造成 memory spike。
+
+### UseCache 設定的影響
+
+```go
+// UseCache: true
+// ✅ 複用 controller cache，避免建立額外的 informer
+// ✅ 適合 Cluster、Machine 等已在 cache 中的物件
+// ❌ 若物件不在 cache 中，會建立新 informer（消耗記憶體）
+
+// UseCache: false
+// ✅ 直接讀取 API server，不使用 cache
+// ✅ 適合 IPAM 等不在主要 controller cache 中的物件
+// ❌ 每次遷移都需要 API server 呼叫
+```
+
+## 與 API 版本轉換的關係
+
+CRD Migration 是 [API 版本轉換系統](/cluster-api/features/api-conversion) 的**補充機制**：
+
+| 機制 | 目的 | 觸發時機 |
+|------|------|---------|
+| Conversion Webhook | 讀寫時即時轉換 | 每次 API 請求 |
+| CRDMigrator | 批次遷移 etcd 中的舊格式物件 | CAPI 升級後 |
+
+兩者合力確保：
+- 舊格式物件仍可正常讀取（conversion webhook 即時轉換）
+- etcd 逐漸全面轉換為新格式（CRDMigrator 批次遷移）
+- 最終可以安全地從 CRD 中移除舊 API version
+
+```bash
+# 確認遷移完成後，可以安全地移除舊 version
+kubectl patch crd clusters.cluster.x-k8s.io --type=json \
+  -p='[{"op":"remove","path":"/spec/versions/0"}]'
+# 注意：這通常由 CAPI 自己管理，不需要手動操作
+```

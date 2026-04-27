@@ -1,0 +1,259 @@
+---
+layout: doc
+title: Cluster API Provider MAAS — Webhook 驗證機制
+description: 深入解析 CAPM 三大 CRD 的 Admission Webhook 驗證邏輯，包含不可變欄位檢查與常見錯誤訊息。
+---
+
+# Webhook 驗證機制
+
+<Callout type="info" title="相關章節">
+- [API 類型定義](/cluster-api-provider-maas/features/api-types)
+- [Controllers 運作原理](/cluster-api-provider-maas/features/controllers)
+- [Machine 服務實作](/cluster-api-provider-maas/features/machine-service-implementation)
+</Callout>
+
+<Callout type="tip" title="本文適用對象">
+- 🟢 **初學者**：了解 Kubernetes Admission Webhook 如何保護 CRD 資源不被誤改。
+- 🟡 **中階工程師**：掌握 CAPM 各 CRD 哪些欄位是不可變的，避免踩坑。
+- 🔴 **資深工程師**：分析 webhook failurePolicy 與 controller-runtime Defaulter/Validator 整合架構。
+</Callout>
+
+> 📦 **類比**：Webhook 就像信用卡刷卡時的即時授權系統——在資料寫入 etcd 之前，先由 API server 送到外部審核，確認沒問題才放行。一旦拒絕，申請方馬上收到明確的錯誤訊息。
+
+## 什麼是 Admission Webhook
+
+Kubernetes Admission Webhook 是 API Server 擴充機制，分為兩種：
+
+| 類型 | 時機 | 用途 |
+|------|------|------|
+| **MutatingAdmissionWebhook** | 請求進入 etcd 之前 | 注入預設值、自動修正欄位 |
+| **ValidatingAdmissionWebhook** | Mutating 之後、寫入之前 | 拒絕不合法的請求 |
+
+CAPM 使用 `controller-runtime` 的 `webhook.Defaulter` 與 `webhook.Validator` 介面，為三個 CRD 同時掛載 mutating 與 validating webhook。
+
+## Webhook 路徑對照表
+
+每個 CRD 的 webhook 路徑由 `//+kubebuilder:webhook` 標記自動產生：
+
+| CRD | Mutating 路徑 | Validating 路徑 |
+|-----|--------------|----------------|
+| `MaasCluster` | `/mutate-infrastructure-cluster-x-k8s-io-v1beta1-maascluster` | `/validate-infrastructure-cluster-x-k8s-io-v1beta1-maascluster` |
+| `MaasMachine` | `/mutate-infrastructure-cluster-x-k8s-io-v1beta1-maasmachine` | `/validate-infrastructure-cluster-x-k8s-io-v1beta1-maasmachine` |
+| `MaasMachineTemplate` | `/mutate-infrastructure-cluster-x-k8s-io-v1beta1-maasmachinetemplate` | `/validate-infrastructure-cluster-x-k8s-io-v1beta1-maasmachinetemplate` |
+
+全部的 `failurePolicy=fail`，代表若 webhook server 不可達，所有相關操作都會被拒絕。
+
+## MaasCluster Webhook
+
+### 驗證邏輯
+
+```go
+// api/v1beta1/maascluster_webhook.go
+func (r *MaasCluster) ValidateUpdate(old runtime.Object) (admission.Warnings, error) {
+    oldC, ok := old.(*MaasCluster)
+    if !ok {
+        return nil, apierrors.NewBadRequest(
+            fmt.Sprintf("expected a MaasCluster but got a %T", old))
+    }
+
+    if r.Spec.DNSDomain != oldC.Spec.DNSDomain {
+        return nil, apierrors.NewBadRequest("changing cluster DNS Domain not allowed")
+    }
+    return nil, nil
+}
+```
+
+### 不可變欄位
+
+| 欄位 | 路徑 | 說明 |
+|------|------|------|
+| `DNSDomain` | `spec.dnsDomain` | cluster 建立後不可修改 DNS domain，因為 DNS 記錄已對應建立 |
+
+### 常見錯誤訊息
+
+```
+Error from server (BadRequest): error when applying patch "...":
+  admission webhook "vmaascluster.kb.io" denied the request:
+  changing cluster DNS Domain not allowed
+```
+
+**觸發情境**：嘗試將已存在的 `MaasCluster` 的 `spec.dnsDomain` 從 `maas` 改為 `maas-new`。
+
+```bash
+# 錯誤操作示範
+kubectl patch maascluster my-cluster --type=merge \
+  -p '{"spec":{"dnsDomain":"maas-new"}}'
+# 結果：被 webhook 拒絕
+```
+
+## MaasMachine Webhook
+
+### 驗證邏輯
+
+MaasMachine 的 `ValidateUpdate` 會同時檢查三個欄位的不可變性：
+
+```go
+// api/v1beta1/maasmachine_webhook.go
+func (r *MaasMachine) ValidateUpdate(old runtime.Object) (admission.Warnings, error) {
+    oldM := old.(*MaasMachine)
+
+    if r.Spec.Image != oldM.Spec.Image {
+        return nil, apierrors.NewBadRequest(
+            fmt.Sprintf("maas machine image change is not allowed, old=%s, new=%s",
+                oldM.Spec.Image, r.Spec.Image))
+    }
+
+    if *r.Spec.MinCPU != *oldM.Spec.MinCPU {
+        return nil, apierrors.NewBadRequest(
+            fmt.Sprintf("maas machine min cpu count change is not allowed, old=%d, new=%d",
+                oldM.Spec.MinCPU, r.Spec.MinCPU))
+    }
+
+    if *r.Spec.MinMemoryInMB != *oldM.Spec.MinMemoryInMB {
+        return nil, apierrors.NewBadRequest(
+            fmt.Sprintf("maas machine min memory change is not allowed, old=%d MB, new=%d MB",
+                oldM.Spec.MinMemoryInMB, r.Spec.MinMemoryInMB))
+    }
+    return nil, nil
+}
+```
+
+### 不可變欄位
+
+| 欄位 | 路徑 | 不可變原因 |
+|------|------|-----------|
+| `Image` | `spec.image` | machine 已用此 image 部署，修改不會重新部署 |
+| `MinCPU` | `spec.minCPU` | 已向 MAAS 配置硬體，硬體規格無法動態更改 |
+| `MinMemoryInMB` | `spec.minMemory` | 同上，已分配的實體記憶體不可追加 |
+
+### 常見錯誤訊息
+
+```
+admission webhook "vmaasmachine.kb.io" denied the request:
+  maas machine image change is not allowed, old=ubuntu/focal, new=ubuntu/jammy
+
+admission webhook "vmaasmachine.kb.io" denied the request:
+  maas machine min cpu count change is not allowed, old=4, new=8
+
+admission webhook "vmaasmachine.kb.io" denied the request:
+  maas machine min memory change is not allowed, old=8192 MB, new=16384 MB
+```
+
+<Callout type="warning" title="正確的升級做法">
+若需要更換 machine 規格，應建立新的 `MaasMachineTemplate` 並滾動更新 `MachineDeployment`，讓 CAPI 依正常流程重新配置新機器，而非直接修改現有 `MaasMachine`。
+</Callout>
+
+## MaasMachineTemplate Webhook
+
+`MaasMachineTemplate` 是 `MaasMachine` 的模板資源，webhook 的不可變欄位與 `MaasMachine` 完全相同，路徑多了 `spec.template.spec` 前綴：
+
+```go
+// api/v1beta1/maasmachinetemplate_webhook.go
+func (r *MaasMachineTemplate) ValidateUpdate(old runtime.Object) (admission.Warnings, error) {
+    oldM := old.(*MaasMachineTemplate)
+
+    if r.Spec.Template.Spec.Image != oldM.Spec.Template.Spec.Image {
+        return nil, apierrors.NewBadRequest(
+            fmt.Sprintf("maas machine template image change is not allowed, old=%s, new=%s",
+                oldM.Spec.Template.Spec.Image, r.Spec.Template.Spec.Image))
+    }
+    // ... MinCPU, MinMemoryInMB 同樣邏輯
+}
+```
+
+### 三個 CRD 不可變欄位對照
+
+| 欄位 | `MaasMachine` | `MaasMachineTemplate` |
+|------|:---:|:---:|
+| `image` | ✅ 不可變 | ✅ 不可變 |
+| `minCPU` | ✅ 不可變 | ✅ 不可變 |
+| `minMemory` | ✅ 不可變 | ✅ 不可變 |
+| `dnsDomain` | — | — |
+
+## Defaulter 行為
+
+目前三個 CRD 的 `Default()` 方法皆為空實作，僅記錄 log：
+
+```go
+func (r *MaasMachine) Default() {
+    maasmachinelog.Info("default", "name", r.Name)
+}
+```
+
+<Callout type="info" title="注意">
+雖然 `Default()` 目前無實際邏輯，但 webhook registration 仍然生效。若未來新增 default value 注入邏輯，不需要修改 webhook server 設定，只需在 `Default()` 中加入程式碼即可。
+</Callout>
+
+預設值由 CRD schema 中的 `+kubebuilder:default` 標記處理，例如：
+
+```go
+// +kubebuilder:default=false
+DeployInMemory bool `json:"deployInMemory,omitempty"`
+
+// +kubebuilder:default=false
+Ready bool `json:"ready"`
+```
+
+## Webhook Server 啟動設定
+
+`main.go` 中所有 webhook 的啟動方式相同：
+
+```go
+// main.go
+if err = (&infrav1beta1.MaasCluster{}).SetupWebhookWithManager(mgr); err != nil {
+    setupLog.Error(err, "unable to create webhook", "webhook", "MaasCluster")
+    os.Exit(1)
+}
+if err = (&infrav1beta1.MaasMachine{}).SetupWebhookWithManager(mgr); err != nil {
+    setupLog.Error(err, "unable to create webhook", "webhook", "MaasMachine")
+    os.Exit(1)
+}
+if err = (&infrav1beta1.MaasMachineTemplate{}).SetupWebhookWithManager(mgr); err != nil {
+    setupLog.Error(err, "unable to create webhook", "webhook", "MaasMachineTemplate")
+    os.Exit(1)
+}
+```
+
+Webhook server 預設監聽 port `9443`，可透過啟動參數 `--webhook-port` 覆蓋。
+
+## 除錯指南
+
+### 確認 webhook 是否正常運作
+
+```bash
+# 查看 webhook configuration
+kubectl get mutatingwebhookconfigurations
+kubectl get validatingwebhookconfigurations
+
+# 查看 webhook service
+kubectl get svc -n capmaas-system
+
+# 查看 webhook pod logs
+kubectl logs -n capmaas-system deploy/capmaas-controller-manager \
+  | grep -E "webhook|validate|mutate"
+```
+
+### webhook server 不可達時的症狀
+
+由於所有 webhook 都設定 `failurePolicy=fail`，若 controller pod 重啟或 webhook service 不通，以下操作都會失敗：
+
+```
+Error from server (InternalError): Internal error occurred:
+  failed calling webhook "vmaasmachine.kb.io":
+  Post "https://capmaas-webhook-service.capmaas-system.svc:443/...":
+  dial tcp: connect: connection refused
+```
+
+**處理方式**：確認 controller pod 正常執行，且 webhook service 的 endpoints 正確指向 pod。
+
+```bash
+kubectl get endpoints -n capmaas-system capmaas-webhook-service
+```
+
+## 摘要
+
+| CRD | ValidateCreate | ValidateUpdate | ValidateDelete | Default |
+|-----|:--------------:|:--------------:|:--------------:|:-------:|
+| `MaasCluster` | 無邏輯 | 檢查 DNSDomain 不可變 | 無邏輯 | 無邏輯 |
+| `MaasMachine` | 無邏輯 | 檢查 Image/MinCPU/MinMemory 不可變 | 無邏輯 | 無邏輯 |
+| `MaasMachineTemplate` | 無邏輯 | 檢查 Image/MinCPU/MinMemory 不可變 | 無邏輯 | 無邏輯 |

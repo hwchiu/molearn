@@ -1,0 +1,414 @@
+---
+layout: doc
+title: KubeVirt — GPU 與 Host Device Passthrough
+description: 透過 GPU passthrough、vGPU mediated device 與 HostDevice passthrough，將 GPU 和任意 PCIe 裝置直接分配給 VM，支援 AI/ML 推論與 GPU 加速工作負載。
+---
+
+# GPU 與 Host Device Passthrough
+
+<Callout type="info" title="相關章節">
+- [CPU Pinning 與 NUMA 拓樸](/kubevirt/features/cpu-pinning-numa)
+- [VMI 生命週期](/kubevirt/features/vmi-lifecycle)
+- [virt-operator 與 KubeVirt CR](/kubevirt/features/virt-operator)
+- [Live Migration](/kubevirt/features/live-migration)
+</Callout>
+
+<Callout type="tip" title="本文適用對象">
+- 🟢 **初學者**：了解 GPU passthrough 的基本概念與使用場景
+- 🟡 **中階工程師**：學習 NVIDIA GPU Operator 整合與 VMI spec 設定
+- 🔴 **資深工程師**：掌握 mdev（mediated device）、HostDevice passthrough 與 IOMMU 設定
+</Callout>
+
+> 📦 **類比**：GPU passthrough 就像把公司伺服器機架中的 NVIDIA A100 GPU 卡「直接遞給」VM——不透過虛擬化層，VM 看到的就是真實的 PCIe 裝置，效能幾乎等同於 bare-metal。這與容器中的 GPU（需要 device plugin 配合）不同，VM 可以載入自己的 GPU 驅動程式，完全掌控硬體。
+
+## GPU Passthrough 技術概覽
+
+KubeVirt 支援三種 GPU 分配方式：
+
+| 方式 | 技術 | 共享性 | 典型場景 |
+|------|------|--------|---------|
+| GPU passthrough | VFIO-PCI | 每個 VM 獨佔一張 GPU | AI/ML 訓練、高效能推論 |
+| vGPU (mdev) | NVIDIA Virtual GPU | 多個 VM 共享一張 GPU | 虛擬桌面、輕量推論 |
+| HostDevice passthrough | VFIO-PCI | 任意 PCIe 裝置獨佔 | FPGA、網路加速卡、加密硬體 |
+
+---
+
+## 先決條件：IOMMU 與 VFIO
+
+### 啟用 IOMMU
+
+IOMMU（Input-Output Memory Management Unit）是 GPU passthrough 的基礎，讓 PCIe 裝置可以安全地直接存取 VM 的記憶體空間。
+
+```bash
+# 1. 在 BIOS/UEFI 中啟用 VT-d（Intel）或 AMD-Vi（AMD）
+
+# 2. 在 kernel 啟動參數中啟用 IOMMU
+# Intel CPU：
+echo 'GRUB_CMDLINE_LINUX_DEFAULT="... intel_iommu=on iommu=pt"' >> /etc/default/grub
+
+# AMD CPU：
+echo 'GRUB_CMDLINE_LINUX_DEFAULT="... amd_iommu=on iommu=pt"' >> /etc/default/grub
+
+# 套用並重啟
+update-grub
+reboot
+
+# 3. 確認 IOMMU 已啟用
+dmesg | grep -e DMAR -e IOMMU
+```
+
+`iommu=pt`（passthrough mode）：DMA 操作不透過 IOMMU 轉換，降低延遲，適合 passthrough 用途。
+
+### VFIO 驅動程式
+
+```bash
+# 載入 VFIO 模組
+modprobe vfio
+modprobe vfio_pci
+modprobe vfio_iommu_type1
+
+# 持久化（加入 /etc/modules-load.d/）
+echo "vfio" >> /etc/modules-load.d/vfio.conf
+echo "vfio_pci" >> /etc/modules-load.d/vfio.conf
+echo "vfio_iommu_type1" >> /etc/modules-load.d/vfio.conf
+```
+
+---
+
+## GPU Passthrough（獨佔整張 GPU）
+
+### NVIDIA GPU Operator 整合
+
+NVIDIA GPU Operator 自動化了 GPU node 的所有設定工作：
+
+```bash
+# 安裝 NVIDIA GPU Operator（已整合 KubeVirt 支援）
+helm repo add nvidia https://helm.ngc.nvidia.com/nvidia
+helm repo update
+
+helm install gpu-operator nvidia/gpu-operator \
+  --namespace gpu-operator \
+  --create-namespace \
+  --set sandboxWorkloads.enabled=true \    # 啟用 VM（sandbox）GPU 支援
+  --set vgpu.enabled=false                  # 若不使用 vGPU 則關閉
+```
+
+GPU Operator 會自動安裝：
+- NVIDIA 驅動程式（在主機上）
+- nvidia-container-toolkit
+- GPU 的 Kubernetes device plugin
+- DCGMExporter（監控）
+- 以及 KubeVirt sandbox workload 支援
+
+```bash
+# 確認 GPU node 已就緒
+kubectl get nodes -l nvidia.com/gpu.present=true
+
+# 查看 GPU 可用數量
+kubectl describe node <gpu-node> | grep "nvidia.com/gpu"
+```
+
+### VMI GPU Spec 設定
+
+```yaml
+apiVersion: kubevirt.io/v1
+kind: VirtualMachineInstance
+metadata:
+  name: gpu-vm
+spec:
+  domain:
+    devices:
+      gpus:
+        - name: gpu1                           # 自訂名稱（在 VM 內部識別用）
+          deviceName: nvidia.com/GP102GL_Tesla_P40  # device plugin 資源名稱
+          tag: myGPU                           # 可選：用於 node selector
+      disks:
+        - name: rootdisk
+          disk:
+            bus: virtio
+    resources:
+      requests:
+        memory: "16Gi"
+        cpu: "8"
+  volumes:
+    - name: rootdisk
+      dataVolume:
+        name: ubuntu-gpu-disk
+```
+
+### 查詢可用的 GPU 資源名稱
+
+```bash
+# 查看 node 上的 GPU 資源
+kubectl describe node <gpu-node> | grep "nvidia.com/"
+
+# 範例輸出：
+# nvidia.com/GP102GL_Tesla_P40:  4
+# nvidia.com/A100-SXM4-80GB:     8
+```
+
+### Feature Gate 需求
+
+```yaml
+# 在 KubeVirt CR 中啟用 GPU feature gate
+apiVersion: kubevirt.io/v1
+kind: KubeVirt
+metadata:
+  name: kubevirt
+  namespace: kubevirt
+spec:
+  configuration:
+    developerConfiguration:
+      featureGates:
+        - GPU
+        - HostDevices   # 若需要 HostDevice passthrough
+```
+
+---
+
+## vGPU（Mediated Device，mdev）
+
+vGPU 允許將一張物理 GPU 分割為多個虛擬 GPU（vGPU），每個 VM 獲得一個虛擬 GPU。
+
+### 支援 vGPU 的硬體
+
+| 系列 | 型號範例 | 備註 |
+|------|---------|------|
+| NVIDIA A-Series | A30、A40、A100 | 支援 MIG（Multi-Instance GPU）|
+| NVIDIA V100 | V100-SXM2、V100-PCIe | |
+| NVIDIA T4 | T4 | 適合推論 |
+| NVIDIA RTX A-Series | RTX A6000 | 適合圖形工作站 |
+
+### 設定 mdev 裝置
+
+```bash
+# 查看可用的 mdev 類型
+ls /sys/bus/pci/devices/<gpu-bdf>/mdev_supported_types/
+
+# 範例輸出：
+# nvidia-222 (GRID A100-10C: 10GB, 7 可建立)
+# nvidia-223 (GRID A100-20C: 20GB, 3 可建立)
+
+# 建立 mdev 實例
+echo <uuid> > /sys/bus/pci/devices/<gpu-bdf>/mdev_supported_types/nvidia-222/create
+```
+
+NVIDIA GPU Operator 在啟用 vGPU 模式時會自動管理 mdev 建立。
+
+### VMI vGPU Spec
+
+```yaml
+spec:
+  domain:
+    devices:
+      gpus:
+        - name: vgpu0
+          deviceName: nvidia.com/GRID_A100-10C    # vGPU 類型的 resource name
+```
+
+---
+
+## HostDevice Passthrough
+
+HostDevice passthrough 允許將任意 PCIe 裝置（不只是 GPU）直接分配給 VM：
+
+| 裝置類型 | 使用場景 |
+|---------|---------|
+| GPU | AI/ML、圖形工作站 |
+| FPGA | 硬體加速、訊號處理 |
+| SR-IOV NIC | 高效能網路 |
+| InfiniBand HCA | HPC、RDMA |
+| 加密加速卡 | HSM、SSL 卸載 |
+| NVMe SSD 控制器 | 超低延遲儲存 |
+
+### 在 KubeVirt 中宣告允許的 HostDevice
+
+```yaml
+apiVersion: kubevirt.io/v1
+kind: KubeVirt
+metadata:
+  name: kubevirt
+  namespace: kubevirt
+spec:
+  configuration:
+    permittedHostDevices:
+      pciHostDevices:
+        - pciVendorSelector: "10DE:1DB6"          # NVIDIA Tesla V100 PCIe
+          resourceName: "nvidia.com/GP100GL_Tesla_V100"
+        - pciVendorSelector: "10EE:5020"          # Xilinx FPGA
+          resourceName: "xilinx.com/ALVEO_U250"
+        - pciVendorSelector: "8086:0D58"          # Intel XXV710 25G NIC VF
+          resourceName: "intel.com/XXV710"
+      mediatedDevices:
+        - mdevNameSelector: "GRID A100-10C"        # mdev 類型名稱
+          resourceName: "nvidia.com/GRID_A100-10C"
+```
+
+### VMI HostDevice Spec
+
+```yaml
+spec:
+  domain:
+    devices:
+      hostDevices:
+        - name: fpga0
+          deviceName: xilinx.com/ALVEO_U250    # 對應 permittedHostDevices 中的 resourceName
+        - name: sriov-nic0
+          deviceName: intel.com/XXV710
+```
+
+---
+
+## Node 標籤與排程
+
+```bash
+# 手動為 GPU node 加上標籤
+kubectl label node <gpu-node> \
+  nvidia.com/gpu=true \
+  nvidia.com/gpu.product=A100-SXM4-80GB
+
+# NVIDIA GPU Operator 會自動加上詳細的標籤
+kubectl get node <gpu-node> --show-labels | grep nvidia
+# 範例：
+# nvidia.com/cuda.driver.major=535
+# nvidia.com/gpu.count=8
+# nvidia.com/gpu.memory=81920
+# nvidia.com/gpu.product=A100-SXM4-80GB
+```
+
+### VMI Node Affinity
+
+```yaml
+spec:
+  affinity:
+    nodeAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+        nodeSelectorTerms:
+          - matchExpressions:
+              - key: nvidia.com/gpu.product
+                operator: In
+                values:
+                  - A100-SXM4-80GB
+```
+
+---
+
+## Live Migration 限制
+
+<Callout type="warning" title="GPU Passthrough 不支援 Live Migration">
+使用 GPU passthrough（包括 GPU 和 HostDevice）的 VM **無法進行 live migration**。因為 PCIe 裝置直接綁定到特定節點，無法遷移到另一個節點。這是硬體 passthrough 的基本限制。
+
+若需要 VM 可遷移，應考慮：
+- 使用 NVIDIA MIG（Multi-Instance GPU）搭配 virtual device（非直通）
+- 使用容器化 GPU 工作負載（不在 VM 中）
+- 使用 NVIDIA vGPU 軟體（部分版本支援有限度的遷移）
+</Callout>
+
+| VM 配置 | Live Migration 支援 |
+|---------|-------------------|
+| 一般 VM（無 passthrough）| ✅ 完整支援 |
+| GPU passthrough | ❌ 不支援 |
+| vGPU (mdev) passthrough | ❌ 不支援（一般情況）|
+| HostDevice passthrough | ❌ 不支援 |
+| SR-IOV（作為 hotplug NIC）| ❌ hotplug SR-IOV 不支援遷移 |
+
+---
+
+## 完整範例：AI/ML 推論 VM
+
+```yaml
+apiVersion: kubevirt.io/v1
+kind: VirtualMachine
+metadata:
+  name: inference-server-01
+  namespace: ai-workloads
+spec:
+  running: true
+  template:
+    spec:
+      domain:
+        cpu:
+          sockets: 1
+          cores: 8
+          threads: 2
+          dedicatedCPUPlacement: true      # 確保 CPU 效能
+          model: host-passthrough
+        memory:
+          hugepages:
+            pageSize: "1Gi"                # 大型記憶體操作最佳化
+        devices:
+          gpus:
+            - name: inference-gpu
+              deviceName: nvidia.com/A100-SXM4-80GB
+          disks:
+            - name: rootdisk
+              disk:
+                bus: virtio
+          interfaces:
+            - name: default
+              masquerade: {}
+        resources:
+          requests:
+            cpu: "16"
+            memory: "128Gi"
+            hugepages-1Gi: "128Gi"
+            nvidia.com/A100-SXM4-80GB: "1"
+          limits:
+            cpu: "16"
+            memory: "128Gi"
+            hugepages-1Gi: "128Gi"
+            nvidia.com/A100-SXM4-80GB: "1"
+      nodeSelector:
+        nvidia.com/gpu.product: "A100-SXM4-80GB"
+      networks:
+        - name: default
+          pod: {}
+      volumes:
+        - name: rootdisk
+          dataVolume:
+            name: ubuntu-22.04-cuda
+```
+
+---
+
+## 在 Guest 內使用 GPU
+
+```bash
+# 啟動 VM 後，SSH 進入 guest
+virtctl ssh inference-server-01
+
+# 在 guest 內確認 GPU 已識別
+nvidia-smi
+lspci | grep NVIDIA
+
+# 安裝 CUDA 工具組（若映像未預裝）
+apt-get update && apt-get install -y cuda-toolkit-12-0
+
+# 測試 GPU 計算
+python3 -c "
+import torch
+print('CUDA available:', torch.cuda.is_available())
+print('GPU:', torch.cuda.get_device_name(0))
+print('Memory:', torch.cuda.get_device_properties(0).total_memory / 1e9, 'GB')
+"
+```
+
+---
+
+## 監控 GPU VM
+
+```bash
+# 查看 GPU VM 的 resource 使用
+kubectl get vmi inference-server-01 -o yaml | grep -A5 resources
+
+# DCGM Exporter 提供 GPU 指標（若已安裝 NVIDIA GPU Operator）
+kubectl port-forward svc/gpu-operator-dcgm-exporter 9400:9400 -n gpu-operator
+curl localhost:9400/metrics | grep DCGM_FI_DEV_GPU_UTIL
+```
+
+| 指標 | 說明 |
+|------|------|
+| `DCGM_FI_DEV_GPU_UTIL` | GPU 使用率（%）|
+| `DCGM_FI_DEV_MEM_COPY_UTIL` | GPU 記憶體複製頻寬使用率 |
+| `DCGM_FI_DEV_FB_USED` | GPU 顯存使用量（MB）|
+| `DCGM_FI_DEV_POWER_USAGE` | GPU 功耗（W）|

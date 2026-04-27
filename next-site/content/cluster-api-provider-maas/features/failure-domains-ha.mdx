@@ -1,0 +1,279 @@
+---
+layout: doc
+title: Cluster API Provider MAAS — Failure Domains 與高可用
+description: 解析 CAPM 如何將 MAAS zones 對應為 CAPI FailureDomains，實現 control plane 跨 zone 的高可用部署。
+---
+
+# Failure Domains 與高可用
+
+<Callout type="info" title="相關章節">
+- [API 類型定義](/cluster-api-provider-maas/features/api-types)
+- [Controllers 運作原理](/cluster-api-provider-maas/features/controllers)
+- [Resource Pools 與 Tags 主機選擇](/cluster-api-provider-maas/features/resource-pools-tags)
+</Callout>
+
+<Callout type="tip" title="本文適用對象">
+- 🟢 **初學者**：了解什麼是 Failure Domain，以及它如何幫助 cluster 在硬體故障時存活。
+- 🟡 **中階工程師**：掌握 MaasCluster FailureDomains 設定方式，以及 CAPI 如何分配 machines。
+- 🔴 **資深工程師**：分析 CAPM 中 FailureDomains 的實作邏輯，以及 MachineDeployment 的 zone 分散策略。
+</Callout>
+
+> 📦 **類比**：Failure Domain 就像雞蛋不要放在同一個籃子裡——把 Kubernetes control plane 節點分散到不同的實體機架（MAAS zone），即使一個機架的電源故障，cluster 仍然可以繼續運作。
+
+## 什麼是 Failure Domain
+
+在 CAPI 的概念中，Failure Domain 是一個抽象的「故障隔離單元」。不同的 infrastructure provider 對它的定義不同：
+
+| Provider | Failure Domain 對應 |
+|---------|-------------------|
+| AWS | Availability Zone（us-east-1a, 1b, 1c） |
+| Azure | Azure Availability Zone |
+| GCP | GCP Zone |
+| **MAAS** | **MAAS Availability Zone（zone/fabric）** |
+
+CAPI 的 KubeadmControlPlane（KCP）與 MachineDeployment 會參考 FailureDomains，將 machine 盡量分散到不同的 domain，達到高可用效果。
+
+## MaasCluster 中的 FailureDomains 設定
+
+### Spec 設定
+
+在 `MaasCluster.Spec.FailureDomains` 中列出要使用的 MAAS zones：
+
+```yaml
+# 範例：使用三個 zone 的高可用設定
+apiVersion: infrastructure.cluster.x-k8s.io/v1beta1
+kind: MaasCluster
+metadata:
+  name: my-ha-cluster
+spec:
+  dnsDomain: maas
+  failureDomains:
+    - zone-a
+    - zone-b
+    - zone-c
+```
+
+### Status 中的 FailureDomains
+
+`MaasClusterReconciler` 讀取 `Spec.FailureDomains` 並將其轉換為 CAPI 標準的 `FailureDomains` map 寫入 Status：
+
+```go
+// controllers/maascluster_controller.go
+failureDomains := make(clusterv1.FailureDomains)
+for _, az := range maasCluster.Spec.FailureDomains {
+    failureDomains[az] = clusterv1.FailureDomainSpec{
+        ControlPlane: true,  // 標記為可放置 control plane
+    }
+}
+maasCluster.Status.FailureDomains = failureDomains
+```
+
+`ControlPlane: true` 告訴 CAPI 這個 domain 可以放置 control plane 節點。
+
+### 轉換結果
+
+設定三個 zone 後，`MaasCluster.Status.FailureDomains` 的內容：
+
+```yaml
+status:
+  failureDomains:
+    zone-a:
+      controlPlane: true
+    zone-b:
+      controlPlane: true
+    zone-c:
+      controlPlane: true
+  ready: true
+```
+
+## CAPI 如何使用 FailureDomains 分配 Machine
+
+### KubeadmControlPlane（KCP）分配邏輯
+
+當 KCP 需要建立新的 control plane machine 時，它會：
+
+1. 讀取 `MaasCluster.Status.FailureDomains`
+2. 計算每個 domain 目前有幾個 running control plane machine
+3. 選擇數量最少的 domain（balance 策略）
+4. 在建立 `Machine` 時設定 `Machine.Spec.FailureDomain`
+
+```yaml
+# CAPI 自動設定的 Machine（示意）
+apiVersion: cluster.x-k8s.io/v1beta1
+kind: Machine
+metadata:
+  name: my-ha-cluster-control-plane-abc12
+spec:
+  failureDomain: zone-b  # CAPI 根據 balance 策略選擇的 zone
+  infrastructureRef:
+    kind: MaasMachine
+    name: my-ha-cluster-control-plane-abc12
+```
+
+### MaasMachine 的 Zone 選擇
+
+`MaasMachine` controller 接收到 `Machine.Spec.FailureDomain` 後，在 `DeployMachine` 中使用它：
+
+```go
+// pkg/maas/machine/machine.go
+failureDomain := mm.Spec.FailureDomain
+if failureDomain == nil {
+    failureDomain = s.scope.Machine.Spec.FailureDomain
+}
+
+if failureDomain != nil {
+    allocator.WithZone(*failureDomain)
+}
+```
+
+優先使用 `MaasMachine.Spec.FailureDomain`，若未設定則使用 `Machine.Spec.FailureDomain`。
+
+## 完整 HA 設定範例：三 Zone 叢集
+
+### 1. 建立 MaasCluster
+
+```yaml
+apiVersion: infrastructure.cluster.x-k8s.io/v1beta1
+kind: MaasCluster
+metadata:
+  name: prod-cluster
+  namespace: default
+spec:
+  dnsDomain: maas
+  failureDomains:
+    - rack-north
+    - rack-south
+    - rack-east
+```
+
+### 2. 建立 CAPI Cluster
+
+```yaml
+apiVersion: cluster.x-k8s.io/v1beta1
+kind: Cluster
+metadata:
+  name: prod-cluster
+  namespace: default
+spec:
+  clusterNetwork:
+    pods:
+      cidrBlocks: ["192.168.0.0/16"]
+    services:
+      cidrBlocks: ["10.96.0.0/12"]
+  infrastructureRef:
+    kind: MaasCluster
+    name: prod-cluster
+  controlPlaneRef:
+    kind: KubeadmControlPlane
+    name: prod-cluster-control-plane
+```
+
+### 3. 建立 KubeadmControlPlane（3 副本跨 zone）
+
+```yaml
+apiVersion: controlplane.cluster.x-k8s.io/v1beta1
+kind: KubeadmControlPlane
+metadata:
+  name: prod-cluster-control-plane
+  namespace: default
+spec:
+  replicas: 3
+  version: v1.27.0
+  machineTemplate:
+    infrastructureRef:
+      kind: MaasMachineTemplate
+      name: prod-cluster-control-plane-template
+  kubeadmConfigSpec:
+    initConfiguration:
+      nodeRegistration:
+        kubeletExtraArgs:
+          cloud-provider: external
+    joinConfiguration:
+      nodeRegistration:
+        kubeletExtraArgs:
+          cloud-provider: external
+```
+
+CAPI 會將 3 個 control plane machine 自動分散到 `rack-north`、`rack-south`、`rack-east` 各一台。
+
+### 4. 建立 MachineDeployment（worker nodes）
+
+```yaml
+apiVersion: cluster.x-k8s.io/v1beta1
+kind: MachineDeployment
+metadata:
+  name: prod-cluster-workers
+  namespace: default
+spec:
+  clusterName: prod-cluster
+  replicas: 6
+  selector:
+    matchLabels:
+      cluster.x-k8s.io/cluster-name: prod-cluster
+  template:
+    spec:
+      clusterName: prod-cluster
+      version: v1.27.0
+      infrastructureRef:
+        kind: MaasMachineTemplate
+        name: prod-cluster-worker-template
+      bootstrap:
+        configRef:
+          kind: KubeadmConfigTemplate
+          name: prod-cluster-worker-bootstrap
+      # worker 也可以指定 failureDomain（可選）
+      # failureDomain: rack-north
+```
+
+<Callout type="info" title="Worker 的 Failure Domain">
+`MachineDeployment` 本身不支援跨 domain 自動分散。若要讓 worker 分散到多個 zone，需要為每個 zone 建立獨立的 `MachineDeployment`，每個 deployment 設定不同的 `spec.template.spec.failureDomain`。
+</Callout>
+
+## 不使用 FailureDomains 的單 Zone 設定
+
+若 MAAS 環境只有一個 zone，可以省略 `failureDomains`：
+
+```yaml
+spec:
+  dnsDomain: maas
+  # failureDomains 不設定，機器配置時不加 zone constraint
+```
+
+此時 CAPI 不會指定 `Machine.Spec.FailureDomain`，`DeployMachine` 也不會傳 zone 參數給 MAAS allocator，MAAS 會自行選擇機器。
+
+## FailureDomain 與 ProviderID 的關聯
+
+machine 配置完成後，zone 資訊會被嵌入 ProviderID：
+
+```go
+// pkg/maas/scope/machine.go
+func (m *MachineScope) SetProviderID(systemID, availabilityZone string) {
+    providerID := fmt.Sprintf("maas:///%s/%s", availabilityZone, systemID)
+    m.MaasMachine.Spec.ProviderID = pointer.StringPtr(providerID)
+}
+
+// 同時設定 FailureDomain status
+func (m *MachineScope) SetFailureDomain(availabilityZone string) {
+    m.MaasMachine.Spec.FailureDomain = pointer.StringPtr(availabilityZone)
+}
+```
+
+這樣即使 machine 重啟，`ProviderID` 中的 zone 資訊也不會遺失，便於後續的 node 識別與 cloud-provider 整合。
+
+## 驗證 FailureDomains 分配結果
+
+```bash
+# 查看 MaasCluster status 中的 FailureDomains
+kubectl get maascluster prod-cluster \
+  -o jsonpath='{.status.failureDomains}' | jq .
+
+# 確認 control plane machines 分散在不同 zone
+kubectl get maasmachine -l cluster.x-k8s.io/control-plane= \
+  -o custom-columns='NAME:.metadata.name,ZONE:.spec.failureDomain'
+
+# 預期輸出：
+# NAME                                ZONE
+# prod-cluster-control-plane-abc12   rack-north
+# prod-cluster-control-plane-def34   rack-south
+# prod-cluster-control-plane-ghi56   rack-east
+```

@@ -1,0 +1,510 @@
+---
+layout: doc
+title: KubeVirt — CDI 與 DataVolume
+description: Containerized Data Importer（CDI）是 KubeVirt 的磁碟映像管理夥伴專案，DataVolume CRD 提供高階 PVC 抽象，支援從 HTTP、容器映像檔、PVC Clone 等多種來源匯入磁碟映像。
+---
+
+# CDI 與 DataVolume
+
+<Callout type="info" title="相關章節">
+- [VM Storage](/kubevirt/features/vm-storage)
+- [VMI 生命週期](/kubevirt/features/vmi-lifecycle)
+- [Instancetypes 與 Preferences](/kubevirt/features/instancetypes)
+- [Hotplug 磁碟與網路介面](/kubevirt/features/hotplug)
+- [Snapshot 與 Restore](/kubevirt/features/snapshot-restore)
+</Callout>
+
+<Callout type="tip" title="本文適用對象">
+- 🟢 **初學者**：了解 DataVolume 如何簡化 VM 磁碟的匯入與管理
+- 🟡 **中階工程師**：掌握各種 DataVolume 來源類型與 CDI 架構
+- 🔴 **資深工程師**：深入 CDI importer pod 生命週期、golden image pattern 與 import proxy 設定
+</Callout>
+
+> 📦 **類比**：CDI 就像 VM 的「映像倉庫搬運工」——當你告訉它「我要一個 Ubuntu 22.04 的磁碟」，它負責從網路上下載 .qcow2 映像、轉換格式、存入 PVC，讓 VM 直接啟動，而不需要手動下載、格式轉換、上傳等繁瑣步驟。
+
+## 什麼是 CDI
+
+**Containerized Data Importer（CDI）** 是 KubeVirt 的夥伴專案，專門解決 VM 磁碟映像的管理問題：
+
+| 問題 | CDI 解決方式 |
+|------|------------|
+| 如何從 URL 下載 VM 映像到 PVC？ | HTTP/HTTPS import |
+| 如何使用容器映像檔中的磁碟？ | Registry（container disk）import |
+| 如何複製現有 PVC？ | PVC Clone |
+| 如何從 S3/GCS 上傳？ | S3、GCS import |
+| 如何從本地上傳映像？ | virtctl image-upload |
+| 如何建立空白磁碟？ | Blank DataVolume |
+
+CDI 作為獨立的 Kubernetes operator 部署，但與 KubeVirt 緊密整合。
+
+### CDI 安裝
+
+```bash
+# 安裝最新版 CDI
+export VERSION=$(curl -s https://api.github.com/repos/kubevirt/containerized-data-importer/releases/latest | jq -r .tag_name)
+kubectl create -f https://github.com/kubevirt/containerized-data-importer/releases/download/${VERSION}/cdi-operator.yaml
+kubectl create -f https://github.com/kubevirt/containerized-data-importer/releases/download/${VERSION}/cdi-cr.yaml
+
+# 確認 CDI 元件運作
+kubectl get pods -n cdi
+```
+
+CDI 元件：
+
+| Pod | 功能 |
+|-----|------|
+| `cdi-operator` | 管理 CDI 自身的生命週期 |
+| `cdi-apiserver` | CDI 的 API 擴充（處理 DataVolume 請求）|
+| `cdi-controller` | 監控 DataVolume，建立 importer pod |
+| `cdi-uploadproxy` | 接收本地映像上傳 |
+
+---
+
+## DataVolume CRD
+
+DataVolume 是 PVC 的高階抽象——你描述「我想要什麼樣的磁碟、從哪裡取得」，CDI 負責完成所有底層工作。
+
+### DataVolume 基本結構
+
+```yaml
+apiVersion: cdi.kubevirt.io/v1beta1
+kind: DataVolume
+metadata:
+  name: ubuntu-22.04-disk
+  namespace: default
+spec:
+  source:               # 資料來源（詳見下方各類型說明）
+    http:
+      url: "https://cloud-images.ubuntu.com/jammy/current/jammy-server-cloudimg-amd64.img"
+  pvc:                  # 目標 PVC 規格
+    accessModes:
+      - ReadWriteOnce
+    resources:
+      requests:
+        storage: 30Gi
+    storageClassName: rook-ceph-block
+```
+
+完成後，CDI 會建立一個同名的 PVC（`ubuntu-22.04-disk`），內容是匯入的磁碟映像。
+
+---
+
+## DataVolume 來源類型
+
+### 1. HTTP/HTTPS 匯入
+
+從公開或私有 HTTP URL 下載映像（支援 .img、.qcow2、.iso 格式）：
+
+```yaml
+spec:
+  source:
+    http:
+      url: "https://cloud-images.ubuntu.com/jammy/current/jammy-server-cloudimg-amd64.img"
+      secretRef: "http-credentials"    # 可選：Basic Auth 憑證
+      certConfigMap: "custom-ca"       # 可選：自訂 CA 憑證
+      extraHeaders:
+        - "X-Custom-Header: value"     # 可選：自訂 HTTP header
+```
+
+HTTP 匯入支援的格式：
+
+| 格式 | 說明 |
+|------|------|
+| `.qcow2` | QEMU Copy-On-Write 格式（最常見）|
+| `.img` | Raw 映像格式 |
+| `.iso` | ISO 映像（用於安裝媒體）|
+| `.vmdk` | VMware 格式（自動轉換）|
+| `.ova` | OVA 格式（自動解包）|
+| `.gz` / `.xz` / `.zst` | 壓縮格式（自動解壓縮）|
+
+### 2. 容器映像檔（Registry）匯入
+
+從 OCI 容器映像檔中取出磁碟映像（ContainerDisk 格式）：
+
+```yaml
+spec:
+  source:
+    registry:
+      url: "docker://quay.io/containerdisks/ubuntu:22.04"
+      secretRef: "registry-credentials"   # 可選：私有 registry 認證
+      certConfigMap: "registry-ca"        # 可選：自訂 CA
+```
+
+ContainerDisk 格式要求：
+- 磁碟映像放在容器內的 `/disk/` 目錄
+- 支援 `.qcow2` 或 raw 格式
+
+```dockerfile
+# 自製 ContainerDisk 範例
+FROM scratch
+ADD my-disk.qcow2 /disk/
+```
+
+### 3. PVC Clone（複製現有 PVC）
+
+```yaml
+spec:
+  source:
+    pvc:
+      namespace: default
+      name: ubuntu-22.04-golden   # 來源 PVC 名稱
+```
+
+<Callout type="info" title="跨命名空間 Clone">
+跨命名空間 Clone 需要在來源命名空間建立 `DataVolumeSourceRef` 授權，或使用 Smart Clone（若 CSI 支援 VolumeSnapshot）以提升效能。
+</Callout>
+
+### 4. 空白磁碟（Blank）
+
+建立空白 PVC，用作資料磁碟：
+
+```yaml
+spec:
+  source:
+    blank: {}
+```
+
+### 5. 本地上傳（Upload）
+
+先建立 DataVolume，再用 virtctl 上傳本地映像：
+
+```yaml
+spec:
+  source:
+    upload: {}        # 宣告等待上傳
+```
+
+```bash
+# 使用 virtctl 上傳
+virtctl image-upload dv my-custom-disk \
+  --size=20Gi \
+  --image-path=/path/to/my-disk.qcow2 \
+  --insecure    # 僅測試用，生產環境請移除
+```
+
+### 6. S3 匯入
+
+```yaml
+spec:
+  source:
+    s3:
+      url: "s3://my-bucket/vm-images/ubuntu-22.04.qcow2"
+      secretRef: "s3-credentials"    # 包含 accessKeyId 和 secretKey
+```
+
+### 7. GCS 匯入
+
+```yaml
+spec:
+  source:
+    gcs:
+      url: "gs://my-bucket/vm-images/ubuntu-22.04.qcow2"
+      secretRef: "gcs-credentials"   # 包含 serviceAccount JSON
+```
+
+### 8. ImageIO（oVirt/RHV 匯入）
+
+```yaml
+spec:
+  source:
+    imageio:
+      url: "https://ovirt-engine.example.com/ovirt-engine/api"
+      diskId: "disk-uuid-here"
+      secretRef: "imageio-credentials"
+      certConfigMap: "imageio-ca"
+```
+
+---
+
+## DataVolume 狀態機
+
+DataVolume 的 `status.phase` 欄位追蹤匯入進度：
+
+```
+Pending
+   ↓（PVC 已建立，等待排程）
+ImportScheduled
+   ↓（Importer Pod 開始運行）
+ImportInProgress
+   ↓（匯入完成）
+Succeeded
+   
+（若發生錯誤）
+ImportInProgress → Failed
+```
+
+| Phase | 說明 |
+|-------|------|
+| `Pending` | DataVolume 已建立，等待 CDI controller 處理 |
+| `ImportScheduled` | Importer Pod 已建立，等待排程 |
+| `ImportInProgress` | 正在下載/匯入 |
+| `WaitForFirstConsumer` | StorageClass 使用 `WaitForFirstConsumer` 綁定模式，等待 Pod 使用 |
+| `Succeeded` | 匯入成功，PVC 可用 |
+| `Failed` | 匯入失敗（查看 importer pod logs）|
+
+```bash
+# 監控 DataVolume 狀態
+kubectl get dv -w
+
+# 查看匯入進度
+kubectl get dv ubuntu-22.04-disk -o jsonpath='{.status.progress}'
+
+# 查看 importer pod 日誌（排錯用）
+kubectl logs -l app=containerized-data-importer -n cdi
+```
+
+---
+
+## CDI Controller 架構
+
+### Importer Pod 生命週期
+
+```
+DataVolume 建立
+     ↓
+CDI controller 建立 PVC
+     ↓
+CDI controller 建立 importer Pod（在與 PVC 同一 node）
+     ↓
+Importer Pod 執行：
+  - 下載映像（HTTP/registry/S3...）
+  - 轉換格式（若需要，使用 qemu-img）
+  - 寫入 PVC
+     ↓
+Importer Pod 完成後自動刪除
+     ↓
+DataVolume phase = Succeeded
+```
+
+### Smart Clone vs Host-Assisted Clone
+
+| Clone 方式 | 觸發條件 | 效能 |
+|-----------|---------|------|
+| Smart Clone | CSI 支援 VolumeSnapshot，且 StorageClass 相同 | 極快（storage 層快照）|
+| Host-Assisted Clone | Smart Clone 不可用時 | 慢（需要資料傳輸）|
+
+```bash
+# 查看 Clone 使用哪種方式
+kubectl get dv my-cloned-dv -o jsonpath='{.status.cloneType}'
+# 輸出：snapshot（Smart Clone）或 copy（Host-Assisted）
+```
+
+---
+
+## VM 中使用 DataVolume
+
+### 方式一：直接在 VM spec 中宣告 DataVolume
+
+```yaml
+apiVersion: kubevirt.io/v1
+kind: VirtualMachine
+metadata:
+  name: ubuntu-vm
+  namespace: default
+spec:
+  running: true
+  dataVolumeTemplates:                 # 在 VM 中直接定義 DataVolume
+    - metadata:
+        name: ubuntu-22.04-root
+      spec:
+        source:
+          http:
+            url: "https://cloud-images.ubuntu.com/jammy/current/jammy-server-cloudimg-amd64.img"
+        pvc:
+          accessModes:
+            - ReadWriteOnce
+          resources:
+            requests:
+              storage: 30Gi
+          storageClassName: rook-ceph-block
+  template:
+    spec:
+      domain:
+        devices:
+          disks:
+            - name: rootdisk
+              disk:
+                bus: virtio
+      volumes:
+        - name: rootdisk
+          dataVolume:
+            name: ubuntu-22.04-root   # 引用上方 dataVolumeTemplates 中定義的名稱
+```
+
+<Callout type="info" title="dataVolumeTemplates 生命週期">
+使用 `dataVolumeTemplates` 定義的 DataVolume 會與 VM 綁定——刪除 VM 時，對應的 DataVolume 和 PVC 也會一起刪除。若要保留資料，應先建立獨立的 DataVolume，再在 VM 中以 `volumes[].dataVolume.name` 引用。
+</Callout>
+
+### 方式二：先建立 DataVolume，再引用
+
+```yaml
+# 步驟一：獨立建立 DataVolume
+apiVersion: cdi.kubevirt.io/v1beta1
+kind: DataVolume
+metadata:
+  name: shared-ubuntu-golden
+spec:
+  source:
+    http:
+      url: "https://cloud-images.ubuntu.com/jammy/current/jammy-server-cloudimg-amd64.img"
+  pvc:
+    accessModes:
+      - ReadWriteMany    # 或 ReadWriteOnce
+    resources:
+      requests:
+        storage: 10Gi
+---
+# 步驟二：VM 引用已存在的 DataVolume
+apiVersion: kubevirt.io/v1
+kind: VirtualMachine
+metadata:
+  name: my-ubuntu-vm
+spec:
+  running: true
+  template:
+    spec:
+      volumes:
+        - name: rootdisk
+          dataVolume:
+            name: shared-ubuntu-golden   # 引用現有 DataVolume
+```
+
+---
+
+## Golden Image Pattern
+
+Golden Image（黃金映像）模式是大規模部署 VM 的最佳實踐：
+
+```
+[Golden DataVolume] → Clone → [VM-1 DataVolume]
+                    → Clone → [VM-2 DataVolume]
+                    → Clone → [VM-N DataVolume]
+```
+
+### 實作步驟
+
+```yaml
+# 1. 建立 Golden Image DataVolume（唯讀基底）
+apiVersion: cdi.kubevirt.io/v1beta1
+kind: DataVolume
+metadata:
+  name: ubuntu-22.04-golden
+  namespace: vm-images           # 集中管理命名空間
+  labels:
+    role: golden-image
+    os: ubuntu-22.04
+spec:
+  source:
+    http:
+      url: "https://cloud-images.ubuntu.com/jammy/current/jammy-server-cloudimg-amd64.img"
+  pvc:
+    accessModes:
+      - ReadWriteOnce
+    resources:
+      requests:
+        storage: 10Gi
+    storageClassName: rook-ceph-block
+```
+
+```yaml
+# 2. 每個 VM 從 Golden Image Clone（使用 dataVolumeTemplates）
+apiVersion: kubevirt.io/v1
+kind: VirtualMachine
+metadata:
+  name: web-server-prod-01
+  namespace: production
+spec:
+  dataVolumeTemplates:
+    - metadata:
+        name: web-server-prod-01-root
+      spec:
+        source:
+          pvc:
+            namespace: vm-images       # 跨命名空間 clone
+            name: ubuntu-22.04-golden  # Golden Image 名稱
+        pvc:
+          accessModes:
+            - ReadWriteOnce
+          resources:
+            requests:
+              storage: 30Gi            # 可比 golden image 更大
+```
+
+### 跨命名空間 Clone 授權
+
+```yaml
+# 在 golden image 所在命名空間建立授權
+apiVersion: cdi.kubevirt.io/v1beta1
+kind: DataVolumeSourceRef
+metadata:
+  name: ubuntu-22.04-golden-ref
+  namespace: vm-images
+spec:
+  kind: DataVolume
+  name: ubuntu-22.04-golden
+---
+# 或使用 RBAC 授權目標命名空間的 CDI service account
+```
+
+---
+
+## Import Proxy 設定
+
+在私有雲或受限網路環境，可設定 CDI 使用 HTTP proxy 進行匯入：
+
+```yaml
+apiVersion: cdi.kubevirt.io/v1beta1
+kind: CDI
+metadata:
+  name: cdi
+spec:
+  config:
+    importProxy:
+      httpProxy: "http://proxy.company.com:3128"
+      httpsProxy: "http://proxy.company.com:3128"
+      noProxy: "localhost,127.0.0.1,.company.com,10.0.0.0/8"
+      trustedCAProxy: "proxy-ca-configmap"    # 包含 proxy 的 CA 憑證
+```
+
+---
+
+## 常用指令
+
+```bash
+# 列出所有 DataVolume
+kubectl get dv -A
+
+# 查看特定 DataVolume 詳情
+kubectl describe dv ubuntu-22.04-golden -n vm-images
+
+# 監控匯入進度
+kubectl get dv -w
+
+# 查看 importer pod 日誌
+kubectl logs -l cdi.kubevirt.io/importer -n cdi
+
+# 使用 virtctl 上傳本地映像
+virtctl image-upload \
+  --pvc-name=my-custom-image \
+  --pvc-size=20Gi \
+  --image-path=/path/to/disk.qcow2 \
+  --uploadproxy-url=https://cdi-uploadproxy.cdi.svc
+
+# 查看 CDI 設定
+kubectl get cdi cdi -o yaml
+```
+
+---
+
+## StorageClass 選擇建議
+
+| 使用場景 | 建議 AccessMode | 建議 StorageClass |
+|---------|----------------|------------------|
+| 單一 VM 根磁碟 | ReadWriteOnce | Ceph RBD、LVM |
+| Golden Image（多 VM 同時讀）| ReadWriteMany | CephFS、NFS |
+| Live Migration（VM 需跨節點）| ReadWriteMany | CephFS、NFS |
+| 高效能資料庫 | ReadWriteOnce | Ceph RBD（rwo）+ 高速 SSD |
+
+<Callout type="warning" title="WaitForFirstConsumer 與 DataVolume">
+若 StorageClass 使用 `volumeBindingMode: WaitForFirstConsumer`，DataVolume 的 PVC 不會立即綁定，而是等到 VM Pod 排程到特定 node 後才綁定。DataVolume 的 phase 會停在 `WaitForFirstConsumer`，這是正常現象，不是錯誤。
+</Callout>

@@ -1,0 +1,287 @@
+---
+layout: doc
+title: Cluster API Provider MAAS — Machine 服務實作
+description: 深入解析 CAPM Machine 服務的 Allocate、Deploy、Release 完整流程，包含錯誤處理與 defer 回滾機制。
+---
+
+# Machine 服務實作
+
+<Callout type="info" title="相關章節">
+- [Machine 生命週期](/cluster-api-provider-maas/features/machine-lifecycle)
+- [MAAS Client 介面](/cluster-api-provider-maas/features/maas-client-abstraction)
+- [Scope 設計模式](/cluster-api-provider-maas/features/scope-pattern)
+- [ProviderID 格式](/cluster-api-provider-maas/features/provider-id-format)
+</Callout>
+
+<Callout type="tip" title="本文適用對象">
+- 🟢 **初學者**：了解 CAPM 如何將一台 bare-metal 機器從空閒狀態變成 Kubernetes node。
+- 🟡 **中階工程師**：掌握 allocate/deploy 的約束條件設定與 user-data 注入機制。
+- 🔴 **資深工程師**：分析 idempotent reconcile 設計與失敗時的自動 release 機制。
+</Callout>
+
+> 📦 **類比**：Machine 服務就像酒店的前台——先確認有空房（Allocate），然後幫客人辦理入住並設定好房間（Deploy），客人退房時清空房間恢復備用（Release）。
+
+## Service 結構
+
+Machine 服務定義在 `pkg/maas/machine/machine.go`，封裝所有 MAAS machine 操作：
+
+```go
+// pkg/maas/machine/machine.go
+type Service struct {
+    scope      *scope.MachineScope
+    maasClient maasclient.ClientSetInterface
+}
+
+func NewService(machineScope *scope.MachineScope) *Service {
+    return &Service{
+        scope:      machineScope,
+        maasClient: scope.NewMaasClient(machineScope.ClusterScope),
+    }
+}
+```
+
+## GetMachine：查詢 Machine 狀態
+
+```go
+func (s *Service) GetMachine(systemID string) (*infrav1beta1.Machine, error) {
+    if systemID == "" {
+        return nil, nil
+    }
+
+    m, err := s.maasClient.Machines().Machine(systemID).Get(context.Background())
+    if err != nil {
+        return nil, err
+    }
+
+    return fromSDKTypeToMachine(m), nil
+}
+```
+
+- 若 `systemID` 為空，直接回傳 `nil, nil`（代表 machine 尚未配置）
+- 若 machine 不存在，MAAS API 回傳 404，error 會被向上傳遞
+
+## DeployMachine：配置與部署
+
+`DeployMachine` 是最核心的方法，包含完整的 allocate-then-deploy 流程：
+
+### 第一階段：確定 Failure Domain
+
+```go
+func (s *Service) DeployMachine(userDataB64 string) (_ *infrav1beta1.Machine, rerr error) {
+    mm := s.scope.MaasMachine
+
+    failureDomain := mm.Spec.FailureDomain
+    if failureDomain == nil {
+        failureDomain = s.scope.Machine.Spec.FailureDomain
+    }
+    // ...
+}
+```
+
+Failure domain（MAAS zone）的優先順序：
+1. `MaasMachine.Spec.FailureDomain`（machine 層級指定）
+2. `Machine.Spec.FailureDomain`（CAPI Machine 層級指定，由 CAPI 依 cluster failureDomains 分配）
+
+### 第二階段：Allocate（冪等設計）
+
+```go
+if s.scope.GetProviderID() == "" {
+    // 尚未配置，建立 allocator 並加入 constraints
+    allocator := s.maasClient.
+        Machines().
+        Allocator().
+        WithCPUCount(*mm.Spec.MinCPU).
+        WithMemory(*mm.Spec.MinMemoryInMB)
+
+    if failureDomain != nil {
+        allocator.WithZone(*failureDomain)
+    }
+    if mm.Spec.ResourcePool != nil {
+        allocator.WithResourcePool(*mm.Spec.ResourcePool)
+    }
+    if len(mm.Spec.Tags) > 0 {
+        allocator.WithTags(mm.Spec.Tags)
+    }
+
+    m, err = allocator.Allocate(ctx)
+    if err != nil {
+        return nil, errors.Wrapf(err, "Unable to allocate machine")
+    }
+
+    // 立即寫入 ProviderID，下次 reconcile 可跳過 allocate
+    s.scope.SetProviderID(m.SystemID(), m.Zone().Name())
+    err = s.scope.PatchObject()
+    if err != nil {
+        return nil, errors.Wrapf(err, "unable to patch machine with provider id")
+    }
+} else {
+    // 已有 ProviderID，直接取得現有 machine
+    m, err = s.maasClient.Machines().Machine(*s.scope.GetInstanceID()).Get(ctx)
+    if err != nil {
+        return nil, errors.Wrapf(err, "unable to find machine %s", *s.scope.GetInstanceID())
+    }
+}
+```
+
+**冪等設計說明**：controller reconcile 可能因為各種原因中斷並重試。`if ProviderID == ""` 的判斷確保：
+- 若第一次 reconcile 成功配置但失敗在後續步驟，下次 reconcile 不會重複 allocate
+- ProviderID 寫入後立即 patch，確保崩潰恢復後仍能找到已配置的 machine
+
+### 第三階段：失敗自動 Release
+
+```go
+defer func() {
+    if rerr != nil {
+        s.scope.Info("Attempting to release machine which failed to deploy")
+        _, err := m.Releaser().Release(ctx)
+        if err != nil {
+            log.Error(err, "Unable to release properly")
+        }
+    }
+}()
+```
+
+這個 `defer` 確保：若 deploy 過程中任何步驟失敗（`rerr != nil`），MAAS machine 會自動被 release 回 Ready pool，避免機器長時間被佔用。
+
+### 第四階段：停用 Swap
+
+```go
+noSwap := 0
+if _, err := m.Modifier().SetSwapSize(noSwap).Update(ctx); err != nil {
+    return nil, errors.Wrapf(err, "Unable to disable swap")
+}
+```
+
+Kubernetes 要求 node 關閉 swap（`kubelet` 預設拒絕 swap 啟用的 node），因此在 deploy 前先透過 MAAS API 設定 swap size 為 0。
+
+### 第五階段：部署 OS
+
+```go
+if mm.Spec.DeployInMemory {
+    s.scope.Info("Machine will be deployed in memory", "system-id", m.SystemID())
+}
+
+deployingM, err := m.Deployer().
+    SetUserData(userDataB64).
+    SetOSSystem("custom").
+    SetEphemeralDeploy(mm.Spec.DeployInMemory).
+    SetDistroSeries(mm.Spec.Image).Deploy(ctx)
+if err != nil {
+    return nil, errors.Wrapf(err, "Unable to deploy machine")
+}
+```
+
+| 部署參數 | 值 | 說明 |
+|---------|-----|------|
+| `UserData` | Base64 cloud-init script | 含 kubelet 安裝、k8s join token |
+| `OSSystem` | `"custom"` | 使用 MAAS custom image |
+| `EphemeralDeploy` | `spec.deployInMemory` | 是否部署在 RAM 中 |
+| `DistroSeries` | `spec.image` | image 名稱，如 `ubuntu/focal` |
+
+## ReleaseMachine：釋放 Machine
+
+```go
+func (s *Service) ReleaseMachine(systemID string) error {
+    ctx := context.TODO()
+
+    _, err := s.maasClient.Machines().
+        Machine(systemID).
+        Releaser().
+        Release(ctx)
+    if err != nil {
+        return errors.Wrapf(err, "Unable to release machine")
+    }
+
+    return nil
+}
+```
+
+Release 後，MAAS 會執行以下動作：
+1. 停止 machine
+2. 清除 disk（依 MAAS zone 設定決定是否做 secure erase）
+3. 將 machine 狀態改回 `Ready`，重新進入配置池
+
+## PowerOnMachine：電源管理
+
+```go
+func (s *Service) PowerOnMachine() error {
+    _, err := s.maasClient.Machines().
+        Machine(s.scope.GetSystemID()).
+        PowerManagerOn().
+        WithPowerOnComment("maas provider power on").
+        PowerOn(context.Background())
+    return err
+}
+```
+
+此方法用於 machine 已配置但電源未開啟的情況，通常發生在 MAAS machine 電源異常關閉後。
+
+## User-Data 注入機制
+
+`userDataB64` 參數是 CAPI bootstrap controller（例如 kubeadm）產生的 cloud-init 腳本，以 Base64 編碼。這個腳本通常包含：
+
+```yaml
+# cloud-init 示意（CAPI kubeadm bootstrap 產生）
+#cloud-config
+runcmd:
+  - kubeadm join <control-plane-endpoint>:6443
+      --token <bootstrap-token>
+      --discovery-token-ca-cert-hash sha256:<hash>
+```
+
+`MachineScope.GetRawBootstrapData()` 從 Kubernetes Secret 讀取這份腳本：
+
+```go
+func (m *MachineScope) GetRawBootstrapData() ([]byte, error) {
+    if m.Machine.Spec.Bootstrap.DataSecretName == nil {
+        return nil, errors.New(
+            "error retrieving bootstrap data: linked Machine's bootstrap.dataSecretName is nil")
+    }
+
+    secret := &corev1.Secret{}
+    key := types.NamespacedName{
+        Namespace: m.Machine.Namespace,
+        Name:      *m.Machine.Spec.Bootstrap.DataSecretName,
+    }
+    if err := m.client.Get(context.TODO(), key, secret); err != nil {
+        return nil, errors.Wrapf(err, "failed to retrieve bootstrap data secret")
+    }
+
+    value, ok := secret.Data["value"]
+    if !ok {
+        return nil, errors.New("error retrieving bootstrap data: secret value key is missing")
+    }
+
+    return value, nil
+}
+```
+
+## Machine 狀態機
+
+在整個 deploy 流程中，MAAS machine 會經歷以下狀態：
+
+| 狀態 | 說明 | CAPM 操作 |
+|------|------|-----------|
+| `Ready` | 已 commission，等待配置 | allocate 前 |
+| `Allocated` | 已被配置，等待 deploy | allocate 成功後 |
+| `Deploying` | 正在安裝 OS | deploy 進行中 |
+| `Deployed` | OS 安裝完成，node 執行中 | reconcile 完成後 |
+| `Releasing` | 正在釋放 | release 進行中 |
+| `Disk erasing` | 正在清除磁碟 | release 進行中 |
+| `New` | 尚未 commission | 異常狀態 |
+
+詳細狀態轉換請見 [Machine 生命週期](/cluster-api-provider-maas/features/machine-lifecycle)。
+
+## 錯誤處理策略
+
+| 錯誤情境 | 處理方式 |
+|---------|---------|
+| Allocate 失敗（無符合條件機器） | 回傳 error，controller 重試 |
+| Deploy 失敗 | defer 自動 release，回傳 error |
+| Release 失敗 | 記錄 log，但不覆蓋原始 error |
+| ProviderID patch 失敗 | 回傳 error，下次 reconcile 重新 allocate（可能 double allocate） |
+| Bootstrap data Secret 不存在 | 回傳 error，等待 bootstrap controller 建立 Secret |
+
+<Callout type="warning" title="Double Allocate 風險">
+若 `Allocate` 成功但 `PatchObject`（寫入 ProviderID）失敗，下次 reconcile 時由於 ProviderID 仍為空，會重新執行 allocate，導致前一次配置的 machine 被遺棄在 `Allocated` 狀態。需要手動從 MAAS 介面 release 這台機器。
+</Callout>

@@ -1,0 +1,221 @@
+---
+layout: doc
+title: Kube-OVN — Multi-NIC 與 Multus IPAM
+description: 透過 Multus CNI + Kube-OVN IPAM 為 Pod 提供多網卡，實現數據平面與管理平面的網路分離
+---
+
+# Multi-NIC 與 Multus IPAM
+
+<Callout type="info" title="相關章節">
+- [VPC 與 Subnet 設計](/kube-ovn/features/vpc-subnet)
+- [IPAM 設計](/kube-ovn/features/ipam)
+- [整體架構](/kube-ovn/features/architecture)
+- [Underlay 網路](/kube-ovn/features/underlay)
+</Callout>
+
+<Callout type="tip" title="本文適用對象">
+- 🟢 **初學者**：理解 Multi-NIC 的應用場景與 Multus 的角色
+- 🟡 **中階工程師**：掌握 provider 命名規則、NetworkAttachmentDefinition 設定、Pod annotation 用法
+- 🔴 **資深工程師**：深入理解 All-OVN Multi-NIC 架構、靜態 IP 分配與電信 VNF 場景
+</Callout>
+
+> 📦 **類比**：Multi-NIC 就像給伺服器插了兩張網卡——一張連 Internet（數據平面），一張連管理網（管理平面）。Multus 是「多網卡驅動管理員」，Kube-OVN 則負責為每張網卡分配 IP。
+
+## 架構：Multus as Meta-CNI
+
+在 Multi-NIC 場景中，Multus CNI 作為「meta-CNI」（CNI 的 CNI）：
+
+```
+kubelet
+  └── Multus (meta-CNI)
+        ├── Kube-OVN (primary CNI)   → eth0（主網卡，cluster 流量）
+        └── Kube-OVN (secondary CNI) → net1（次網卡，業務數據平面）
+              └── IPAM 由 Kube-OVN 管理（使用 Subnet CRD）
+```
+
+Multus 讀取 Pod 的 `k8s.v1.cni.cncf.io/networks` annotation，決定要附加哪些額外網卡（NetworkAttachmentDefinition），並依序呼叫對應的 CNI plugin。
+
+## provider 命名規則
+
+Kube-OVN 的 Multi-NIC 依賴 **provider** 名稱來識別不同的網路附件。provider 名稱格式為：
+
+```
+{NetworkAttachmentDefinition名稱}.{NetworkAttachmentDefinition所在namespace}.ovn
+```
+
+例如：
+- NetworkAttachmentDefinition 名稱為 `macvlan-conf`，位於 `kube-system` namespace
+- 對應的 Kube-OVN provider 名稱為：`macvlan-conf.kube-system.ovn`
+
+<Callout type="warning" title="provider 名稱必須完全匹配">
+Subnet 的 `spec.provider` 必須與 NetworkAttachmentDefinition 的名稱和 namespace 嚴格對應。拼錯會導致 Pod 無法獲得次網卡 IP，錯誤通常出現在 `kube-ovn-controller` 日誌中。
+</Callout>
+
+## 步驟一：建立帶 provider 的 Subnet
+
+```yaml
+apiVersion: kubeovn.io/v1
+kind: Subnet
+metadata:
+  name: data-plane-subnet
+spec:
+  protocol: IPv4
+  cidrBlock: "172.20.0.0/24"
+  gateway: "172.20.0.1"
+  provider: "data-net.kube-system.ovn"   # 對應 NetworkAttachmentDefinition
+  natOutgoing: false
+  excludeIps:
+  - "172.20.0.1"
+```
+
+此 Subnet 專門為次網卡提供 IP，與主網卡使用的 `ovn-default` Subnet 完全分離。
+
+## 步驟二：建立 NetworkAttachmentDefinition
+
+```yaml
+apiVersion: "k8s.cni.cncf.io/v1"
+kind: NetworkAttachmentDefinition
+metadata:
+  name: data-net          # 必須與 provider 中的名稱一致
+  namespace: kube-system  # 必須與 provider 中的 namespace 一致
+spec:
+  config: '{
+    "cniVersion": "0.3.1",
+    "name": "data-net",
+    "type": "kube-ovn",
+    "server_socket": "/run/openvswitch/kube-ovn-daemon.sock",
+    "provider": "data-net.kube-system.ovn"
+  }'
+```
+
+`type: kube-ovn` 告訴 Multus 使用 Kube-OVN CNI plugin 處理此附件，`provider` 欄位指向對應的 Subnet。
+
+## 步驟三：Pod 請求次網卡
+
+在 Pod spec 的 annotation 中使用 `k8s.v1.cni.cncf.io/networks` 指定要附加的 NetworkAttachmentDefinition：
+
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: multi-nic-pod
+  namespace: default
+  annotations:
+    k8s.v1.cni.cncf.io/networks: kube-system/data-net    # 格式：namespace/名稱
+spec:
+  containers:
+  - name: app
+    image: nginx:alpine
+    resources:
+      requests:
+        memory: "64Mi"
+        cpu: "100m"
+```
+
+Pod 啟動後擁有兩個網卡：
+
+```bash
+kubectl exec multi-nic-pod -- ip addr
+# eth0: 10.16.0.50/24  ← 主網卡（ovn-default Subnet）
+# net1: 172.20.0.10/24 ← 次網卡（data-plane-subnet）
+```
+
+## 靜態 IP 分配（次網卡）
+
+若需要為次網卡分配固定 IP，在 annotation 中使用 JSON 格式：
+
+```yaml
+annotations:
+  k8s.v1.cni.cncf.io/networks: |
+    [{
+      "name": "data-net",
+      "namespace": "kube-system",
+      "ips": ["172.20.0.100/24"],
+      "mac": "00:11:22:33:44:55"
+    }]
+```
+
+<Callout type="info" title="靜態 IP 需在 Subnet CIDR 範圍內">
+`ips` 中指定的靜態 IP 必須在對應 Subnet 的 `cidrBlock` 範圍內，且不能在 `excludeIps` 列表中。Kube-OVN IPAM 會驗證並標記此 IP 為已使用。
+</Callout>
+
+## 動態 IP 分配（次網卡）
+
+不指定 `ips` 時，Kube-OVN 從 Subnet 的 IPAM 池自動分配：
+
+```yaml
+annotations:
+  k8s.v1.cni.cncf.io/networks: kube-system/data-net   # 動態分配 IP
+```
+
+## 多個次網卡
+
+一個 Pod 可以同時附加多個次網卡，以逗號分隔（或使用 JSON 陣列）：
+
+```yaml
+annotations:
+  k8s.v1.cni.cncf.io/networks: "kube-system/data-net,kube-system/mgmt-net"
+```
+
+此 Pod 將有三個網卡：`eth0`（主）、`net1`（data）、`net2`（mgmt）。
+
+## All-OVN Multi-NIC
+
+當所有網卡都由 Kube-OVN 管理時（不混用其他 CNI），所有次網卡都走 OVN Logical Switch，可以充分利用 OVN 的安全策略和路由功能：
+
+```yaml
+# 主網卡 Subnet（ovn-default）
+spec:
+  provider: ovn-default   # 隱含的系統 provider
+
+# 次網卡 Subnet
+spec:
+  provider: "data-net.kube-system.ovn"
+  # 可設定獨立的 NetworkPolicy ACL
+  private: true
+  allowSubnets:
+  - 10.16.0.0/24
+```
+
+All-OVN 模式的優勢：
+- 次網卡流量也受 NetworkPolicy 保護
+- 所有網卡的流量可視化（OVN Flow 統一管理）
+- 支援跨 Subnet 路由（透過 OVN Logical Router）
+
+## 使用場景
+
+| 場景 | 主網卡用途 | 次網卡用途 |
+|------|----------|----------|
+| **電信 VNF** | 管理面（OAM）| 用戶面（User Plane）大流量 |
+| **資料庫節點** | Kubernetes 管理流量 | 儲存網路（高頻寬低延遲）|
+| **安全掃描** | 業務 cluster 流量 | 鏡像流量或 out-of-band 管理 |
+| **SR-IOV 加速** | 標準 OVN 網卡 | SR-IOV VF（bypass kernel）|
+
+## 限制與注意事項
+
+| 限制項目 | 說明 |
+|---------|------|
+| Multus 版本 | 需要 Multus v3.7+ 與 Thick Plugin 模式 |
+| 次網卡與 Service | 次網卡 IP 無法作為 Kubernetes Service Endpoint（需主網卡 IP）|
+| NetworkPolicy 覆蓋 | NetworkPolicy 預設只作用於主網卡（eth0），次網卡需在 Subnet ACL 設定 |
+| Windows 節點 | Multi-NIC 功能在 Windows 節點上支援有限 |
+| Pod 刪除順序 | Multus 需先 detach 次網卡再刪主網卡，若 Multus 異常可能遺留 IP 分配記錄 |
+
+## 排查步驟
+
+```bash
+# 確認 Multus 正確附加次網卡
+kubectl describe pod multi-nic-pod | grep -A 10 "k8s.v1.cni.cncf.io"
+
+# 查看次網卡 IP 是否正確分配
+kubectl get ip | grep multi-nic-pod
+
+# 在節點上確認 OVS port 建立
+kubectl exec -n kube-system ds/ovs-ovn -- ovs-vsctl show | grep multi-nic
+
+# 查看 Kube-OVN daemon 的 CNI 呼叫日誌
+kubectl logs -n kube-system ds/kube-ovn-cni | grep -i "net1\|secondary"
+
+# 手動測試次網卡連通性
+kubectl exec multi-nic-pod -- ping 172.20.0.1 -I net1
+```

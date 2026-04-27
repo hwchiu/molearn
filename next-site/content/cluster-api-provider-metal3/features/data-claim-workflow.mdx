@@ -1,0 +1,320 @@
+---
+layout: doc
+title: Cluster API Provider Metal3 — Metal3DataClaim 工作流
+description: 完整說明 Metal3DataClaim 的生命週期，從 Machine 建立到 per-machine Secrets 生成的全流程
+---
+
+# Metal3DataClaim 工作流
+
+<Callout type="info" title="相關章節">
+- [Data Templates 機制](/cluster-api-provider-metal3/features/data-templates)
+- [IPAM 整合](/cluster-api-provider-metal3/features/ipam)
+- [映像與部署配置](/cluster-api-provider-metal3/features/image-deployment-config)
+- [CRD：Metal3Machine](/cluster-api-provider-metal3/features/crds-machine)
+</Callout>
+
+<Callout type="tip" title="本文適用對象">
+- �� **初學者**：了解 Metal3DataTemplate、Metal3DataClaim、Metal3Data 三者的關係
+- 🟡 **中階工程師**：掌握 DataClaim 的完整生命週期與 Secret 生成的時機
+- 🔴 **資深工程師**：深入理解 per-machine index 分配機制與 template 變數展開邏輯
+</Callout>
+
+> 📦 **類比**：Metal3DataTemplate 是「菜單」（所有可能的選項），Metal3DataClaim 是「訂單」（某台機器要點什麼），Metal3Data 是「廚房做好的料理」（為這台機器生成的具體設定），最後的 Secrets 是「送到桌上的餐點」（機器實際能使用的設定檔）。
+
+## 為什麼需要 DataClaim 機制
+
+在 Kubernetes Cluster 中，每台機器需要不同的設定：
+- 不同的 IP 位址
+- 不同的 hostname
+- 不同的主機名稱、網路設定
+
+如果每台機器都要手動設定，會非常繁瑣且容易出錯。Metal3DataTemplate 提供一個「藍圖」，Metal3DataClaim 系統則自動為每台機器生成「個性化」的設定。
+
+## 三層物件關係
+
+```
+Metal3DataTemplate（藍圖，集群級別）
+  │  定義 metaData 和 networkData 的「模板」
+  │  包含變數、IP 地址池、hostname 規則
+  │
+  │  每台機器觸發一個 DataClaim ↓
+  ▼
+Metal3DataClaim（訂單，每台機器一個）
+  │  記錄「這台機器需要從哪個 template 產生設定」
+  │  Status.RenderedData 指向生成的 Metal3Data
+  │
+  │  Metal3Data controller 處理每個 DataClaim ↓
+  ▼
+Metal3Data（成品，每台機器一個）
+  │  index: 此機器在 template 中的序號（決定 IP）
+  │  Spec.MetaData: 生成的 metaData Secret 引用
+  │  Spec.NetworkData: 生成的 networkData Secret 引用
+  │
+  │  生成的 Secrets ↓
+  ├─► metaData Secret（hostname、instance-id 等）
+  └─► networkData Secret（IP 設定、路由等）
+```
+
+## 完整工作流時序
+
+```
+時間軸：
+
+T+0: CAPI 建立 Machine 物件
+     CAPM3 建立 Metal3Machine 物件
+
+T+1: Metal3Machine controller 偵測到 Spec.DataTemplate 設定
+     → 建立 Metal3DataClaim 物件
+       Metal3DataClaim.Spec.Template = {Metal3DataTemplate 的 ObjectReference}
+       Metal3DataClaim 的名稱 = Metal3Machine 名稱
+
+T+2: Metal3DataTemplate controller（metal3datatemplate_controller.go）偵測到新 DataClaim
+     → 分配一個可用的 index（從 0 開始遞增）
+     → 建立 Metal3Data 物件
+       Metal3Data.Spec.Index = <分配的 index>
+       Metal3Data.Spec.Claim = {Metal3DataClaim 的 ObjectReference}
+       Metal3Data.Spec.Template = {Metal3DataTemplate 的 ObjectReference}
+
+T+3: Metal3Data controller（metal3data_controller.go）偵測到新 Metal3Data
+     → 讀取 Metal3DataTemplate 的模板定義
+     → 使用 index 展開 IP 地址（Start IP + index * Step）
+     → 展開 hostname（Prefix + index + Suffix）
+     → 建立 metaData Secret（cloud-init meta-data）
+     → 建立 networkData Secret（Nmstate/cloud-init network-config）
+     → 更新 Metal3Data.Status.Ready = true
+
+T+4: Metal3DataTemplate controller 更新 Metal3DataClaim.Status.RenderedData
+     → 指向已生成的 Metal3Data
+
+T+5: Metal3Machine controller 偵測到 DataClaim.Status.RenderedData 已設定
+     → 讀取 Metal3Data.Spec.MetaData（Secret 引用）
+     → 讀取 Metal3Data.Spec.NetworkData（Secret 引用）
+     → 更新 Metal3Machine.Spec.MetaData = <metaData Secret 引用>
+     → 更新 Metal3Machine.Spec.NetworkData = <networkData Secret 引用>
+
+T+6: Metal3Machine controller 將 Secrets 引用設定到 BareMetalHost
+     → BMH.Spec.MetaData = {metaData Secret}
+     → BMH.Spec.NetworkData = {networkData Secret}
+     → BMH.Spec.UserData = {bootstrap data Secret}
+
+T+7: Ironic 讀取這些 Secrets 的內容
+     → 將 metaData 和 networkData 寫入 configdrive 分割區
+     → 機器啟動時 cloud-init 讀取這些設定並套用
+```
+
+## Metal3DataTemplate 範例
+
+Metal3DataTemplate 定義了展開規則：
+
+```yaml
+apiVersion: infrastructure.cluster.x-k8s.io/v1beta1
+kind: Metal3DataTemplate
+metadata:
+  name: worker-data-template
+  namespace: metal3
+spec:
+  clusterName: my-cluster
+
+  metaData:
+    strings:
+      - key: local-hostname
+        value: "worker-${index}"   # 展開為 worker-0, worker-1, ...
+    objectNames:
+      - key: name
+        object: metal3machine      # 使用 Metal3Machine 的名稱
+    indexes:
+      - key: instance-index
+        offset: 0
+        step: 1
+    fromLabels:
+      - key: rack
+        object: baremetalhost
+        label: rack                # 從 BMH 的 label 取值
+
+  networkData:
+    networks:
+      ipv4:
+        - id: "baremetal"
+          link: "eth0"
+          ipAddressFromIPPool: worker-ip-pool   # 從 IPAM 分配 IP
+          routes:
+            - network: "0.0.0.0"
+              prefix: 0
+              gateway:
+                fromIPPool: worker-ip-pool      # 從 IPAM 取得 gateway
+    services:
+      dns:
+        - "8.8.8.8"
+        - "8.8.4.4"
+    links:
+      ethernets:
+        - id: "eth0"
+          type: "phy"
+          macAddress:
+            fromHostInterface: "eth0"           # 從 BMH hardware inspection 取得 MAC
+```
+
+## Metal3DataClaim 物件
+
+Metal3DataClaim 是一個輕量的「請求」物件：
+
+```yaml
+apiVersion: infrastructure.cluster.x-k8s.io/v1beta1
+kind: Metal3DataClaim
+metadata:
+  name: worker-machine-0          # 與 Metal3Machine 同名
+  namespace: metal3
+  finalizers:
+    - metal3dataclaim.infrastructure.cluster.x-k8s.io
+  ownerReferences:
+    - apiVersion: infrastructure.cluster.x-k8s.io/v1beta1
+      kind: Metal3Machine
+      name: worker-machine-0
+spec:
+  template:
+    apiVersion: infrastructure.cluster.x-k8s.io/v1beta1
+    kind: Metal3DataTemplate
+    name: worker-data-template
+    namespace: metal3
+status:
+  # 建立完成後，指向生成的 Metal3Data
+  renderedData:
+    apiVersion: infrastructure.cluster.x-k8s.io/v1beta1
+    kind: Metal3Data
+    name: worker-machine-0-data
+    namespace: metal3
+```
+
+## Metal3Data 物件
+
+Metal3Data 是最終生成的「成品」物件：
+
+```yaml
+apiVersion: infrastructure.cluster.x-k8s.io/v1beta1
+kind: Metal3Data
+metadata:
+  name: worker-machine-0-data
+  namespace: metal3
+  ownerReferences:
+    - apiVersion: infrastructure.cluster.x-k8s.io/v1beta1
+      kind: Metal3DataTemplate
+      name: worker-data-template
+      namespace: metal3
+spec:
+  index: 2          # 此機器被分配到 index=2（第 3 台）
+  template:
+    name: worker-data-template
+    namespace: metal3
+  claim:
+    name: worker-machine-0
+    namespace: metal3
+  metaData:
+    name: worker-machine-0-metadata
+    namespace: metal3
+  networkData:
+    name: worker-machine-0-networkdata
+    namespace: metal3
+status:
+  ready: true       # Secrets 已生成完畢
+```
+
+## 生成的 Secrets 內容
+
+### metaData Secret
+
+```yaml
+apiVersion: v1
+kind: Secret
+metadata:
+  name: worker-machine-0-metadata
+  namespace: metal3
+type: Opaque
+data:
+  # base64 encoded JSON（解碼後如下）
+  metaData: |
+    {
+      "local-hostname": "worker-2",
+      "name": "worker-machine-0",
+      "instance-index": "2",
+      "rack": "rack-1"
+    }
+```
+
+### networkData Secret
+
+```yaml
+apiVersion: v1
+kind: Secret
+metadata:
+  name: worker-machine-0-networkdata
+  namespace: metal3
+type: Opaque
+data:
+  # base64 encoded Nmstate YAML（解碼後如下）
+  networkData: |
+    version: 2
+    links:
+      - id: eth0
+        type: phy
+        ethernet_mac_address: "00:11:22:33:44:55"
+    networks:
+      - id: baremetal
+        type: ipv4
+        link: eth0
+        ip_address: "192.168.1.12"   # Start(192.168.1.10) + index(2) * step(1)
+        netmask: "255.255.255.0"
+        routes:
+          - network: "0.0.0.0"
+            netmask: "0.0.0.0"
+            gateway: "192.168.1.1"
+    services:
+      - type: dns
+        address: "8.8.8.8"
+```
+
+## Index 分配機制
+
+每個 Metal3DataClaim 獲得一個唯一的 index，決定 IP 地址和其他 index-based 的值。
+
+- index 從 0 開始
+- 機器刪除時，index 被釋放
+- 新機器可以重用已釋放的 index（依照 lowest available 策略）
+
+```bash
+# 查看所有 Metal3Data 的 index 分配
+kubectl get metal3data -n metal3 \
+  -o custom-columns='NAME:.metadata.name,INDEX:.spec.index,READY:.status.ready'
+
+# 範例輸出
+NAME                    INDEX   READY
+worker-machine-0-data   0       true
+worker-machine-1-data   1       true
+worker-machine-2-data   2       true
+```
+
+## 診斷與排查
+
+```bash
+# 查看 DataClaim 是否已渲染
+kubectl get metal3dataclaims -n metal3
+# 若 status.renderedData 為空，表示 Metal3Data 尚未建立
+
+# 查看 Metal3Data 是否就緒
+kubectl get metal3data -n metal3
+# 若 status.ready 為 false，查看 status.errorMessage
+
+# 查看 Metal3DataTemplate 的 status
+kubectl describe metal3datatemplate worker-data-template -n metal3
+
+# 查看生成的 Secrets
+kubectl get secrets -n metal3 | grep -E "metadata|networkdata"
+```
+
+常見問題：
+
+| 問題 | 可能原因 | 解決方法 |
+|------|----------|----------|
+| Metal3DataClaim 沒有 renderedData | Metal3DataTemplate 不存在 | 確認 template 名稱拼寫正確 |
+| Metal3Data status.ready = false | IPAM 尚未分配 IP | 確認 IPPool 有足夠的可用 IP |
+| Secret 內容為空 | template 變數引用錯誤 | 查看 Metal3Data controller 日誌 |
+| index 衝突 | 多個 DataClaim 同時建立 | Metal3DataTemplate controller 內有並發控制，短暫重試可解決 |

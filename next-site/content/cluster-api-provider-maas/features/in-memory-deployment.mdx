@@ -1,0 +1,236 @@
+---
+layout: doc
+title: Cluster API Provider MAAS — In-Memory 部署模式
+description: 解析 CAPM 的 deployInMemory 功能，讓 MAAS 將 OS 部署到 RAM 而非磁碟，適用於 CI/CD 測試與快速部署場景。
+---
+
+# In-Memory 部署模式
+
+<Callout type="info" title="相關章節">
+- [Machine 服務實作](/cluster-api-provider-maas/features/machine-service-implementation)
+- [API 類型定義](/cluster-api-provider-maas/features/api-types)
+- [Machine 生命週期](/cluster-api-provider-maas/features/machine-lifecycle)
+</Callout>
+
+<Callout type="tip" title="本文適用對象">
+- 🟢 **初學者**：了解 in-memory 模式的概念，以及什麼場景適合使用它。
+- 🟡 **中階工程師**：掌握如何在 `MaasMachine` 設定中啟用 in-memory 部署。
+- 🔴 **資深工程師**：分析 in-memory 模式的技術細節與對 node 持久性的影響。
+</Callout>
+
+> 📦 **類比**：In-Memory 部署就像 USB 開機的 Live OS——系統直接從記憶體執行，不安裝到硬碟上。速度快，但關機後一切消失。適合需要快速啟動、不在乎資料持久性的測試環境。
+
+## 什麼是 In-Memory 部署
+
+MAAS 支援一種稱為 **Ephemeral Deploy（短暫部署）** 的模式，在這個模式下：
+
+- OS image 會被載入到機器的 RAM 中執行，而不是安裝到磁碟
+- 機器執行期間的所有資料都存放在記憶體
+- 機器 release 後，所有資料消失，磁碟保持不變
+- 下次部署時可以更快完成（不需要等待磁碟寫入）
+
+CAPM 透過 `MaasMachine.Spec.DeployInMemory` 欄位控制這個行為。
+
+## Spec 欄位定義
+
+```go
+// api/v1beta1/maasmachine_types.go
+type MaasMachineSpec struct {
+    // DeployInMemory indicates to maas to deploy machine in memory
+    // +kubebuilder:default=false
+    DeployInMemory bool `json:"deployInMemory,omitempty"`
+
+    // 其他欄位...
+    Image         string  `json:"image"`
+    MinCPU        *int    `json:"minCPU"`
+    MinMemoryInMB *int    `json:"minMemory"`
+}
+```
+
+預設值為 `false`（關閉），使用 `+kubebuilder:default=false` 確保未設定時的行為一致。
+
+## 如何啟用 In-Memory 部署
+
+在 `MaasMachineTemplate` 中設定 `deployInMemory: true`：
+
+```yaml
+# MaasMachineTemplate 啟用 in-memory 模式
+apiVersion: infrastructure.cluster.x-k8s.io/v1beta1
+kind: MaasMachineTemplate
+metadata:
+  name: test-worker-template
+spec:
+  template:
+    spec:
+      image: ubuntu/focal
+      minCPU: 2
+      minMemory: 8192   # in-memory 模式需要更多 RAM（OS 也佔用記憶體）
+      deployInMemory: true
+```
+
+<Callout type="warning" title="記憶體需求">
+In-Memory 部署模式下，OS image 本身會佔用機器的一部分 RAM。建議將 `minMemory` 設定為預期 OS 佔用 + workload 需求的總和。例如 Ubuntu Focal 約佔用 2-4GB，若 workload 需要 8GB，則應設定 `minMemory: 12288`（12GB）以上。
+</Callout>
+
+## 程式碼實作
+
+在 `DeployMachine` 中，`DeployInMemory` 欄位直接傳給 MAAS deployer：
+
+```go
+// pkg/maas/machine/machine.go
+if mm.Spec.DeployInMemory {
+    s.scope.Info("Machine will be deployed in memory", "system-id", m.SystemID())
+}
+
+deployingM, err := m.Deployer().
+    SetUserData(userDataB64).
+    SetOSSystem("custom").
+    SetEphemeralDeploy(mm.Spec.DeployInMemory).  // 關鍵設定
+    SetDistroSeries(mm.Spec.Image).
+    Deploy(ctx)
+```
+
+`SetEphemeralDeploy(true)` 會在 MAAS API 請求中加入 `ephemeral_deploy=true` 參數。
+
+## Machine 狀態中的 in-memory 標記
+
+MAAS 回傳的 machine 物件包含 `DeployedInMemory` 狀態，CAPM 在類型轉換時會保留這個資訊：
+
+```go
+// pkg/maas/machine/machine.go
+func fromSDKTypeToMachine(m maasclient.Machine) *infrav1beta1.Machine {
+    machine := &infrav1beta1.Machine{
+        ID:               m.SystemID(),
+        Hostname:         m.Hostname(),
+        State:            infrav1beta1.MachineState(m.State()),
+        Powered:          m.PowerState() == "on",
+        DeployedInMemory: m.DeployedInMemory(),  // 從 MAAS SDK 取得
+        AvailabilityZone: m.Zone().Name(),
+    }
+    return machine
+}
+```
+
+## 適用場景
+
+### CI/CD 管線測試
+
+```yaml
+# 在 CI/CD 中快速建立測試 cluster
+apiVersion: infrastructure.cluster.x-k8s.io/v1beta1
+kind: MaasMachineTemplate
+metadata:
+  name: ci-worker-template
+spec:
+  template:
+    spec:
+      image: ubuntu/focal
+      minCPU: 2
+      minMemory: 8192
+      deployInMemory: true  # 快速部署，測試完快速清理
+      resourcePool: ci-pool
+      tags:
+        - ci-ephemeral
+```
+
+CI pipeline 流程：
+1. 建立 cluster（使用 in-memory worker）
+2. 執行 integration tests
+3. 刪除 cluster → MAAS 自動 release 機器
+4. 機器回到 Ready 池，無需磁碟清除等待時間
+
+### Demo 環境快速部署
+
+```yaml
+# Demo 環境：5 分鐘內就緒
+apiVersion: infrastructure.cluster.x-k8s.io/v1beta1
+kind: MaasMachineTemplate
+metadata:
+  name: demo-worker-template
+spec:
+  template:
+    spec:
+      image: ubuntu/focal
+      minCPU: 4
+      minMemory: 16384
+      deployInMemory: true
+```
+
+### 開發測試（功能驗證）
+
+在開發新功能時，in-memory 模式可以減少等待部署的時間，讓開發者更快驗證邏輯。
+
+## In-Memory vs 標準磁碟部署對比
+
+| 面向 | In-Memory 模式 | 標準磁碟部署 |
+|------|:--------------:|:-----------:|
+| 部署速度 | ⚡ 較快（無磁碟寫入等待） | 🐢 較慢（需要 OS 安裝） |
+| 機器 release 速度 | ⚡ 極快（無需磁碟清除） | 🐢 較慢（disk erasing 步驟） |
+| 資料持久性 | ❌ 機器重啟後資料消失 | ✅ 資料保存在磁碟 |
+| 記憶體需求 | ⬆️ 更高（OS 佔用 RAM） | 一般 |
+| 適合 Stateful workloads | ❌ 不適合 | ✅ 適合 |
+| 適合 CI/CD 環境 | ✅ 最佳選擇 | 可以但浪費時間 |
+| 適合生產環境 | ❌ 不建議 | ✅ 標準做法 |
+
+## 限制與注意事項
+
+<Callout type="warning" title="生產環境不建議使用">
+In-Memory 模式下，node 的工作目錄、容器 image cache、local storage 等資料在機器非預期重啟後**全部消失**。Kubernetes 的 Stateful workloads（如 etcd、資料庫）**絕對不能**使用 in-memory 部署的 node。
+</Callout>
+
+### 已知限制
+
+| 限制 | 說明 |
+|------|------|
+| 磁碟掛載限制 | 部分 MAAS 版本對 ephemeral deploy 的 local storage 支援有限 |
+| Swap 仍需停用 | 即使是 in-memory 模式，CAPM 仍然會執行 `SetSwapSize(0)` 停用 swap |
+| MAAS 版本相依 | `DeployedInMemory()` API 的可用性依 MAAS 版本而定 |
+| 記憶體壓力 | OS image 持續佔用 RAM，workload 可用記憶體減少 |
+
+### 混合部署策略
+
+在同一個 cluster 中，可以混合使用 in-memory 和標準磁碟部署：
+
+```yaml
+# control plane：標準磁碟（需要 etcd 持久性）
+apiVersion: infrastructure.cluster.x-k8s.io/v1beta1
+kind: MaasMachineTemplate
+metadata:
+  name: cp-template
+spec:
+  template:
+    spec:
+      image: ubuntu/focal
+      minCPU: 4
+      minMemory: 8192
+      deployInMemory: false  # control plane 一定要磁碟部署
+---
+# worker：in-memory（無狀態 workload）
+apiVersion: infrastructure.cluster.x-k8s.io/v1beta1
+kind: MaasMachineTemplate
+metadata:
+  name: worker-template
+spec:
+  template:
+    spec:
+      image: ubuntu/focal
+      minCPU: 4
+      minMemory: 16384       # 更多記憶體給 OS + workload
+      deployInMemory: true   # worker 可以 in-memory
+```
+
+## 驗證 In-Memory 部署狀態
+
+```bash
+# 查看 MaasMachine 的 deployInMemory 設定
+kubectl get maasmachine <name> \
+  -o jsonpath='{.spec.deployInMemory}'
+
+# 查看 CAPM controller 的部署日誌
+kubectl logs -n capmaas-system deploy/capmaas-controller-manager \
+  | grep "deployed in memory"
+
+# 預期輸出：
+# I0101 00:00:00.000000 machine.go:xx] Machine will be deployed in memory
+#   system-id="abc123de"
+```
