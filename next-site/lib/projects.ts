@@ -272,11 +272,14 @@ export const PROJECTS: Record<ProjectId, ProjectMeta> = {
     features: [
       'architecture', 'vpc-subnet', 'ipam',
       'ovn-integration', 'controllers', 'qos-security', 'bgp',
+      'underlay', 'load-balancing', 'nat-gateway',
     ],
     featureGroups: [
       { label: '從這裡開始', icon: '🚀', slugs: ['architecture'] },
       { label: '網路模型', icon: '🌐', slugs: ['vpc-subnet', 'ipam', 'ovn-integration'] },
-      { label: '控制器與功能', icon: '⚙️', slugs: ['controllers', 'qos-security', 'bgp'] },
+      { label: 'Underlay 網路模式', icon: '🔌', slugs: ['underlay'] },
+      { label: '服務與對外連通', icon: '🌍', slugs: ['load-balancing', 'bgp', 'nat-gateway'] },
+      { label: '控制器與安全策略', icon: '⚙️', slugs: ['controllers', 'qos-security'] },
     ],
     difficulty: '🔴 進階',
     difficultyColor: 'text-red-400 bg-red-400/10 border-red-400/30',
@@ -301,13 +304,14 @@ export const PROJECTS: Record<ProjectId, ProjectMeta> = {
       ],
       intermediate: [
         { slug: 'ovn-integration', note: '深入 OVN Northbound DB 與 Kubernetes 的同步機制' },
+        { slug: 'underlay', note: '理解 Overlay 與 Underlay 網路模式的差異與選擇' },
         { slug: 'controllers', note: '研究各 Controller 的 Reconcile 邏輯' },
         { slug: 'qos-security', note: '理解 QoS 與安全策略的實作' },
       ],
       advanced: [
-        { slug: 'ovn-integration', note: '分析 OVN 邏輯拓樸與物理網路的映射' },
-        { slug: 'bgp', note: '研究 BGP 整合與跨叢集路由設計' },
-        { slug: 'controllers', note: '追蹤複雜的跨元件協作流程' },
+        { slug: 'load-balancing', note: '分析 OVN Load Balancer 取代 iptables/IPVS 的原理' },
+        { slug: 'nat-gateway', note: '研究 VPC NAT Gateway 與 EIP 的設計與高可用限制' },
+        { slug: 'bgp', note: '追蹤 BGP 整合與跨叢集路由設計' },
       ],
     },
   },

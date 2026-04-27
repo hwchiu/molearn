@@ -1,0 +1,109 @@
+---
+layout: doc
+title: Kube-OVN — Overlay 與 Underlay 網路模式
+description: ProviderNetwork 與 VLAN CRD 讓 Pod 直接接入實體網路，不需要隧道封裝
+---
+
+## 工程師面臨的問題
+
+你的資料中心裡有一批高頻交易應用，對延遲極度敏感，不接受任何隧道封裝的額外 overhead。預設的 Overlay 模式（Geneve 封裝）會在每個封包上加上 50+ bytes 的外層 header，雖然在多數場景影響不大，但對這類工作負載卻是不可接受的。Kube-OVN 的 Underlay 模式讓 Pod 直接使用 VLAN 接入實體網路，保持原生的乙太網路效能，同時仍由 OVN 管理 Logical Switch 的 ACL 與 IPAM。
+
+## Overlay 與 Underlay 的根本差異
+
+**Overlay 模式**是 Kube-OVN 的預設模式。Pod 流量在節點的 OVS 上透過 Geneve（或 VXLAN）協定封裝，在節點之間的實體網路中以隧道傳輸，目的節點解封後再送達 Pod。每個節點只需要一個對外的 uplink，網路拓樸不需要特別設計。
+
+**Underlay 模式**下，Pod 的 veth pair 直接橋接到實體網卡（或 bond 介面），OVS 在 access port 上打上 VLAN tag，讓 Pod 流量以原生的 tagged frame 送上實體交換機。實體交換機必須預先設定對應的 VLAN，Pod 的 MAC/IP 對上游路由器直接可見。
+
+| 面向 | Overlay | Underlay |
+|------|---------|---------|
+| 封裝協定 | Geneve / VXLAN | 原生 VLAN（802.1Q）|
+| 延遲 | 略高（解封裝 overhead）| 接近 bare-metal |
+| 網路設定需求 | 無特殊需求 | 交換機需設定 trunk VLAN |
+| IP 可路由性 | 需 BGP 或 LB 才能對外曝光 | Pod IP 直接在物理網路可路由 |
+| 多租戶隔離 | OVN 邏輯隔離 | VLAN 隔離（IP 不可重疊）|
+
+## ProviderNetwork CRD：映射實體網路介面
+
+Underlay 模式的入口是 `ProviderNetwork` CRD，它描述節點上用來接 Underlay 流量的實體介面：
+
+```yaml
+# 範例：定義一個 provider network 對應各節點的 eth1 介面
+apiVersion: kubeovn.io/v1
+kind: ProviderNetwork
+metadata:
+  name: net1
+spec:
+  defaultInterface: eth1          # 大多數節點使用 eth1
+  customInterfaces:               # 少數節點使用不同介面名稱
+    - interface: ens3
+      nodes:
+        - node-special-1
+  excludeNodes:                   # 不參與此 provider network 的節點
+    - gpu-node-1
+```
+
+controller 在 `handleAddOrUpdateProviderNetwork` 中處理這個 CRD：讀取 spec 後，在每個節點的 OVS 中確保對應的 bridge（例如 `br-net1`）存在，並將 `eth1` 設定為 OVS 的 uplink port，使 OVS bridge 接管該介面的流量。
+
+## VLAN CRD：指定 VLAN ID
+
+`VLAN` CRD 讓每個 Underlay Subnet 指定使用的 VLAN ID：
+
+```yaml
+apiVersion: kubeovn.io/v1
+kind: Vlan
+metadata:
+  name: vlan100
+spec:
+  id: 100                    # VLAN ID（1–4094）
+  provider: net1             # 對應的 ProviderNetwork 名稱
+```
+
+一個 ProviderNetwork 可以有多個 VLAN，每個 VLAN 對應一個獨立的 L2 domain。
+
+## Subnet 的 VLAN 繫結
+
+將 Subnet 切換到 Underlay 模式，只需在 spec 中指定 `provider` 和 `vlan`：
+
+```yaml
+apiVersion: kubeovn.io/v1
+kind: Subnet
+metadata:
+  name: underlay-prod
+spec:
+  cidrBlock: 192.168.100.0/24
+  gateway: 192.168.100.1
+  vlan: vlan100              # 繫結 VLAN CRD
+  protocol: IPv4
+  namespaces:
+    - production
+```
+
+此時 `gatewayType` 的概念不同：Underlay subnet 的 gateway 是實體交換機上的 L3 介面 IP（不是 OVN Logical Router Port），Kube-OVN 不建立對應的 Logical Router Port——OVN 只管 L2 的 Logical Switch 與 ACL，路由交給物理網路設備處理。
+
+## 節點上發生了什麼
+
+當一個 Underlay Pod 被建立，`kube-ovn-daemon` 執行以下步驟：
+
+1. 建立 veth pair，一端插入 Pod network namespace，另一端接到 OVS bridge（`br-net1`）
+2. 在 OVN NB 建立 Logical Switch Port，設定 `addresses`（MAC + IP）
+3. OVS 將這個 port 設為 access port，配置 `tag=100`（對應 VLAN ID）
+4. Pod 送出的封包在 OVS 打上 VLAN 100 tag，透過 `eth1` 送上實體交換機
+5. 實體交換機感知到 Pod 的 MAC，後續就可以直接把流量送到正確的節點
+
+<Callout type="warning" title="IP 不可重疊">
+Underlay 模式下，Pod IP 直接在實體網路中路由，不同 Subnet 的 IP 必須在整個物理 L2/L3 domain 內唯一，無法像 Overlay 模式那樣讓不同 VPC 使用相同的 CIDR。若需要 IP 重疊的多租戶隔離，應使用 Overlay 模式配合 VPC CRD。
+</Callout>
+
+## 混合模式部署
+
+同一個 Cluster 可以同時擁有 Overlay Subnet 和 Underlay Subnet，兩者共存：
+
+- 延遲敏感的工作負載（資料庫、高頻交易）使用 Underlay Subnet
+- 一般 Web 服務使用 Overlay Subnet（預設的 `ovn-cluster` VPC）
+- 兩種 Subnet 之間的東西向流量透過 OVN Logical Router 中轉
+
+<Callout type="tip" title="Underlay + BGP 的最佳組合">
+若實體交換機已配置 BGP peering，Underlay 模式搭配 BGP speaker 可以讓 Pod IP 直接出現在 BGP 路由表中，實現真正的「Pod IP 即服務 IP」，外部客戶端無需經過任何 NAT 或 LoadBalancer。詳見 [BGP 整合](/kube-ovn/features/bgp)。
+</Callout>
+
+了解 Kube-OVN 的整體架構請見 [整體架構](/kube-ovn/features/architecture)。VPC 與 Subnet 的設計細節請見 [VPC 與 Subnet CRD 設計](/kube-ovn/features/vpc-subnet)。

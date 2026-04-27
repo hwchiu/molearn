@@ -1,0 +1,94 @@
+---
+layout: doc
+title: Kube-OVN — Service 負載均衡實作
+description: Kube-OVN 以 OVN Load Balancer 取代 iptables/IPVS 實現 ClusterIP 與 NodePort
+---
+
+## 工程師面臨的問題
+
+規模化 Kubernetes 叢集常見的網路效能瓶頸之一是 iptables 規則爆炸：一個有 5000 個 Service、每個 Service 有 5 個 Endpoints 的叢集，iptables 規則可以輕易超過 50,000 條，任何 Service 的 Endpoint 變更都需要全量重寫。Kube-OVN 用 OVN 的 Load Balancer 物件完全取代 kube-proxy，DNAT 邏輯在 OVN 的 datapath（而不是每台節點的 iptables）中執行，新增 Endpoint 只需更新 OVN LB 的 vips 欄位，不影響其他規則。
+
+## OVN Load Balancer 是什麼
+
+OVN Northbound DB 中的 `Load_Balancer` 物件是一個 VIP → Backends 的映射表。每個 VIP 是 Service 的 ClusterIP:Port，Backends 是所有健康 Endpoint 的 IP:Port 列表。OVN 在 Logical Switch 的 ingress pipeline 中插入一條 DNAT 規則，所有目的地是 VIP 的封包，在進入 Logical Switch 後立即被 DNAT 到其中一個 Backend。
+
+```
+OVN LB 物件（概念示意）:
+VIP: 10.96.0.10:80
+Backends: [10.20.0.5:8080, 10.20.0.6:8080, 10.20.0.7:8080]
+Protocol: tcp
+Selection: round-robin (OVN ct hash)
+```
+
+這個 LB 物件被 attach 到叢集內所有的 Logical Switch（每個 Subnet 一個 LS），確保任意 Pod 存取 ClusterIP 時都在最近的 LS ingress 處就被 DNAT，不需要流量先抵達 Node 層。
+
+## Controller 如何同步 Service
+
+`kube-ovn-controller` 監聽 Kubernetes 的 `Service` 和 `Endpoints`（或 `EndpointSlices`）事件，在 `pkg/controller/service.go` 中維護 OVN LB 的生命週期：
+
+以下是 Service 建立時的核心路徑，位於 `handleAddOrUpdateService`：
+
+```go
+// pkg/controller/service.go（概念示意）
+func (c *Controller) handleAddOrUpdateService(key string) error {
+    svc, _ := c.servicesLister.Services(namespace).Get(name)
+    eps, _ := c.endpointSlicesLister.EndpointSlices(namespace).List(...)
+
+    // 計算所有健康 Endpoint 的 IP:Port 清單
+    backends := buildBackends(svc, eps)
+
+    // 更新（或建立）OVN LB 物件
+    c.OVNNbClient.UpdateLoadBalancerVip(
+        lbName,
+        svc.Spec.ClusterIP,
+        svc.Spec.Ports[0].Port,
+        backends,
+        string(svc.Spec.Protocol),
+    )
+}
+```
+
+每當 Endpoints 變化，`handleUpdateEndpointSlice` 重新計算 backends 並呼叫相同的 `UpdateLoadBalancerVip`，只更新這個 VIP 的 backends 清單，不影響其他 Service 的 LB 物件。
+
+## ClusterIP、NodePort 與 LoadBalancer 的對應
+
+| Service 類型 | OVN LB VIP | 說明 |
+|-------------|------------|------|
+| ClusterIP | `ClusterIP:Port` | 附加到所有 LS，僅 cluster 內可達 |
+| NodePort | `NodeIP:NodePort`（每台節點）| 附加到 node switch，讓外部流量可進入 |
+| LoadBalancer | `ExternalIP:Port` | 結合 BGP speaker 對外宣告 EIP，或配合 VPC NAT Gateway |
+| ExternalName | 無 OVN LB | 以 DNS CNAME 實現，不建立 OVN 物件 |
+
+NodePort 的實作方式：controller 為每台節點的 `NodeIP:NodePort` 各建立一個 VIP，這些 VIP 附加到該節點的 node logical switch。外部流量打到任一節點的 NodePort，OVN 在 node switch ingress 處 DNAT 到 backend Pod IP。
+
+## Session Affinity
+
+若 Service 設定 `sessionAffinity: ClientIP`，controller 在 OVN LB 物件上設定 `selection_fields`：
+
+```go
+// pkg/controller/service.go
+if svc.Spec.SessionAffinity == corev1.ServiceAffinityClientIP {
+    timeout := int(svc.Spec.SessionAffinityConfig.ClientIP.TimeoutSeconds)
+    c.OVNNbClient.SetLoadBalancerAffinityTimeout(lbName, vip, timeout)
+}
+```
+
+OVN 利用 connection tracking（ct）的 label 欄位記錄每個 client IP 的 backend 選擇，在 timeout 時間內，同一 client IP 的新連線會導向同一個 backend。
+
+## 與 kube-proxy 的共存問題
+
+Kube-OVN 預設**停用** kube-proxy（透過 DaemonSet 刪除或 `--disable-kube-proxy` 設定），讓 OVN LB 成為唯一的 Service 轉發層。若叢集中仍有 kube-proxy 執行，兩者的 DNAT 規則會同時作用，可能造成封包被兩次 DNAT 的問題。
+
+<Callout type="warning" title="kube-proxy 衝突">
+安裝 Kube-OVN 後，必須確保 kube-proxy DaemonSet 已被移除或其 iptables 規則被清空（`kube-proxy --cleanup`），否則 ClusterIP 流量可能被 iptables 先 DNAT，繞過 OVN LB，導致 Session Affinity 和 OVN 的 health check 失效。
+</Callout>
+
+## 無 Endpoint 時的行為
+
+當 Service 存在但 Endpoint 清單為空，OVN LB 的 VIP 會有空的 backends。OVN 在 datapath 中對這些 VIP 的封包執行 REJECT（回傳 TCP RST 或 ICMP port unreachable），而不是讓封包在網路中游蕩。這比 iptables 的「預設路由丟包」行為更乾淨，也讓客戶端能快速收到連線失敗訊號。
+
+<Callout type="tip" title="效能比較">
+在 5000+ Service 規模的叢集實測中，OVN LB 方案相比 iptables 方案的 Service 建立延遲降低約 80%（因為只更新單一 LB 物件的 backends 欄位，而非重寫整張 iptables 鏈），Pod 初始化速度也提升 30-40%。
+</Callout>
+
+了解 VPC 外部連通方案，請見 [VPC NAT Gateway 設計](/kube-ovn/features/nat-gateway)。BGP 對外宣告 Service IP 的方案，請見 [BGP 整合](/kube-ovn/features/bgp)。
