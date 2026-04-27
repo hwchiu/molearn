@@ -277,7 +277,7 @@ export const PROJECTS: Record<ProjectId, ProjectMeta> = {
     featureGroups: [
       { label: '從這裡開始', icon: '🚀', slugs: ['architecture'] },
       { label: '網路模型', icon: '🌐', slugs: ['vpc-subnet', 'ipam', 'ovn-integration'] },
-      { label: 'Overlay 與 Underlay', icon: '🔌', slugs: ['underlay'] },
+      { label: 'Underlay 網路模式', icon: '🔌', slugs: ['underlay'] },
       { label: '服務與對外連通', icon: '🌍', slugs: ['load-balancing', 'bgp', 'nat-gateway'] },
       { label: '控制器與安全策略', icon: '⚙️', slugs: ['controllers', 'qos-security'] },
     ],
