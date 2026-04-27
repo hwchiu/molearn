@@ -106,5 +106,77 @@
     ],
     "answer": 1,
     "explanation": "Controller 結構體中的 subnetKeyMutex keymutex.KeyMutex 為每個 subnet key 提供獨立的鎖，確保同一個 subnet 不會被兩個 worker goroutine 同時 reconcile，避免競態條件導致 OVN NB DB 狀態不一致。"
+  },
+  {
+    "id": 210,
+    "question": "Kube-OVN 的 Underlay 模式與 Overlay 模式的根本差異是什麼？",
+    "options": [
+      "Underlay 使用 VXLAN 封裝，Overlay 使用 Geneve 封裝",
+      "Underlay 模式 Pod 流量以原生 VLAN（802.1Q）直接接入實體網路，Overlay 模式在節點間建立隧道封裝",
+      "Underlay 模式只支援 IPv4，Overlay 模式支援 DualStack",
+      "Underlay 模式由 kube-proxy 管理，Overlay 模式由 OVN 管理"
+    ],
+    "answer": 1,
+    "explanation": "Overlay 模式使用 Geneve/VXLAN 隧道在節點間傳輸封包，Pod IP 不在物理網路可見。Underlay 模式的 Pod veth 橋接到 OVS bridge 並打上 VLAN tag，流量以 802.1Q 原生 tagged frame 送上實體交換機，Pod MAC/IP 對物理網路直接可見，不需解封裝，延遲接近 bare-metal。"
+  },
+  {
+    "id": 211,
+    "question": "在 Kube-OVN 的 Underlay 模式中，ProviderNetwork CRD 的 defaultInterface 欄位定義了什麼？",
+    "options": [
+      "OVN Northbound DB 的連接端點",
+      "各節點上用來承接 Underlay 流量的預設實體網路介面名稱",
+      "Pod 的預設 gateway IP",
+      "NAT Gateway Pod 使用的外部介面"
+    ],
+    "answer": 1,
+    "explanation": "ProviderNetwork 的 defaultInterface 欄位指定絕大多數節點上的實體介面名稱（如 eth1），controller 會在每個節點的 OVS 中建立對應的 bridge（如 br-net1）並將此介面設為 uplink port。對於介面名稱不同的特殊節點，可透過 customInterfaces 欄位個別指定。"
+  },
+  {
+    "id": 212,
+    "question": "Kube-OVN 用 OVN Load Balancer 取代 kube-proxy 的主要優勢是什麼？",
+    "options": [
+      "OVN LB 支援 UDP 負載均衡，iptables 不支援",
+      "新增或移除 Endpoint 時只更新單一 LB 物件的 backends 欄位，不需要全量重寫 iptables 規則鏈",
+      "OVN LB 可自動進行 TLS 終止",
+      "OVN LB 支援 HTTP/2 層級的路由"
+    ],
+    "answer": 1,
+    "explanation": "iptables/IPVS 方案在 Service 規模大時，任何 Endpoint 變化都需要重寫整張規則鏈（數萬條規則），對 Node 的 CPU 造成明顯影響。OVN LB 將每個 Service 的 VIP→Backends 映射獨立存儲，Endpoint 變化只更新對應 LB 物件，不影響其他 Service，規模可線性擴展。"
+  },
+  {
+    "id": 213,
+    "question": "當 Kubernetes Service 沒有健康的 Endpoint 時，Kube-OVN 的 OVN Load Balancer 如何處理打到 ClusterIP 的封包？",
+    "options": [
+      "封包被靜默丟棄（drop）",
+      "封包被路由到預設 gateway",
+      "OVN 回傳 TCP RST 或 ICMP port unreachable（REJECT）",
+      "封包被轉發到 kube-proxy 處理"
+    ],
+    "answer": 2,
+    "explanation": "OVN LB 的 VIP 若 backends 清單為空，OVN 在 datapath 中對這些封包執行 REJECT（回傳 TCP RST 或 ICMP port unreachable），讓客戶端立即收到連線失敗訊號。這比預設路由丟包更乾淨，避免客戶端等待 timeout。"
+  },
+  {
+    "id": 214,
+    "question": "Kube-OVN 的 VPC NAT Gateway 中，Gateway Pod 有幾張網卡？各連接到哪裡？",
+    "options": [
+      "一張網卡，連接到 VPC subnet",
+      "兩張網卡，一張連接 VPC subnet（內網），一張連接 external subnet（外網）",
+      "三張網卡，分別連接 VPC subnet、management subnet 和 external subnet",
+      "一張網卡，透過 VLAN 區分內外網流量"
+    ],
+    "answer": 1,
+    "explanation": "VPC NAT Gateway Pod 透過 Multus 掛載兩張額外網卡：第一張（VPC 側）連接到 VPC 內的 gateway subnet，使用 VPC 內的 IP（lanIp）作為 VPC 預設路由的出口；第二張（外部側）連接到 underlay external subnet，直接接入實體網路。流量從 VPC Pod 進入 Gateway Pod 的 VPC 側介面，SNAT 後從外部側介面送出。"
+  },
+  {
+    "id": 215,
+    "question": "IptablesEIP CRD 在 Kube-OVN 中實現了什麼功能？",
+    "options": [
+      "為 Service 分配一個 External IP，等同於 LoadBalancer 類型 Service",
+      "讓特定 VPC Pod 擁有固定的外部 IP，入站流量 DNAT 到 Pod，出站流量 SNAT 為該 EIP",
+      "為 Pod 分配一個叢集內部的靜態 IP",
+      "讓 Pod 直接使用 BGP 宣告自己的 IP"
+    ],
+    "answer": 1,
+    "explanation": "IptablesEIP 從 external subnet 的 CIDR 分配（或指定）一個外部 IP，controller 在 NAT Gateway Pod 上設定 iptables 規則：DNAT 讓外部流量打到 EIP 後轉到對應的 VPC Pod IP；SNAT 讓 Pod 出口流量使用 EIP 作為來源 IP。這使 Pod 擁有穩定的外部身分，跨重啟不變，滿足 IP 白名單需求。"
   }
 ]

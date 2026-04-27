@@ -1,0 +1,128 @@
+---
+layout: doc
+title: Kube-OVN — VPC NAT Gateway 與 EIP 設計
+description: 自訂 VPC 的南北向出口：NAT Gateway Pod、EIP CRD 與 IptablesEIP 的實作原理
+---
+
+## 工程師面臨的問題
+
+你為企業的三個部門建立了各自獨立的 VPC，彼此完全隔離。但各部門的應用程式需要能對外訪問 SaaS 服務，同時某些特定 Pod 需要有固定的出口 IP 以通過供應商的 IP 白名單審核。預設的 Kubernetes Service 只能做 cluster-scoped 的 LoadBalancer，無法為不同 VPC 提供獨立的出口，也無法綁定固定的外部 IP。Kube-OVN 的 VPC NAT Gateway 和 EIP CRD 正是為解決這個問題而設計。
+
+## 整體架構：Gateway Pod 作為 NAT 出口
+
+Kube-OVN 的 VPC NAT Gateway 是一個**特殊 Pod**，部署在某個節點上，扮演 VPC 的出口路由器角色。這個 Pod 有兩張網卡：
+
+- **VPC 側介面**：連接到對應 VPC 的 subnet，使用 VPC 內的一個 IP（Gateway IP）
+- **外部側介面**：連接到一個特殊的 underlay subnet（`externalSubnet`），直接接入實體網路
+
+當 VPC 內的 Pod 要訪問外部網路，流量由 OVN Logical Router 路由到 Gateway Pod 的 VPC 側介面，再由 Gateway Pod 執行 SNAT，以外部側的 IP（或 EIP）做來源 IP 出去。
+
+```
+VPC Pod → OVN LR（靜態路由到 GW）→ NAT GW Pod（SNAT）→ 實體網路
+```
+
+## VpcNatGateway CRD
+
+以下是一個 VPC NAT Gateway 的典型定義：
+
+```yaml
+apiVersion: kubeovn.io/v1
+kind: VpcNatGateway
+metadata:
+  name: gw-finance
+spec:
+  vpc: finance-vpc              # 服務的 VPC
+  subnet: finance-gw-subnet    # Gateway Pod 在 VPC 側的 subnet
+  lanIp: 10.20.0.254           # Gateway Pod 在 VPC 側的 IP
+  selector:
+    - "kubernetes.io/os: linux"
+  tolerations:
+    - operator: Exists
+```
+
+Controller（`pkg/controller/vpc_nat_gw.go`）接到這個 CRD 後：
+
+1. 建立一個 StatefulSet，Pod spec 中聲明需要兩個額外的網路 annotation（`ovn.kubernetes.io/logical_switch` 和外部 subnet）
+2. Pod 啟動後，Multus 會為它掛載第二張網卡
+3. Controller 在 VPC 的 Logical Router 上加入靜態路由：`0.0.0.0/0 → lanIp`，讓 VPC 預設流量走向 Gateway Pod
+
+## EIP CRD：固定外部 IP 綁定
+
+`IptablesEIP` CRD 允許為特定 VPC Pod 分配一個靜態的外部 IP（從 external subnet 的 CIDR 中分配）：
+
+```yaml
+apiVersion: kubeovn.io/v1
+kind: IptablesEIP
+metadata:
+  name: finance-db-eip
+spec:
+  v4ip: 203.0.113.50         # 指定外部 IP（或留空由 IPAM 自動分配）
+  macAddress: ""
+  natGwDp: gw-finance        # 使用哪個 NAT Gateway
+  externalSubnet: external   # 外部 subnet 名稱
+```
+
+下面的程式碼展示 EIP controller 如何在 NAT Gateway Pod 上設定 iptables SNAT 規則：
+
+```go
+// pkg/controller/iptables-eip.go（概念示意）
+func (c *Controller) handleAddIptablesEIP(key string) error {
+    eip, _ := c.iptablesEipsLister.Get(eipName)
+    // 1. 從 IPAM 分配外部 IP（或驗證靜態 IP 可用）
+    v4ip, _, _, err := c.ipam.GetStaticAddress(...)
+
+    // 2. 在 NAT GW Pod 上以 exec 執行 iptables 規則
+    //    ip addr add <eip>/32 on external interface
+    //    iptables -t nat -A PREROUTING -d <eip> -j DNAT --to <podIP>
+    //    iptables -t nat -A POSTROUTING -s <podIP> -j SNAT --to-source <eip>
+    c.execInNatGwPod(eip.Spec.NatGwDp, addEIPCommand(v4ip))
+    // 3. 更新 EIP status.ready = true
+}
+```
+
+EIP 啟用後，來自外部打到這個 EIP 的流量會被 DNAT 到 Pod，而 Pod 的出口流量則被 SNAT 成 EIP。Pod 的外部 IP 從此固定，不隨 Pod 重啟而改變。
+
+## IptablesDnatRule 與 SnatRule：精細的 NAT 策略
+
+除了 EIP，Kube-OVN 還提供兩個更細粒度的 CRD：
+
+**IptablesDnatRule**：將外部特定 IP:Port 的流量轉發到 VPC 內的 Pod：
+```yaml
+apiVersion: kubeovn.io/v1
+kind: IptablesDnatRule
+metadata:
+  name: expose-finance-api
+spec:
+  eip: finance-db-eip        # 使用的 EIP
+  externalPort: "443"
+  internalIp: 10.20.0.50    # VPC 內部 Pod IP
+  internalPort: "8443"
+  protocol: tcp
+  natGwDp: gw-finance
+```
+
+**IptablesSnatRule**：讓整個 VPC subnet 或特定 Pod CIDR 使用指定 EIP 出去（覆蓋預設的 SNAT 行為）：
+```yaml
+apiVersion: kubeovn.io/v1
+kind: IptablesSnatRule
+metadata:
+  name: finance-snat
+spec:
+  eip: finance-db-eip
+  internalCIDR: 10.20.0.0/24
+  natGwDp: gw-finance
+```
+
+## NAT Gateway 的高可用設計
+
+Gateway Pod 是 StatefulSet（replica = 1），是單點。若節點故障，StatefulSet 會在其他節點重建 Pod，但 EIP 的 iptables 規則需要重新設定（controller 偵測到 Pod 重啟後重播所有 NAT 規則）。
+
+<Callout type="warning" title="NAT Gateway 重啟期間的中斷">
+NAT Gateway Pod 重建期間（通常 30–60 秒），VPC 的南北向流量會中斷。若需要高可用，可以部署多個 NAT Gateway，並在 OVN LR 上設定多條 ECMP 靜態路由，讓流量在多個 Gateway 間分散。但目前 EIP 規則仍需綁定到特定的 NAT GW Pod，不支援自動 failover。
+</Callout>
+
+<Callout type="tip" title="BGP 宣告 EIP">
+結合 BGP speaker，EIP 所在的 external subnet 可以透過 BGP 宣告，讓外部路由器感知哪台節點目前持有 Gateway Pod，實現更快的路由收斂。詳見 [BGP 整合](/kube-ovn/features/bgp) 的 NatGw 模式說明。
+</Callout>
+
+了解 VPC 的基礎設計，請見 [VPC 與 Subnet CRD 設計](/kube-ovn/features/vpc-subnet)。Kube-OVN 的 Service 負載均衡方案，請見 [Service 負載均衡實作](/kube-ovn/features/load-balancing)。
