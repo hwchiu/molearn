@@ -1,0 +1,110 @@
+[
+  {
+    "id": 201,
+    "question": "Kube-OVN 的 kube-ovn-controller 透過哪個介面操作 OVN Northbound DB？",
+    "options": [
+      "直接執行 ovn-nbctl CLI 命令",
+      "透過 libovsdb client（OVNNbClient）以 OVSDB 協定操作",
+      "透過 Kubernetes API 間接更新 ConfigMap",
+      "直接寫入 etcd 中的 OVN schema"
+    ],
+    "answer": 1,
+    "explanation": "Controller 結構體中的 OVNNbClient 欄位類型為 ovs.NbClient，底層使用 libovsdb 以 OVSDB 協定直接連接 OVN Northbound DB，並在記憶體維護 NB DB 快取，避免每次操作都查詢資料庫。"
+  },
+  {
+    "id": 202,
+    "question": "在 Kube-OVN 的 VPC CRD 中，哪個欄位決定哪些 namespace 的 Pod 屬於這個 VPC？",
+    "options": [
+      "spec.defaultSubnet",
+      "spec.namespaces",
+      "spec.staticRoutes",
+      "spec.enableExternal"
+    ],
+    "answer": 1,
+    "explanation": "VpcSpec 中的 Namespaces []string 欄位明確列出可以使用此 VPC 的 namespace 清單。Controller 根據此欄位更新對應 namespace 的 annotation，讓 Pod 分配到正確的 VPC 網路。"
+  },
+  {
+    "id": 203,
+    "question": "Kube-OVN 的 IPAM 模組在 controller 重啟後如何重建 IP 分配狀態？",
+    "options": [
+      "從 OVN Southbound DB 讀取 Logical Switch Port 的 addresses 欄位重建",
+      "從 Kubernetes 中的 IP CRD 物件讀取重建記憶體 map",
+      "從 etcd 的特定 key prefix 讀取持久化的 IP 狀態",
+      "重啟後 IPAM 狀態從零開始，等待 Pod 重新申請"
+    ],
+    "answer": 1,
+    "explanation": "IPAM 是純記憶體結構，每次 IP 分配成功後 controller 會建立對應的 IP CRD（kind: IP）。Controller 重啟時從所有存在的 IP CRD 重建 PodToIP、IPToPod 等 map，確保不重複分配。"
+  },
+  {
+    "id": 204,
+    "question": "當 Subnet 的 gatewayType 設定為 centralized 且指定多個 gatewayNode 時，Kube-OVN 採用什麼機制分散出口流量？",
+    "options": [
+      "Round-robin DNS",
+      "Kubernetes Service 的 sessionAffinity",
+      "OVN Logical Router 的 ECMP（Equal-Cost Multi-Path）路由",
+      "Linux IPVS 的 weighted round-robin"
+    ],
+    "answer": 2,
+    "explanation": "指定多個 gatewayNode 時，controller 的 reconcileEcmpCentralizedSubnetRouteInDefaultVpc 函數會為每個 gateway 節點建立等價路由（ECMP），OVN Logical Router 自動在多條路徑間分散流量。"
+  },
+  {
+    "id": 205,
+    "question": "Kube-OVN 的 Security Group 底層使用 OVN 的哪兩個機制來實作？",
+    "options": [
+      "Logical Switch + Address Set",
+      "Port Group + ACL",
+      "Logical Router Policy + NAT",
+      "Load Balancer + Health Check"
+    ],
+    "answer": 1,
+    "explanation": "每個 SecurityGroup CRD 對應一個 OVN Port Group，加入同一 Security Group 的 Pod port 都會加入此 Port Group。ACL 規則附加在 Port Group 上，自動套用到所有成員 port，規則以 ovnnb.ACLDirectionToLport 和 ACLDirectionFromLport 分別控制 ingress 與 egress。"
+  },
+  {
+    "id": 206,
+    "question": "ovn.kubernetes.io/ingress_rate annotation 在 Kube-OVN 中限制的是哪個方向的流量？",
+    "options": [
+      "Pod 送出（egress）的流量",
+      "Pod 收到（ingress）的流量",
+      "Node 層級的所有入站流量",
+      "Service 的 ClusterIP 入站流量"
+    ],
+    "answer": 1,
+    "explanation": "從 Pod 視角，ingress_rate annotation 限制 Pod 收到的流量速率（單位 Mbps）。值得注意的是 daemon 實作中將 annotation 方向與 OVS interface 方向做了互換，但對使用者而言語義是「限制 Pod 收到的頻寬」。"
+  },
+  {
+    "id": 207,
+    "question": "BGP speaker 的 local 宣告策略（announcePolicyLocal）與 cluster 策略的主要差異是什麼？",
+    "options": [
+      "local 策略只宣告 IPv4 路由，cluster 策略同時宣告 IPv4 和 IPv6",
+      "local 策略只在有 Pod 實際運行的節點上宣告，cluster 策略在所有 speaker 節點宣告",
+      "local 策略使用 iBGP，cluster 策略使用 eBGP",
+      "local 策略宣告 /32 主機路由，cluster 策略宣告 subnet CIDR"
+    ],
+    "answer": 1,
+    "explanation": "subnet.go 中定義：announcePolicyLocal 讓 Pod IP 只從實際承載 Pod 的節點宣告，使流量直接到達 Pod 所在節點。announcePolicyCluster 則在所有 speaker 節點宣告，流量可能從任一節點進入再透過 OVN overlay 路由到目標 Pod。"
+  },
+  {
+    "id": 208,
+    "question": "Kube-OVN 的 IPAM GetStaticAddress 函數在遇到指定 IP 已被其他 Pod 佔用時，會回傳哪個錯誤？",
+    "options": [
+      "ErrNoAvailable",
+      "ErrNoSubnet",
+      "ErrConflict",
+      "ErrOutOfRange"
+    ],
+    "answer": 2,
+    "explanation": "pkg/ipam/ipam.go 中定義了四種 IPAM 錯誤：ErrOutOfRange（IP 超出 CIDR 範圍）、ErrConflict（IP 已被其他 Pod 佔用）、ErrNoAvailable（無可用 IP）、ErrNoSubnet（subnet 不存在）。靜態 IP 衝突時回傳 ErrConflict。"
+  },
+  {
+    "id": 209,
+    "question": "kube-ovn-controller 的 subnetKeyMutex 欄位的主要用途是什麼？",
+    "options": [
+      "對 etcd 的寫入操作加鎖，防止並發更新 CRD",
+      "確保同一個 subnet 在任何時刻只有一個 reconcile goroutine 在執行",
+      "對 OVN NB DB 的 transaction 加鎖",
+      "防止多個 controller 副本同時當選為 leader"
+    ],
+    "answer": 1,
+    "explanation": "Controller 結構體中的 subnetKeyMutex keymutex.KeyMutex 為每個 subnet key 提供獨立的鎖，確保同一個 subnet 不會被兩個 worker goroutine 同時 reconcile，避免競態條件導致 OVN NB DB 狀態不一致。"
+  }
+]

@@ -1,0 +1,171 @@
+---
+layout: doc
+title: Rook — CephCluster CRD 設計與部署設定
+description: 深入解析 CephCluster 自訂資源的關鍵欄位，以及 Rook Operator 如何將宣告轉換為實際的 Ceph 叢集。
+---
+
+## 工程師面臨的問題
+
+你在 staging 環境把 `cluster.yaml` 直接套用到 production，結果發現 mon 被調度在同一個 node、OSD 磁碟選錯、升級時資料不一致。問題的根源在於你不了解 `CephCluster` CRD 每個欄位背後的含義與預設值。
+
+---
+
+## CephCluster 的核心結構
+
+`CephCluster` 是 Rook 的根 CRD，`apiVersion: ceph.rook.io/v1`，所有 Ceph 元件都由它驅動。
+
+```yaml
+# deploy/examples/cluster.yaml
+apiVersion: ceph.rook.io/v1
+kind: CephCluster
+metadata:
+  name: rook-ceph
+  namespace: rook-ceph
+spec:
+  cephVersion:
+    image: quay.io/ceph/ceph:v20.2.1
+    allowUnsupported: false
+  dataDirHostPath: /var/lib/rook
+  mon:
+    count: 3
+    allowMultiplePerNode: false
+  mgr:
+    count: 2
+    allowMultiplePerNode: false
+  storage:
+    useAllNodes: true
+    useAllDevices: true
+```
+
+---
+
+## 關鍵欄位逐一解析
+
+### `cephVersion.image`
+
+指定 Ceph daemon 的 container image。所有元件（mon、mgr、osd、mds、rgw）都使用同一個 image。
+
+<Callout type="warning" title="生產環境請固定版本">
+避免使用 `v20` 這類浮動 tag。使用 `quay.io/ceph/ceph:v20.2.1-20260402` 這樣帶時間戳的 tag，確保每次部署的 image 內容一致。
+</Callout>
+
+### `dataDirHostPath`
+
+Ceph 的設定檔與身分識別資料（keyring、fsid）會持久化到這個 host path。
+
+```
+/var/lib/rook/
+├── rook-ceph/          ← cluster namespace
+│   ├── client.admin.keyring
+│   └── rook-ceph.config
+```
+
+<Callout type="warning" title="重新安裝前必須清除">
+如果要重建 cluster，必須先在每個 node 上刪除 `dataDirHostPath`，否則舊的 mon 身分資料會讓新 cluster 啟動失敗。
+</Callout>
+
+### `mon` 設定
+
+```yaml
+mon:
+  count: 3              # 生產環境建議 3 或 5（奇數）
+  allowMultiplePerNode: false  # 生產環境必須 false
+```
+
+`allowMultiplePerNode: false` 確保每個 node 最多一個 mon，避免單 node 宕機導致 quorum 喪失。Monitor 仲裁機制的細節請見 [OSD 與 Monitor](/rook/features/osds-monitors)。
+
+### `storage` 磁碟選擇
+
+```yaml
+storage:
+  useAllNodes: true      # 掃描所有 node
+  useAllDevices: true    # 使用所有空白磁碟
+  # 或精確指定：
+  nodes:
+    - name: "worker-01"
+      devices:
+        - name: "sdb"
+        - name: "sdc"
+```
+
+Operator 在 reconcile 時呼叫 `osd.Cluster.Start()`，掃描符合條件的磁碟並為每顆磁碟建立一個 OSD prepare Job，Job 完成後再建立 OSD Deployment。
+
+### `skipUpgradeChecks` 與升級控制
+
+```yaml
+skipUpgradeChecks: false
+waitTimeoutForHealthyOSDInMinutes: 10
+upgradeOSDRequiresHealthyPGs: false
+```
+
+升級時，Operator 在輪換 OSD pod 前會呼叫 `ceph osd ok-to-stop` 確認資料安全。`waitTimeoutForHealthyOSDInMinutes` 控制等待超時，逾時後根據 `continueUpgradeAfterChecksEvenIfNotHealthy` 決定是否強制繼續。
+
+---
+
+## StorageClassDeviceSets（PVC 型 OSD）
+
+當環境無法使用裸磁碟（例如 VM 或 Minikube）時，可改用 PVC 作為 OSD 後端：
+
+```yaml
+# deploy/examples/cluster-on-pvc.yaml
+storage:
+  storageClassDeviceSets:
+    - name: set1
+      count: 3
+      portable: true
+      volumeClaimTemplates:
+        - metadata:
+            name: data
+          spec:
+            resources:
+              requests:
+                storage: 10Gi
+            storageClassName: local-storage
+            volumeMode: Block
+            accessModes:
+              - ReadWriteOnce
+```
+
+<Callout type="info" title="portable OSD">
+`portable: true` 允許 OSD pod 在 node 失效後被調度到其他 node，前提是底層的 PVC 也能跟著遷移（例如使用 network-attached storage 的 StorageClass）。
+</Callout>
+
+---
+
+## 網路與監控設定
+
+```yaml
+network:
+  connections:
+    encryption:
+      enabled: false  # 啟用後 client 到 daemon 的傳輸加密
+    compression:
+      enabled: false
+
+monitoring:
+  enabled: false  # 需要預先安裝 Prometheus Operator
+```
+
+dashboard 預設啟用並使用 SSL（port 8443），透過 Service `rook-ceph-mgr-dashboard` 暴露。
+
+---
+
+## CephCluster 狀態追蹤
+
+Rook 在 `CephCluster.status` 欄位持續更新 cluster 的健康狀態與當前版本：
+
+```bash
+kubectl -n rook-ceph get cephcluster rook-ceph -o wide
+# NAME        DATADIRHOSTPATH   MONCOUNT   AGE   PHASE   MESSAGE          HEALTH
+# rook-ceph   /var/lib/rook     3          10m   Ready   Cluster created  HEALTH_OK
+```
+
+`PHASE` 欄位從 `Progressing` 轉變為 `Ready` 代表初次部署完成。若長時間停在 `Progressing`，應查看 `kubectl -n rook-ceph logs -l app=rook-ceph-operator` 的 Operator log 了解卡在哪個步驟。
+
+---
+
+## 延伸閱讀
+
+- [整體架構概覽](/rook/features/architecture) — 了解各元件的角色
+- [OSD 生命週期與 Monitor 仲裁](/rook/features/osds-monitors) — 深入 mon/osd 運作
+- [StorageClass 與動態佈建](/rook/features/storage-classes) — 如何讓應用使用 Rook 儲存

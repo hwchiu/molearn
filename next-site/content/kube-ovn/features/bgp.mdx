@@ -1,0 +1,118 @@
+---
+layout: doc
+title: Kube-OVN — BGP 整合
+description: Kube-OVN 如何透過 GoBGP 將 Pod IP 與 Subnet CIDR 宣告給外部路由器
+---
+
+## 工程師面臨的問題
+
+傳統 Kubernetes 服務對外需要 LoadBalancer 或 Ingress，但有些場景更直接：客戶的路由器可以直接連到 cluster，你希望特定 Pod 的 IP 直接出現在外部 BGP 路由表中，不需要 NAT 或 VIP。Kube-OVN 的 BGP speaker 元件用 GoBGP 實作了這個功能——只要在 annotation 上標記，Pod IP 或整個 subnet CIDR 就會自動宣告給鄰近路由器。
+
+## BGP Speaker 的架構
+
+`ovn-speaker` 是獨立的 DaemonSet（或 Deployment），每個節點上執行一個 GoBGP 行程，監聽 Kubernetes 事件並同步 BGP 路由表。
+
+```go
+// pkg/speaker/controller.go
+type Controller struct {
+    config *Configuration
+
+    podsLister    listerv1.PodLister
+    subnetsLister kubeovnlister.SubnetLister
+    eipLister     kubeovnlister.IptablesEIPLister
+    // ...
+}
+```
+
+```go
+// pkg/speaker/config.go（關鍵設定欄位）
+type Configuration struct {
+    ClusterAs             uint32     // 本地 AS 號
+    RouterID              net.IP     // BGP Router ID
+    NeighborAddresses     []net.IP   // IPv4 BGP peer
+    NeighborIPv6Addresses []net.IP   // IPv6 BGP peer
+    NeighborAs            uint32     // 對端 AS 號
+    AnnounceClusterIP     bool       // 是否宣告 Service ClusterIP
+    ExtendedNexthop       bool       // RFC 5549 extended next-hop
+    GracefulRestart       bool       // BGP Graceful Restart
+    PassiveMode           bool       // 被動模式（不主動發起連線）
+    BgpServer             *gobgp.BgpServer
+}
+```
+
+## 宣告策略：cluster vs local
+
+Speaker 支援兩種宣告策略，透過 subnet 的 annotation 設定：
+
+```yaml
+# 在 Subnet 上標記 BGP 宣告
+metadata:
+  annotations:
+    ovn.kubernetes.io/bgp: "true"         # cluster 策略（預設）
+    # 或
+    ovn.kubernetes.io/bgp: "local"        # local 策略
+```
+
+**cluster 策略**：每個節點的 speaker 都宣告這個 CIDR，不管本節點是否有 Pod 在這個 subnet 中。流量從任一節點進入後，OVN overlay 負責內部路由。適合需要高可用的場景。
+
+**local 策略**：只有節點上實際有 Pod 屬於這個 subnet 時，才宣告 CIDR。流量直接到達有 Pod 的節點，路徑更短，但 speaker 下線時路由自動撤銷。
+
+Pod 級別的 BGP 宣告則透過 Pod annotation：
+
+```yaml
+metadata:
+  annotations:
+    ovn.kubernetes.io/bgp: "true"   # 宣告此 Pod 的 IP
+```
+
+## reconcileRoutes：核心同步邏輯
+
+Speaker 定期呼叫 `syncSubnetRoutes`，計算出**期望宣告的 prefix 集合**，再呼叫 `reconcileRoutes` 對比當前已宣告的 prefix：
+
+```go
+// pkg/speaker/bgp.go
+func (c *Controller) reconcileRoutes(expectedPrefixes prefixMap) error {
+    // 分別處理 IPv4 和 IPv6
+    if c.config.ExtendedNexthop || len(c.config.NeighborAddresses) != 0 {
+        c.reconcileIPFamily(api.Family_AFI_IP, expectedPrefixes)
+    }
+    if c.config.ExtendedNexthop || len(c.config.NeighborIPv6Addresses) != 0 {
+        c.reconcileIPFamily(api.Family_AFI_IP6, expectedPrefixes)
+    }
+}
+```
+
+`reconcileIPFamily` 查詢 GoBGP 目前宣告的 prefix 清單（透過 `ListPath`），與期望清單做集合運算：
+
+```go
+// pkg/speaker/bgp.go
+func (c *Controller) announceAndWithdraw(expected, existing set.Set[string]) {
+    // 宣告新增的路由
+    toAdd := expected.Difference(existing)
+    for route := range toAdd {
+        c.addRoute(route)
+    }
+
+    // 撤銷不再需要的路由
+    toDel := existing.Difference(expected)
+    for route := range toDel {
+        c.delRoute(route)
+    }
+}
+```
+
+這個 reconcile 模型確保 BGP 宣告狀態始終與 Kubernetes 狀態一致，即使 speaker 重啟也會自動恢復。
+
+## Graceful Restart 與路由保護
+
+啟用 `--graceful-restart` 後，當 speaker crash 重啟時，BGP peer 會保留已學到的路由（依照 RFC 4724），避免短暫中斷導致大規模路由撤銷和重新學習。`graceful-restart-time`（預設 90 秒）是對端等待 speaker 恢復的最長時間。
+
+## NatGw 模式
+
+設定 `--nat-gw-mode` 時，speaker 會宣告 VPC NAT gateway 的 EIP，讓外部流量可以路由到特定 VPC 的出口。這讓自訂 VPC 的 NAT gateway 不需要依賴雲端 LoadBalancer，適合 bare-metal 部署。
+
+<Callout type="tip" title="Service ClusterIP 宣告">
+開啟 `--announce-cluster-ip` 後，標記 `ovn.kubernetes.io/bgp: "true"` 的 Service 其 ClusterIP 也會加入 BGP 宣告。這讓外部客戶端可以直接透過 Service IP 存取，適合內部 BGP peering 的私有網路場景。
+</Callout>
+
+了解 Kube-OVN 整體元件如何協作，請見 [整體架構](/kube-ovn/features/architecture)。VPC 的外部連通性設定，請見 [VPC 與 Subnet CRD 設計](/kube-ovn/features/vpc-subnet)。

@@ -1,0 +1,115 @@
+---
+layout: doc
+title: Kube-OVN — QoS 限速與 Security Group/ACL 實作
+description: Kube-OVN 如何透過 OVS QoS 與 OVN ACL/PortGroup 實現頻寬限速與安全群組
+---
+
+## 工程師面臨的問題
+
+平台上某個 AI 訓練 Pod 在跑分散式訓練時，消耗了所有節點出口頻寬，導致同一節點的線上服務延遲飆升。另一個常見問題是：不同租戶的 Pod 意外能互相存取，因為 NetworkPolicy 的規則太粗糙。Kube-OVN 提供兩個互補機制：**QoS 限速**在 OVS 層截流，**Security Group** 在 OVN ACL 層做精細的存取控制。
+
+## QoS 限速：annotation 驅動的 OVS 頻寬控制
+
+Kube-OVN 的 QoS 以 Pod annotation 為介面，由節點上的 `kube-ovn-daemon` 實際執行。核心 annotation：
+
+```yaml
+# 限速範例（單位：Mbps）
+metadata:
+  annotations:
+    ovn.kubernetes.io/ingress_rate: "100"   # 限制 Pod 收到的頻寬
+    ovn.kubernetes.io/egress_rate: "50"     # 限制 Pod 送出的頻寬
+    ovn.kubernetes.io/ingress_burst: "200"  # burst 容量
+    ovn.kubernetes.io/egress_burst: "100"
+```
+
+<Callout type="info" title="annotation 方向注意">
+從 Pod 的視角，`ingress` 是 Pod 收到流量（從網路進入 Pod），`egress` 是 Pod 送出流量。但底層呼叫 `ovs.SetInterfaceBandwidth` 時，OVS interface 的 ingress/egress 方向剛好相反，因此程式碼中有意識地做了交換。
+</Callout>
+
+daemon 在 Pod 建立或 annotation 更新時呼叫 `SetInterfaceBandwidth`：
+
+```go
+// pkg/daemon/controller_linux.go
+ifaceID := ovs.PodNameToPortName(podName, pod.Namespace, util.OvnProvider)
+ovsIngress := pod.Annotations[util.EgressRateAnnotation]  // 注意：方向互換
+ovsEgress  := pod.Annotations[util.IngressRateAnnotation]
+
+err = ovs.SetInterfaceBandwidth(
+    podName, pod.Namespace, ifaceID,
+    ovsIngress, ovsEgress,
+    ovsIngressBurst, ovsEgressBurst)
+```
+
+`SetInterfaceBandwidth` 底層透過 OVSDB 在對應的 OVS port 上設定 **ingress policing**（OVS 的 ingress_policing_rate）和 **egress HTB queue**（Hierarchical Token Bucket），讓核心的 tc（traffic control）子系統執行實際的流量整形。
+
+## Netem QoS：模擬網路劣化
+
+除了頻寬限速，Kube-OVN 還支援以 Linux `netem` 模擬網路問題：
+
+```yaml
+annotations:
+  ovn.kubernetes.io/netem_qos_latency: "100"   # 延遲 100ms
+  ovn.kubernetes.io/netem_qos_loss: "1"         # 1% 封包丟失
+  ovn.kubernetes.io/netem_qos_limit: "1000"     # 佇列深度
+  ovn.kubernetes.io/netem_qos_jitter: "10"      # 10ms jitter
+```
+
+這對混沌工程（chaos engineering）和網路韌性測試極為實用，不需要額外安裝工具。
+
+## Security Group：OVN ACL + Port Group 的 CRD 封裝
+
+SecurityGroup CRD 是 Kube-OVN 對 OVN ACL 機制的高層封裝。每個 SecurityGroup 對應 OVN 的一個 **Port Group**，加入同一 Security Group 的 Pod port 都會被加入這個 Port Group，ACL 規則作用在 Port Group 上，規則自動套用到所有成員。
+
+```go
+// pkg/apis/kubeovn/v1/security-group.go
+type SecurityGroupSpec struct {
+    IngressRules          []SecurityGroupRule `json:"ingressRules,omitempty"`
+    EgressRules           []SecurityGroupRule `json:"egressRules,omitempty"`
+    AllowSameGroupTraffic bool                `json:"allowSameGroupTraffic,omitempty"`
+    Tier                  int                 `json:"tier,omitempty"`
+}
+
+type SecurityGroupRule struct {
+    IPVersion           string       `json:"ipVersion"`
+    Protocol            SgProtocol   `json:"protocol,omitempty"` // tcp | udp | icmp | all
+    Priority            int          `json:"priority,omitempty"`
+    RemoteType          SgRemoteType `json:"remoteType"`  // address | securityGroup
+    RemoteSecurityGroup string       `json:"remoteSecurityGroup,omitempty"`
+    PortRangeMin        int          `json:"portRangeMin,omitempty"`
+    PortRangeMax        int          `json:"portRangeMax,omitempty"`
+    Policy              SgPolicy     `json:"policy"` // allow | drop | pass
+}
+```
+
+## Security Group Controller 的 ACL 生成流程
+
+controller（`pkg/controller/security_group.go`）收到 SecurityGroup 建立事件後：
+
+```go
+// 1. 建立 Port Group
+pgName := ovs.GetSgPortGroupName(sg.Name)
+c.OVNNbClient.CreatePortGroup(pgName, map[string]string{
+    "type": "security-group",
+    "sg":   sg.Name,
+})
+
+// 2. 生成 ingress ACL（方向：to-lport）
+c.OVNNbClient.UpdateSgACL(sg, ovnnb.ACLDirectionToLport)
+
+// 3. 生成 egress ACL（方向：from-lport）
+c.OVNNbClient.UpdateSgACL(sg, ovnnb.ACLDirectionFromLport)
+
+// 4. 若 AllowSameGroupTraffic，加入 allow-related 規則
+c.OVNNbClient.CreateSgBaseACL(sg.Name, ...)
+
+// 5. 更新 status.portGroup
+sg.Status.PortGroup = pgName
+```
+
+## RemoteType 的靈活性
+
+`RemoteType: securityGroup` 允許規則引用另一個 Security Group，這是 OVN Address Set 功能的應用：系統為每個 Security Group 維護一個 Address Set，記錄所有成員 Pod 的 IP。規則中的 remote security group 名稱直接映射到這個 Address Set，當 Pod 加入或離開 group 時，Address Set 自動更新，相關 ACL 規則無需修改。
+
+這讓你可以輕鬆表達「允許 `web-sg` 群組的 Pod 存取 `db-sg` 群組的 3306 port」，而且成員變動即時生效。
+
+了解相關的 Controller reconcile 流程，請見 [核心 Controller Reconcile 邏輯](/kube-ovn/features/controllers)。

@@ -1,0 +1,196 @@
+---
+layout: doc
+title: Rook — CSI Driver 架構與 PVC 動態佈建流程
+description: 說明 Rook 如何部署與管理 Ceph CSI Driver，以及 PVC 從申請到掛載的完整資料路徑。
+---
+
+## 工程師面臨的問題
+
+你的 pod 一直卡在 `ContainerCreating`，`kubectl describe pod` 顯示 `WaitForFirstConsumer` 或 `failed to provision volume`。你知道底層是 Rook + Ceph，但不知道 PVC 的建立到底經過哪些元件、哪個環節失敗了，更不知道該看哪支程式的 log。
+
+---
+
+## CSI Driver 的組成
+
+Rook 部署的 Ceph CSI Driver 包含兩個工作負載：
+
+### 1. CSI Plugin DaemonSet（每個 node 一個）
+
+負責實際的 volume 掛載/卸載操作：
+
+- `csi-cephfsplugin` / `csi-rbdplugin`：主要的 CSI node driver
+- `node-driver-registrar`：向 kubelet 的 plugin registry 註冊 CSI socket
+- `liveness`：提供 liveness probe endpoint
+
+### 2. CSI Provisioner Deployment（控制面）
+
+負責 volume 的生命週期管理（Create/Delete/Expand）：
+
+- `csi-cephfsplugin-provisioner` / `csi-rbdplugin-provisioner`：主要 CSI driver
+- `csi-provisioner`：監聽 PVC，呼叫 CSI CreateVolume
+- `csi-resizer`：處理 PVC 的 volume expand
+- `csi-snapshotter`：處理 VolumeSnapshot
+
+---
+
+## Rook 如何管理 CSI Driver
+
+Rook Operator 負責部署與更新 CSI Driver，透過 `ReconcileCSI` controller 管理：
+
+```go
+// pkg/operator/ceph/csi/controller.go
+const controllerName = "rook-ceph-operator-csi-controller"
+
+type ReconcileCSI struct {
+    scheme           *runtime.Scheme
+    client           client.Client
+    context          *clusterd.Context
+    opManagerContext context.Context
+    opConfig         opcontroller.OperatorConfig
+    firstCephCluster *cephv1.ClusterSpec
+}
+```
+
+CSI Driver 的各種 image、feature flag、資源限制都由 `Param` 結構統一管理：
+
+```go
+// pkg/operator/ceph/csi/spec.go
+type Param struct {
+    CSIPluginImage          string
+    RegistrarImage          string
+    ProvisionerImage        string
+    AttacherImage           string
+    SnapshotterImage        string
+    ResizerImage            string
+    EnableRBDSnapshotter    bool
+    EnableCephFSSnapshotter bool
+    EnableCSITopology       bool
+    EnableCSIEncryption     bool
+    ProvisionerReplicas     int32
+    KubeletDirPath          string
+    // ...
+}
+```
+
+這些參數可以在 Rook Operator 的 ConfigMap 中覆寫，無需修改 Operator 本身。
+
+---
+
+## PVC 動態佈建完整流程
+
+### 第一階段：CreateVolume（佈建）
+
+```
+使用者建立 PVC
+       │
+       ▼
+external-provisioner sidecar
+偵測到 PVC 的 storageClassName 對應此 CSI driver
+       │
+       ▼
+呼叫 CSI gRPC: CreateVolume(name, capacity, params)
+       │
+       ▼
+ceph-csi driver:
+  RBD  → 在 Ceph pool 建立 RBD image
+  CephFS → 在 filesystem 建立 subvolume
+       │
+       ▼
+PV 被建立，PVC 狀態變為 Bound
+```
+
+### 第二階段：NodeStageVolume / NodePublishVolume（掛載）
+
+```
+Pod 被調度到 node
+       │
+       ▼
+kubelet 呼叫 CSI node driver (NodeStageVolume)
+       │
+       ▼
+ceph-csi:
+  RBD    → rbd map（掛載 RBD image 為 block device）
+  CephFS → ceph-fuse 或 kernel client 掛載 subvolume
+       │
+       ▼
+kubelet 呼叫 NodePublishVolume
+bind mount 到 pod 的容器路徑
+       │
+       ▼
+Pod 進入 Running 狀態
+```
+
+---
+
+## Topology 感知調度
+
+啟用 CSI Topology 時，StorageClass 可以限制 volume 只在特定拓撲區域佈建：
+
+```go
+// pkg/operator/ceph/csi/spec.go
+EnableCSITopology bool
+CSIDomainLabels   string  // e.g. "topology.kubernetes.io/zone"
+```
+
+這讓 CSI driver 知道「這個 RBD image 佈建在哪個 zone 的 OSD 上」，Kubernetes scheduler 可以把 pod 調度到相同 zone，降低跨 zone 的 I/O 延遲。
+
+---
+
+## 金鑰與 Secret 管理
+
+CSI driver 需要 Ceph keyring 才能操作 pool。Rook Operator 在 cluster 建立時自動生成這些 Secret：
+
+| Secret 名稱 | 用途 |
+|------------|------|
+| `rook-csi-rbd-provisioner` | RBD provisioner 操作 pool |
+| `rook-csi-rbd-node` | RBD node plugin 掛載 volume |
+| `rook-csi-cephfs-provisioner` | CephFS provisioner 建立 subvolume |
+| `rook-csi-cephfs-node` | CephFS node plugin 掛載 subvolume |
+
+這些 Secret 在 StorageClass 的 `parameters` 中以 `csi.storage.k8s.io/provisioner-secret-name` 等 key 引用。
+
+<Callout type="warning" title="Secret namespace 必須一致">
+StorageClass 中的 secret namespace（`csi.storage.k8s.io/provisioner-secret-namespace`）必須與 Rook cluster 的 namespace 相同，否則 CSI provisioner 無法讀取 keyring，PVC 會卡在 Pending。
+</Callout>
+
+---
+
+## Volume Encryption
+
+CSI driver 支援在 volume 層級加密，金鑰由外部 KMS（Vault）管理：
+
+```yaml
+# StorageClass 啟用加密
+parameters:
+  encrypted: "true"
+  encryptionKMSID: vault-kms
+```
+
+```go
+// pkg/operator/ceph/csi/spec.go
+EnableCSIEncryption bool
+```
+
+加密 volume 的每個 RBD image 都有獨立的加密金鑰，即使磁碟遺失，未授權者也無法讀取資料。
+
+---
+
+## 常見問題排查
+
+| 症狀 | 可能原因 | 排查位置 |
+|------|---------|---------|
+| PVC 卡在 Pending | provisioner 無法連線 Ceph | `csi-rbdplugin-provisioner` pod log |
+| Pod 卡在 ContainerCreating | node plugin 掛載失敗 | 對應 node 上的 `csi-rbdplugin` pod log |
+| Volume expand 無效 | csi-resizer 未啟動 | `csi-rbdplugin-provisioner` 中的 `csi-resizer` container |
+
+<Callout type="info" title="查看 CSI driver 版本">
+`kubectl -n rook-ceph get pods -l app=csi-rbdplugin -o jsonpath='{.items[0].spec.containers[0].image}'` 可以確認實際使用的 CSI driver image 版本。
+</Callout>
+
+---
+
+## 延伸閱讀
+
+- [StorageClass 與動態佈建](/rook/features/storage-classes) — RBD/CephFS StorageClass 的完整設定
+- [整體架構概覽](/rook/features/architecture) — CSI 在整體架構的位置
+- [Rook Operator Controller Reconcile 邏輯](/rook/features/ceph-controllers) — CSI controller 的 reconcile 模式

@@ -1,0 +1,156 @@
+---
+layout: doc
+title: Rook — OSD 生命週期與 Monitor 仲裁機制
+description: 深入解析 Ceph OSD 的佈建流程、升級策略，以及 Monitor quorum 如何保障 cluster 的元資料一致性。
+---
+
+## 工程師面臨的問題
+
+一個生產 cluster 的 node 意外重啟，你發現 Ceph 的狀態從 `HEALTH_OK` 變成 `HEALTH_WARN`，甚至 `HEALTH_ERR`。是 OSD 下線？還是 Monitor quorum 喪失？兩者的症狀相似，但恢復機制完全不同。了解 OSD 與 Monitor 的運作，才能快速判斷、快速恢復。
+
+---
+
+## Monitor 仲裁機制（Quorum）
+
+### Monitor 的職責
+
+Monitor 是 Ceph cluster 的「神經中樞」，維護以下幾種 cluster map：
+
+- **OSDMap**：每顆 OSD 的狀態（up/down、in/out）與位置
+- **CRUSHmap**：資料分佈演算法的拓撲描述
+- **MonMap**：Monitor 自身的 endpoint 清單
+
+```go
+// pkg/operator/ceph/cluster/mon/mon.go
+const (
+    DefaultMonCount = 3
+    MaxMonCount     = 9
+
+    DefaultMsgr1Port int32 = 6789
+    DefaultMsgr2Port int32 = 3300  // Ceph Nautilus 引入的 msgr v2 協定
+)
+```
+
+### Quorum 計算
+
+N 個 Monitor 需要 `(N/2)+1` 個在線才能達成 quorum。生產環境通常部署 3 個（需 2 個在線），高可用環境可用 5 個（需 3 個在線）。
+
+| Monitor 數量 | 允許失效數 |
+|-------------|-----------|
+| 3           | 1         |
+| 5           | 2         |
+
+<Callout type="warning" title="偶數 Monitor 的陷阱">
+絕對不要部署偶數個 Monitor（例如 2 或 4），因為腦裂（split-brain）時雙方都無法達成多數，cluster 會完全鎖死。
+</Callout>
+
+### Rook 的 Monitor 調度保護
+
+```go
+// pkg/operator/ceph/cluster/mon/mon.go
+if c.spec.Network.IsHost() && c.spec.Mon.AllowMultiplePerNode && c.spec.Mon.Count > 1 {
+    return nil, errors.Errorf("refusing to deploy %d monitors on the same host with host networking...")
+}
+```
+
+使用 host networking 時，Rook 拒絕在同一個 node 部署多個 Monitor，防止 host 宕機造成 quorum 瞬間喪失。
+
+Monitor endpoint 的變動（pod IP 改變）會同步到 `rook-ceph-mon-endpoints` ConfigMap，CSI driver 也訂閱這份資料來維持連線。
+
+---
+
+## OSD 生命週期
+
+### 階段一：磁碟發現與佈建
+
+Rook 的 OSD 佈建分成兩個步驟：
+
+**1. OSD prepare Job**
+
+```go
+// pkg/operator/ceph/cluster/osd/osd.go
+const (
+    AppName        = "rook-ceph-osd"
+    prepareAppName = "rook-ceph-osd-prepare"
+)
+```
+
+Operator 為每顆磁碟建立一個一次性的 `rook-ceph-osd-prepare-{node}` Job，這個 Job：
+- 以 BlueStore 格式初始化磁碟（直接操作裸磁碟，繞過 filesystem）
+- 將 OSD 的 UUID、磁碟 metadata 寫入 ConfigMap
+- Job 完成後標記磁碟已就緒
+
+**2. OSD Deployment 建立**
+
+prepare Job 成功後，Operator 建立對應的 OSD Deployment：
+
+```go
+// pkg/operator/ceph/cluster/osd/osd.go
+const (
+    osdAppNameFmt              = "rook-ceph-osd-%d"
+    OsdIdLabelKey              = "ceph-osd-id"
+    cephOsdPodMinimumMemory uint64 = 2048  // 最低 2GB RAM
+)
+```
+
+每個 OSD pod 有 label `ceph-osd-id: <N>`，方便查詢特定 OSD 的 pod 狀態。
+
+### 階段二：failure domain 與 CRUSH map
+
+OSD 的拓撲資訊透過 node label 傳遞，Rook 根據這些 label 設定 Ceph CRUSH map 的 failure domain：
+
+```go
+// pkg/operator/ceph/cluster/osd/osd.go
+const (
+    FailureDomainKey = "failure-domain"
+)
+```
+
+設定 `failureDomain: host` 時，CRUSH map 確保同一份資料的不同副本不在同一個 node，host 宕機不影響資料可讀性。
+
+### 階段三：升級滾動更新
+
+升級 Ceph 版本時，Operator 對 OSD 進行 rolling update。每輪換一個 OSD 前先確認安全：
+
+```go
+// pkg/operator/ceph/cluster/osd/osd.go
+waitForHealthyPGInterval = 10 * time.Second
+waitForHealthyPGTimeout  = 15 * time.Minute
+```
+
+Operator 等待 Placement Group（PG）狀態恢復 `active+clean` 後才繼續，超時行為由 `CephCluster.spec.waitTimeoutForHealthyOSDInMinutes` 控制。
+
+### OSD 的 in/out 狀態
+
+- **up/down**：OSD 進程是否在線
+- **in/out**：OSD 是否參與資料分佈
+
+OSD 進程停止（down）後，Ceph 等待 `mon_osd_down_out_interval`（預設 600 秒）才將其標記為 out。標記為 out 後，Ceph 開始資料 rebalance，將原本在這顆 OSD 的 PG 遷移到其他 OSD。
+
+<Callout type="info" title="暫停單一 OSD 的 reconcile">
+可以在 OSD Deployment 加上 annotation `rook.io/do-not-reconcile: "true"` 讓 Operator 跳過特定 OSD，適合需要手動介入的維護場景。
+</Callout>
+
+---
+
+## 自我修復流程
+
+當 OSD pod 被意外刪除時：
+
+1. Kubernetes 的 Deployment controller 重建 pod
+2. 新 pod 掛載同一個磁碟（或 PVC），以同一個 OSD ID 重新加入 cluster
+3. Ceph 的 PG recovery 機制補齊副本
+
+Monitor 掉線時：
+
+1. `rook-ceph-mon-endpoints` ConfigMap 中的 `data` 欄位不再包含該 mon
+2. 若仍有 quorum，cluster 維持正常運作
+3. Rook mon controller 嘗試重啟 mon pod，或在健康的 node 上啟動替代 mon
+
+---
+
+## 延伸閱讀
+
+- [整體架構概覽](/rook/features/architecture) — 元件全局視角
+- [CephCluster CRD 設計](/rook/features/ceph-cluster) — mon count 與 storage 磁碟設定
+- [Rook Operator Controller Reconcile 邏輯](/rook/features/ceph-controllers) — reconcile 的完整序列

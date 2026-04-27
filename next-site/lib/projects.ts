@@ -1,6 +1,6 @@
 import path from 'path'
 
-export type ProjectId = 'cluster-api' | 'cluster-api-provider-maas' | 'cluster-api-provider-metal3'
+export type ProjectId = 'cluster-api' | 'cluster-api-provider-maas' | 'cluster-api-provider-metal3' | 'rook' | 'kube-ovn' | 'kubevirt'
 
 export interface LearningPathStep {
   slug: string
@@ -206,6 +206,160 @@ export const PROJECTS: Record<ProjectId, ProjectMeta> = {
         { slug: 'data-templates', note: '分析 Metal3DataTemplate 與 cloud-init 整合' },
         { slug: 'ipam', note: '研究 IP 位址管理與 IPAddressClaim 設計' },
         { slug: 'advanced-features', note: '探索 node-reuse、labelsync 等進階功能原始碼' },
+      ],
+    },
+  },
+  'rook': {
+    id: 'rook',
+    displayName: 'Rook',
+    shortName: 'Rook',
+    description: '雲端原生儲存協調器，將 Ceph 等分散式儲存系統轉化為 Kubernetes 原生服務',
+    githubUrl: 'https://github.com/rook/rook',
+    submodulePath: path.join(REPO_ROOT, 'rook'),
+    color: 'teal',
+    accentClass: 'border-teal-500 text-teal-400',
+    features: [
+      'architecture', 'ceph-cluster', 'storage-classes',
+      'osds-monitors', 'ceph-controllers', 's3-object-store', 'csi-driver',
+    ],
+    featureGroups: [
+      { label: '從這裡開始', icon: '🚀', slugs: ['architecture'] },
+      { label: 'Ceph 核心', icon: '🗄️', slugs: ['ceph-cluster', 'osds-monitors', 'ceph-controllers'] },
+      { label: '儲存服務', icon: '💾', slugs: ['storage-classes', 's3-object-store', 'csi-driver'] },
+    ],
+    difficulty: '🟡 中階',
+    difficultyColor: 'text-yellow-400 bg-yellow-400/10 border-yellow-400/30',
+    problemStatement: '在 Kubernetes 叢集中，Pod 需要持久化儲存，但傳統的 NFS 或本地磁碟無法滿足雲端原生的彈性與高可用性需求。Rook 把 Ceph 這套企業級分散式儲存系統包裝成 Kubernetes Operator，讓你用宣告式 YAML 管理整個儲存叢集——從磁碟格式化、Monitor 選舉到 S3 物件儲存，全部自動化。',
+    story: {
+      protagonist: '📦 平台工程師 小陳',
+      challenge: '公司的 Kubernetes 平台需要為 10 個微服務團隊提供持久化儲存。有些服務需要高效能 Block Storage（資料庫），有些需要共享 File System（報表），還有 AI 團隊需要 S3-compatible Object Storage 存訓練資料。',
+      scenes: [
+        { step: 1, icon: '🔧', actor: '小陳', action: '在每台 Node 掛上空白磁碟，部署 Rook Operator', detail: 'Rook Operator 是整個系統的大腦，它持續監控 CephCluster CRD，自動發現可用磁碟並規劃 OSD（Object Storage Daemon）部署位置。' },
+        { step: 2, icon: '🗄️', actor: 'Rook Operator', action: '建立 Ceph Monitor 仲裁叢集（通常 3 個），確保儲存 metadata 高可用', detail: 'Monitor 負責維護 Cluster Map——記錄哪些 OSD 存活、資料分佈在哪裡。這是 Ceph 的核心元件，Rook 會自動處理 Monitor 的選舉與故障替換。' },
+        { step: 3, icon: '💾', actor: 'Rook Operator', action: '為每顆磁碟部署 OSD Pod，開始接受讀寫請求', detail: 'OSD 是實際儲存資料的元件，Rook 透過 Job 自動完成磁碟格式化（BlueStore）、OSD 初始化，並注入 TLS 憑證讓各 OSD 安全通訊。' },
+        { step: 4, icon: '📋', actor: '小陳', action: '建立 CephBlockPool + StorageClass，讓開發團隊直接用 PVC 申請儲存', detail: 'StorageClass 背後是 Rook CSI Driver，PVC 建立時自動呼叫 Ceph RBD API 建立 image，並掛載到指定 Pod。讀寫延遲約 1ms，適合資料庫工作負載。' },
+        { step: 5, icon: '✅', actor: 'AI 團隊', action: '透過 CephObjectStore + S3 Endpoint 上傳訓練資料集', detail: 'Rook 部署 RGW（Rados Gateway）元件提供 S3 API，完全相容 AWS S3 SDK。AI 團隊無需改程式碼，直接把 endpoint 從 AWS S3 換成內部位址即可。' },
+      ],
+      outcome: '小陳的團隊現在用同一套 Rook 平台提供三種儲存服務。磁碟故障時 Ceph 自動重新平衡資料，MTTF（平均故障修復時間）從 4 小時降至 0（自動修復，無需人工介入）。',
+    },
+    learningPaths: {
+      beginner: [
+        { slug: 'architecture', note: '了解 Rook + Ceph 的整體架構與元件角色' },
+        { slug: 'ceph-cluster', note: '認識 CephCluster CRD 與部署設定' },
+        { slug: 'storage-classes', note: '了解如何透過 StorageClass 使用儲存' },
+      ],
+      intermediate: [
+        { slug: 'osds-monitors', note: '深入 Monitor 仲裁機制與 OSD 生命週期' },
+        { slug: 'ceph-controllers', note: '研究 Rook Operator 的 Reconcile 邏輯' },
+        { slug: 'csi-driver', note: '理解 CSI Driver 與 PVC 動態佈建流程' },
+      ],
+      advanced: [
+        { slug: 'ceph-controllers', note: '追蹤跨 Controller 的協作與狀態機' },
+        { slug: 's3-object-store', note: '研究 RGW 部署與 S3 相容層設計' },
+        { slug: 'osds-monitors', note: '分析 OSD 故障處理與資料重新平衡機制' },
+      ],
+    },
+  },
+  'kube-ovn': {
+    id: 'kube-ovn',
+    displayName: 'Kube-OVN',
+    shortName: 'KOVN',
+    description: '基於 OVN 的企業級 Kubernetes CNI，提供 VPC、子網路管理、QoS、BGP 等進階網路功能',
+    githubUrl: 'https://github.com/kubeovn/kube-ovn',
+    submodulePath: path.join(REPO_ROOT, 'kube-ovn'),
+    color: 'green',
+    accentClass: 'border-green-500 text-green-400',
+    features: [
+      'architecture', 'vpc-subnet', 'ipam',
+      'ovn-integration', 'controllers', 'qos-security', 'bgp',
+    ],
+    featureGroups: [
+      { label: '從這裡開始', icon: '🚀', slugs: ['architecture'] },
+      { label: '網路模型', icon: '🌐', slugs: ['vpc-subnet', 'ipam', 'ovn-integration'] },
+      { label: '控制器與功能', icon: '⚙️', slugs: ['controllers', 'qos-security', 'bgp'] },
+    ],
+    difficulty: '🔴 進階',
+    difficultyColor: 'text-red-400 bg-red-400/10 border-red-400/30',
+    problemStatement: '預設的 Kubernetes 網路只有一個扁平的 Pod CIDR——所有 Pod 在同一個廣播域，沒有隔離、沒有 QoS、無法精確控制 IP。Kube-OVN 在 Kubernetes 上構建了一套完整的虛擬網路基礎設施：每個 Namespace 可以有獨立的 VPC 和子網路，Pod 可以綁定靜態 IP，跨叢集流量可以走 BGP 路由，安全策略細粒度到單一 Pod。',
+    story: {
+      protagonist: '🌐 網路工程師 小林',
+      challenge: '電信公司在 Kubernetes 上部署多租戶平台，不同客戶的工作負載必須嚴格隔離。同時需要支援有狀態服務（資料庫）的固定 IP，以及 5G UPF 工作負載的低延遲高吞吐量需求。',
+      scenes: [
+        { step: 1, icon: '🏗️', actor: '小林', action: '為每個客戶建立獨立的 VPC（Virtual Private Cloud）', detail: 'Kube-OVN 的 VPC CRD 在 OVN 邏輯層建立獨立的路由器與交換機，不同 VPC 的 Pod IP 可以重疊，流量完全隔離，就像公有雲的 VPC 一樣。' },
+        { step: 2, icon: '📋', actor: '小林', action: '在每個 VPC 內建立子網路，指定 CIDR 和 Gateway', detail: 'Subnet CRD 對應 OVN 邏輯交換機，Kube-OVN 的 IPAM 模組負責從子網路 CIDR 分配 IP，支援靜態 IP（annotate Pod）和動態分配。' },
+        { step: 3, icon: '⚡', actor: 'Kube-OVN CNI', action: '為每個 Pod 配置虛擬網卡，透過 OVS Flow 實現轉發', detail: 'CNI plugin 呼叫本機 ovs-vsctl 建立 veth pair，並向 OVN Northbound DB 注冊 Logical Switch Port，OVN 自動計算並下發轉發規則到每台 Node 的 OVS。' },
+        { step: 4, icon: '🔒', actor: '小林', action: '設定 Security Policy 限制特定 Pod 只能訪問指定服務', detail: 'Kube-OVN 的 Security Group 和 ACL 直接對應到 OVN ACL 規則，在 OVS datapath 層攔截，不需要 iptables，效能更高且規則更精確。' },
+        { step: 5, icon: '📡', actor: '5G 工作負載', action: '透過 BGP 將 Pod IP 宣告到物理網路，實現直接路由', detail: 'Kube-OVN 整合 GoBGP，可以將選定的子網路透過 BGP 宣告到上游路由器，讓 5G 核心網設備直接以 IP 路由到 Pod，繞過 Node 的 NAT，延遲降低 50%。' },
+      ],
+      outcome: '小林的團隊成功在同一個 Kubernetes 叢集上服務 20 個客戶，每個客戶的 VPC 完全隔離，5G 工作負載達到亞毫秒級網路延遲，滿足電信等級 SLA 要求。',
+    },
+    learningPaths: {
+      beginner: [
+        { slug: 'architecture', note: '了解 Kube-OVN 與 OVN/OVS 的整體架構' },
+        { slug: 'vpc-subnet', note: '認識 VPC 和 Subnet CRD 的設計' },
+        { slug: 'ipam', note: '了解 IP 地址管理機制' },
+      ],
+      intermediate: [
+        { slug: 'ovn-integration', note: '深入 OVN Northbound DB 與 Kubernetes 的同步機制' },
+        { slug: 'controllers', note: '研究各 Controller 的 Reconcile 邏輯' },
+        { slug: 'qos-security', note: '理解 QoS 與安全策略的實作' },
+      ],
+      advanced: [
+        { slug: 'ovn-integration', note: '分析 OVN 邏輯拓樸與物理網路的映射' },
+        { slug: 'bgp', note: '研究 BGP 整合與跨叢集路由設計' },
+        { slug: 'controllers', note: '追蹤複雜的跨元件協作流程' },
+      ],
+    },
+  },
+  'kubevirt': {
+    id: 'kubevirt',
+    displayName: 'KubeVirt',
+    shortName: 'KV',
+    description: '在 Kubernetes 上運行虛擬機器的擴充套件，讓 VM 與容器共享同一套編排平台',
+    githubUrl: 'https://github.com/kubevirt/kubevirt',
+    submodulePath: path.join(REPO_ROOT, 'kubevirt'),
+    color: 'rose',
+    accentClass: 'border-rose-500 text-rose-400',
+    features: [
+      'architecture', 'vmi-lifecycle', 'virt-controller',
+      'virt-handler', 'vm-storage', 'vm-network', 'live-migration',
+    ],
+    featureGroups: [
+      { label: '從這裡開始', icon: '🚀', slugs: ['architecture'] },
+      { label: 'VM 生命週期', icon: '🖥️', slugs: ['vmi-lifecycle', 'virt-controller', 'virt-handler'] },
+      { label: '儲存與網路', icon: '🌐', slugs: ['vm-storage', 'vm-network'] },
+      { label: '進階功能', icon: '✈️', slugs: ['live-migration'] },
+    ],
+    difficulty: '🔴 進階',
+    difficultyColor: 'text-red-400 bg-red-400/10 border-red-400/30',
+    problemStatement: '企業的基礎設施中仍有大量虛擬機器無法輕易容器化——Legacy 應用程式、Windows 工作負載、需要完整 OS 的測試環境。KubeVirt 讓這些 VM 直接跑在 Kubernetes 上，用同一套 kubectl 管理，共用同一套網路與儲存策略，讓「容器化遷移」不再是全有全無的選擇。',
+    story: {
+      protagonist: '🖥️ 虛擬化工程師 小吳',
+      challenge: '公司決定淘汰 vSphere 平台，但有 200 台 VM 短期內無法容器化（包含 Windows Server、SAP、老舊 Java 應用）。管理層要求「今年就遷移到 Kubernetes」，但又不能打斷現有業務。',
+      scenes: [
+        { step: 1, icon: '📝', actor: '小吳', action: '把 VM 定義寫成 VirtualMachine CRD，指定 CPU、Memory、磁碟 image 路徑', detail: 'VirtualMachine 是持久的 VM 定義，類似 Deployment；VirtualMachineInstance 是實際執行的 VM，類似 Pod。關機後再開機的 VM 保留同一份定義。' },
+        { step: 2, icon: '🎮', actor: 'virt-controller', action: '收到 VM 建立請求，建立 VMI 物件並選擇最適合的 Node 排程', detail: 'virt-controller 就像 VM 的 Deployment Controller，負責確保 VM 維持期望狀態。它計算 VMI 的資源需求（含 KVM overhead），並與 Kubernetes Scheduler 協作選擇具備 KVM 能力的 Node。' },
+        { step: 3, icon: '⚙️', actor: 'virt-handler', action: '在目標 Node 上以 libvirt/KVM 啟動虛擬機器', detail: 'virt-handler 是每台 Node 上的 DaemonSet，類似 kubelet 之於 Pod。它監聽到 VMI 被排程到本機後，呼叫 virt-launcher 建立一個隔離的 QEMU 行程，使用 KVM 硬體加速。' },
+        { step: 4, icon: '🌐', actor: '小吳', action: '設定 VM 使用 Multus 附加第二張網卡直連物理網路', detail: 'KubeVirt 整合 Multus CNI，VM 可以有多個網路介面：一個走 Pod Network 連 Kubernetes 服務，一個走 SR-IOV 或 bridge 直連物理交換機，滿足低延遲需求。' },
+        { step: 5, icon: '✈️', actor: '小吳', action: '觸發 Live Migration，把執行中的 VM 搬移到另一台 Node', detail: 'KubeVirt 支援不停機的 VM 遷移，透過 QEMU 的 memory migration 功能把 VM 記憶體狀態複製到目標 Node，整個切換過程 downtime 小於 1 秒。' },
+      ],
+      outcome: '小吳的團隊在 3 個月內把 200 台 VM 遷移到 KubeVirt，現在用同一套 GitOps 流程管理 VM 和容器。vSphere 授權費用省下 40 萬美元/年。',
+    },
+    learningPaths: {
+      beginner: [
+        { slug: 'architecture', note: '了解 KubeVirt 元件架構與 VM 如何跑在 Kubernetes 上' },
+        { slug: 'vmi-lifecycle', note: '追蹤 VM 從建立到執行的完整生命週期' },
+        { slug: 'vm-storage', note: '了解 VM 磁碟與 PVC 的整合方式' },
+      ],
+      intermediate: [
+        { slug: 'virt-controller', note: '深入 virt-controller 的 Reconcile 邏輯' },
+        { slug: 'virt-handler', note: '研究 virt-handler 與 libvirt/KVM 的互動' },
+        { slug: 'vm-network', note: '理解 VM 網路模型與 Multus 整合' },
+      ],
+      advanced: [
+        { slug: 'live-migration', note: '分析 Live Migration 的實作與狀態機' },
+        { slug: 'virt-handler', note: '追蹤 QEMU 行程管理與隔離機制' },
+        { slug: 'virt-controller', note: '研究 VM 排程與資源計算的邊界條件' },
       ],
     },
   },

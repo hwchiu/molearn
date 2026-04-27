@@ -1,0 +1,122 @@
+[
+  {
+    "id": 101,
+    "question": "Rook Operator 在啟動 CephCluster 時，以下哪個元件必須最先就緒才能繼續部署其他 daemon？",
+    "options": [
+      "OSD（Object Storage Daemon）",
+      "Monitor（mon）",
+      "Manager（mgr）",
+      "CSI Driver"
+    ],
+    "answer": 1,
+    "explanation": "依照 cluster.go 的 reconcileCephDaemons() 函式序列，Monitor 必須先達成 quorum 並回傳 clusterInfo（含 FSID 與 keyring），mgr 和 OSD 才能啟動。Monitor 是整個 cluster 的元資料基礎。"
+  },
+  {
+    "id": 102,
+    "question": "生產環境中 Monitor 的數量應選哪個，才能允許最多一個 Monitor 失效而不影響 quorum？",
+    "options": [
+      "2 個",
+      "3 個",
+      "4 個",
+      "6 個"
+    ],
+    "answer": 1,
+    "explanation": "3 個 Monitor 需要 2 個在線才能達成 quorum（多數決），因此允許 1 個失效。偶數個 Monitor 容易發生腦裂，Rook 原始碼中 MaxMonCount=9 且強烈建議奇數部署。"
+  },
+  {
+    "id": 103,
+    "question": "在 CephCluster CRD 中，`dataDirHostPath` 的用途是什麼？",
+    "options": [
+      "指定 OSD 磁碟的掛載路徑",
+      "存放 Ceph 設定檔與 keyring 的 host 目錄",
+      "CSI driver socket 的存放位置",
+      "Prometheus metrics 的輸出目錄"
+    ],
+    "answer": 1,
+    "explanation": "dataDirHostPath 是 Ceph daemon 持久化設定資料的位置，包含 client.admin.keyring 和 rook-ceph.config。重建 cluster 前必須清除此目錄，否則舊的 mon 身分資料會導致新 cluster 啟動失敗。"
+  },
+  {
+    "id": 104,
+    "question": "RBD StorageClass 中設定 `imageFeatures: layering` 的主要原因是什麼？",
+    "options": [
+      "啟用 RBD image 的快照功能",
+      "相容 Linux kernel 5.3 及更舊版本的 KRBD driver",
+      "啟用跨 cluster 的 RBD mirroring",
+      "減少 RBD image 的空間佔用"
+    ],
+    "answer": 1,
+    "explanation": "imageFeatures: layering 對應 Ceph 的 bitfield 值 2，是最基本的 feature，相容 5.3 以下的 Linux kernel KRBD driver。kernel 5.4+ 可額外啟用 fast-diff、object-map 等 feature 提升效能。"
+  },
+  {
+    "id": 105,
+    "question": "OSD 完成初始化需要經過哪兩個階段，正確順序是？",
+    "options": [
+      "OSD Deployment 建立 → OSD prepare Job",
+      "OSD prepare Job → OSD Deployment 建立",
+      "PVC 建立 → OSD prepare Job → OSD Deployment",
+      "ConfigMap 初始化 → OSD Deployment 直接建立"
+    ],
+    "answer": 1,
+    "explanation": "依照 osd.go 的 Start() 函式，Operator 先為每顆磁碟建立 rook-ceph-osd-prepare Job（以 BlueStore 格式初始化磁碟），Job 成功後才建立對應的 OSD Deployment。這個兩階段設計確保磁碟初始化完整後才對外服務。"
+  },
+  {
+    "id": 106,
+    "question": "Rook CSI Driver 中，`csi-provisioner` sidecar 的主要職責是什麼？",
+    "options": [
+      "在每個 node 上掛載 volume 到 pod",
+      "監聽 PVC 建立事件並呼叫 CSI CreateVolume gRPC",
+      "管理 Ceph keyring Secret 的輪換",
+      "向 kubelet 的 plugin registry 註冊 CSI socket"
+    ],
+    "answer": 1,
+    "explanation": "csi-provisioner 是 external-provisioner，它監聽 PVC 的建立事件，當 PVC 的 storageClassName 匹配時，呼叫 CSI driver 的 CreateVolume gRPC 在 Ceph 中建立 RBD image 或 CephFS subvolume。node-driver-registrar 才是負責向 kubelet 註冊的元件。"
+  },
+  {
+    "id": 107,
+    "question": "ObjectBucketClaim（OBC）建立成功後，Rook 會自動在同一個 namespace 產生哪些資源讓應用取得 S3 credentials？",
+    "options": [
+      "ServiceAccount 和 ClusterRole",
+      "ConfigMap（含 endpoint）和 Secret（含 access key）",
+      "Ingress 和 TLSSecret",
+      "PersistentVolume 和 PersistentVolumeClaim"
+    ],
+    "answer": 1,
+    "explanation": "依照 Rook 的 Object Bucket Claim 規格，OBC 建立後會在同一個 namespace 自動產生：同名的 ConfigMap（含 BUCKET_HOST、BUCKET_PORT、BUCKET_NAME）和同名的 Secret（含 AWS_ACCESS_KEY_ID、AWS_SECRET_ACCESS_KEY），應用只需注入這兩個資源即可存取 S3。"
+  },
+  {
+    "id": 108,
+    "question": "CephObjectStore 的 `dataPool.parameters.bulk: \"true\"` 設定有何作用？",
+    "options": [
+      "啟用 data pool 的跨 zone 複製",
+      "提示 PG autoscaler 預先配置足夠的 PG 數量",
+      "限制 data pool 只接受大於 1MB 的物件",
+      "啟用 data pool 的即時壓縮"
+    ],
+    "answer": 1,
+    "explanation": "bulk: true 是給 Ceph PG autoscaler 的提示，讓它預先為大型 pool 配置完整的 PG 數量，而非等 pool 使用量增加後再漸進擴充。RGW data pool 預期會存放大量資料，因此標記為 bulk 讓 cluster 從一開始就有最佳效能。"
+  },
+  {
+    "id": 109,
+    "question": "在 `CephCluster.spec.mon` 中，`allowMultiplePerNode: false` 的作用是？",
+    "options": [
+      "禁止多個 CephCluster 部署在同一個 namespace",
+      "確保每個 node 最多只有一個 Monitor pod，防止 node 宕機造成 quorum 瞬間喪失",
+      "禁止 Monitor 跨 namespace 通訊",
+      "強制 Monitor 使用 host networking"
+    ],
+    "answer": 1,
+    "explanation": "allowMultiplePerNode: false 確保 Monitor pod 分散在不同 node。若允許多個 Monitor 在同一個 node 且該 node 宕機，可能一次失去多個 Monitor 導致 quorum 喪失。Rook 原始碼在使用 host networking 時若此設定為 true 會直接拒絕部署。"
+  },
+  {
+    "id": 110,
+    "question": "Rook 的 OSD rolling update 在輪換每個 OSD 前會執行什麼確認步驟？",
+    "options": [
+      "檢查 Kubernetes node 的 CPU 使用率",
+      "呼叫 `ceph osd ok-to-stop` 確認資料安全才繼續",
+      "備份 OSD 的 BlueStore 資料到 ConfigMap",
+      "等待新版本 OSD image 通過 ImagePullBackOff 檢查"
+    ],
+    "answer": 1,
+    "explanation": "依照 osd.go 的升級邏輯，Operator 在輪換每個 OSD 前呼叫 `ceph osd ok-to-stop` 確認停止該 OSD 後資料仍有足夠副本（所有 PG 維持 active）。等待時間由 waitForHealthyPGInterval（10s）和 waitForHealthyPGTimeout（15min）控制。"
+  }
+]

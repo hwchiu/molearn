@@ -1,0 +1,133 @@
+---
+layout: doc
+title: KubeVirt — virt-handler 與 libvirt/KVM 互動
+description: 說明 virt-handler 如何作為 node 守護程序，透過 gRPC 協調 virt-launcher，再由 libvirt 驅動 QEMU/KVM 執行虛擬機。
+---
+
+## 工程師遇到的問題
+
+VMI 已經是 `Scheduled` 狀態，virt-launcher Pod 也在 Running，但 VM 就是沒有啟動，Console 連不進去。這種情況幾乎都發生在 virt-handler 到 virt-launcher 的通訊鏈上——你必須知道 virt-handler 如何運作，才能找到斷點。
+
+## virt-handler 的定位
+
+virt-handler 是每個 node 上的 DaemonSet，只負責「本 node 上的 VMI」。它的核心架構定義在 `pkg/virt-handler/controller.go`：
+
+```go
+// pkg/virt-handler/controller.go
+type BaseController struct {
+    host                 string                 // 本 node hostname
+    vmiStore             cache.Store            // 本 node 的 VMI cache
+    domainStore          cache.Store            // libvirt domain 狀態 cache
+    podIsolationDetector isolation.PodIsolationDetector
+    launcherClients      launcherclients.LauncherClientsManager
+    migrationProxy       migrationproxy.ProxyManager
+    hypervisorRuntime    hypervisor.VirtRuntime
+}
+```
+
+virt-handler 同時 watch 兩個資料來源：
+1. **K8s API Server**：取得排程到本 node 的 VMI 物件（期望狀態）
+2. **libvirt domain 事件**：取得 QEMU 進程的真實狀態（實際狀態）
+
+它的工作就是讓這兩者收斂。
+
+## 通訊鏈：virt-handler → virt-launcher → libvirt → QEMU
+
+### 第一跳：gRPC 到 virt-launcher
+
+virt-handler 透過 Unix socket 與同 node 上的各個 virt-launcher Pod 通訊。`LauncherClientsManager` 負責維護連線池：
+
+```go
+// pkg/virt-handler/launcher-clients/
+// 每個 virt-launcher pod 對應一個 gRPC 連線
+// 連線建立後，virt-handler 即可呼叫：
+// - SyncVMI：啟動或同步 VM
+// - KillVMI：強制終止 VM
+// - SignalTargetPodCleanup：Migration 結束後清理
+```
+
+### 第二跳：virt-launcher 呼叫 libvirt
+
+virt-launcher 內的 `LibvirtDomainManager` 收到 `SyncVMI` 指令後，執行以下流程：
+
+```go
+// pkg/virt-launcher/virtwrap/manager.go
+func (l *LibvirtDomainManager) SyncVMI(
+    vmi *v1.VirtualMachineInstance,
+    allowEmulation bool,
+    options *cmdv1.VirtualMachineOptions,
+) (*api.DomainSpec, error) {
+    // Step 1: VMI spec → libvirt Domain XML
+    converter.Convert_v1_VirtualMachineInstance_To_api_Domain(vmi, domain, c)
+
+    // Step 2: 查找既有 domain 或建立新 domain
+    dom, err := l.lookupOrCreateVirDomain(domain, vmi, options)
+
+    // Step 3: 根據 domain 狀態決定動作
+    switch {
+    case cli.IsDown(domState) && !vmi.IsRunning():
+        l.startDomain(vmi, dom)  // 呼叫 libvirt CreateWithFlags
+    case cli.IsPaused(domState) && !l.paused.contains(vmi.UID):
+        dom.Resume()
+    }
+    // Step 4: 同步磁碟與網路設備
+    l.syncDisks(domain, oldSpec, dom, vmi)
+    network.Sync(domain, oldSpec, dom, vmi, domainAttachments)
+}
+```
+
+<Callout type="info" title="allowEmulation">
+若 node 沒有 KVM 硬體輔助（例如巢狀虛擬化環境），`allowEmulation=true` 會讓 QEMU 以純軟體模擬（TCG）模式運行，性能較低但可用於測試。
+</Callout>
+
+### 第三跳：libvirt 驅動 QEMU
+
+libvirt 收到指令後，根據 Domain XML 生成 QEMU 命令列，`fork()`/`exec()` 啟動 QEMU 進程。virt-launcher 使用 `libvirt.org/go/libvirt` Go binding：
+
+```go
+// pkg/virt-launcher/virtwrap/manager.go
+import "libvirt.org/go/libvirt"
+
+// libvirt flags 控制設定套用範圍
+affectDeviceLiveAndConfigLibvirtFlags =
+    libvirt.DOMAIN_DEVICE_MODIFY_LIVE | libvirt.DOMAIN_DEVICE_MODIFY_CONFIG
+```
+
+## node isolation 偵測
+
+在呼叫 virt-launcher 之前，virt-handler 必須先找到對應 Pod 的 PID namespace，這透過 `PodIsolationDetector` 實現：
+
+```go
+// pkg/virt-handler/isolation/
+// 偵測 virt-launcher pod 的 mount namespace 與 PID
+// 用於設定 network（CNI）和磁碟 mount
+```
+
+若 isolation 偵測失敗（例如 Pod 剛建立、cgroup 還沒就緒），virt-handler 會在 VMI 事件中記錄：
+
+```
+"failed to detect isolation for launcher pod: %v"
+```
+
+這是 `Scheduled` VMI 無法進入 `Running` 最常見的錯誤訊息之一。
+
+## Domain 事件回報
+
+virt-handler 不只「下指令」，也監聽 libvirt domain 事件（透過 `domainStore`），當 QEMU 進程崩潰或正常關機時，virt-handler 會更新 VMI phase：
+
+| QEMU domain 狀態 | VMI phase |
+|---|---|
+| `running` | `Running` |
+| `shut off`（正常） | `Succeeded` |
+| `crashed` | `Failed` |
+| `paused` | `Running`（VMI 仍算 Running，只是暫停） |
+
+<Callout type="tip" title="排查 VM 無法啟動">
+用 `kubectl logs -n kubevirt -l kubevirt.io=virt-handler` 查看 virt-handler 日誌；用 `kubectl logs <virt-launcher-pod>` 查看 libvirt 回傳的錯誤。兩者搭配通常能快速定位問題。
+</Callout>
+
+## 相關頁面
+
+- [整體架構](/kubevirt/features/architecture) — 元件全貌與通訊協定
+- [VMI 生命週期](/kubevirt/features/vmi-lifecycle) — Scheduled → Running 的 phase 轉換
+- [Live Migration 實作](/kubevirt/features/live-migration) — virt-handler 在 migration 中的角色

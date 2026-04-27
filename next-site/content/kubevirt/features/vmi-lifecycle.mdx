@@ -1,0 +1,104 @@
+---
+layout: doc
+title: KubeVirt — VMI 生命週期
+description: 深入解析 VirtualMachineInstance 從建立到終止的七個 phase 狀態機，以及每個轉換的觸發條件。
+---
+
+## 工程師遇到的問題
+
+你用 `kubectl get vmi` 看到一台 VM 卡在 `Scheduling` 超過五分鐘，不知道是 node 資源不夠、還是 CNI 問題、還是 image pull 失敗。要有效排查，你必須先理解 VMI phase 狀態機：每個 phase 代表什麼、誰負責推進它、以及什麼情況下會卡住。
+
+## VMI Phase 定義
+
+KubeVirt 在 `staging/src/kubevirt.io/api/core/v1/types.go` 定義了七個 phase：
+
+```go
+// staging/src/kubevirt.io/api/core/v1/types.go
+const (
+    VmPhaseUnset  VirtualMachineInstancePhase = ""
+    Pending       VirtualMachineInstancePhase = "Pending"
+    Scheduling    VirtualMachineInstancePhase = "Scheduling"
+    Scheduled     VirtualMachineInstancePhase = "Scheduled"
+    Running       VirtualMachineInstancePhase = "Running"
+    Succeeded     VirtualMachineInstancePhase = "Succeeded"
+    Failed        VirtualMachineInstancePhase = "Failed"
+    WaitingForSync VirtualMachineInstancePhase = "WaitingForSync"
+    Unknown       VirtualMachineInstancePhase = "Unknown"
+)
+```
+
+## 狀態轉換流程
+
+### 第一段：Pending → Scheduling
+
+VMI 物件建立後，virt-controller 的 VMI Controller 負責第一段轉換。此時 virt-controller 會：
+
+1. 檢查所有 `DataVolume` 是否就緒（`DataVolumesReady` condition）
+2. 若 DataVolume 未就緒，VMI 停在 `Pending`，等待 CDI 完成匯入
+3. 一旦儲存就緒，virt-controller 建立 virt-launcher Pod，VMI 進入 `Scheduling`
+
+<Callout type="info" title="WaitingForSync">
+`WaitingForSync` 是 Live Migration 情境下的特殊 phase——用於等待 target node 的 virt-handler 確認已準備好接收 VM 記憶體。一般啟動流程不會經過這個 phase。
+</Callout>
+
+### 第二段：Scheduling → Scheduled
+
+`Scheduling` 代表 virt-launcher Pod 已送出，但 Kubernetes Scheduler 尚未決定 node。一旦 Pod 進入 `Running` 狀態（代表 node 選定、image pull 完成），virt-controller 把 VMI phase 推進到 `Scheduled`，並在 `status.nodeName` 記錄 node 名稱。
+
+**卡在 Scheduling 的常見原因：**
+- Node 資源（CPU / Memory）不足，Pod Pending
+- `nodeSelector` 或 `tolerations` 設定讓 Pod 無法排程
+- virt-launcher container image 無法 pull
+
+### 第三段：Scheduled → Running
+
+這段由 **virt-handler**（node daemon）驅動。virt-handler watch 到本 node 上出現新的 `Scheduled` VMI 後：
+
+1. 透過 gRPC 呼叫 virt-launcher 的 `SyncVMI`
+2. virt-launcher 把 VMI spec 轉成 libvirt domain XML，呼叫 libvirt 啟動 QEMU 進程
+3. QEMU domain 進入 `running` 狀態後，virt-handler 把 VMI phase 更新為 `Running`
+
+```go
+// pkg/virt-handler/controller.go（概念流程）
+func (c *BaseController) syncVMI(vmi *v1.VirtualMachineInstance) {
+    // 確認 isolation（確保 launcher pod PID 存在）
+    // 建立 gRPC 連線到 virt-launcher
+    // 呼叫 SyncVMI → libvirt 啟動 domain
+    // 監聽 domain 狀態，更新 VMI phase
+}
+```
+
+### 終止：Running → Succeeded / Failed
+
+| 終止方式 | 觸發 | 最終 phase |
+|---|---|---|
+| 正常關機（VM 內部 `shutdown`） | QEMU domain 進入 `shut off`，virt-handler 偵測到 | `Succeeded` |
+| VM 崩潰（QEMU panic） | QEMU domain 進入 `crashed`，virt-handler 偵測到 | `Failed` |
+| 強制刪除（`kubectl delete vmi`） | DeletionTimestamp 設定，virt-handler 呼叫 KillVMI | `Succeeded`（graceful）或 `Failed` |
+
+<Callout type="warning" title="VM 與 VMI 的差異">
+`VirtualMachine`（VM）物件有 `RunStrategy`。若 strategy 為 `Always`，VM Controller 會在 VMI 進入 `Succeeded` 或 `Failed` 後自動重建新的 VMI——VM 層永遠嘗試維持 VM 運行，VMI 層才是真正的執行實例。
+</Callout>
+
+## Phase 判斷 helper
+
+KubeVirt API 提供 helper method 方便判斷：
+
+```go
+// staging/src/kubevirt.io/api/core/v1/types.go
+func (v *VirtualMachineInstance) IsRunning() bool {
+    return v.Status.Phase == Running
+}
+func (v *VirtualMachineInstance) IsFinal() bool {
+    return v.Status.Phase == Failed || v.Status.Phase == Succeeded
+}
+func (v *VirtualMachineInstance) IsScheduling() bool {
+    return v.Status.Phase == Scheduling
+}
+```
+
+## 相關頁面
+
+- [整體架構](/kubevirt/features/architecture) — 各元件職責
+- [virt-controller Reconcile 邏輯](/kubevirt/features/virt-controller) — VMI controller 詳細邏輯
+- [virt-handler 與 libvirt/KVM 互動](/kubevirt/features/virt-handler) — Scheduled → Running 的執行細節

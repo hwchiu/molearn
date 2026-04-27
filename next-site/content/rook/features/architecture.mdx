@@ -1,0 +1,134 @@
+---
+layout: doc
+title: Rook — 整體架構概覽
+description: 說明 Rook 如何將 Ceph 分散式儲存系統整合進 Kubernetes，以及各核心元件之間的協作關係。
+---
+
+## 工程師面臨的問題
+
+你的 Kubernetes 平台需要持久化儲存，但 hostPath 沒有高可用性，NFS 有單點故障風險，雲端廠商的 block storage 又鎖定在特定平台。你需要一個能「自我管理、自我修復」的儲存層，還要用 Kubernetes 原生的方式宣告它。
+
+Rook 正是為此而生。
+
+---
+
+## Rook 是什麼
+
+Rook 是 CNCF 的 graduated 專案，定位是 **Kubernetes 的 Cloud-Native Storage Orchestrator**。它本身不提供儲存能力，而是透過 Kubernetes Operator 模式，管理 [Ceph](https://ceph.com/) 這套分散式儲存系統的整個生命週期。
+
+```
+Kubernetes 使用者
+     │
+     │  kubectl apply -f cluster.yaml
+     ▼
+CephCluster CRD ──► Rook Operator
+                         │
+           ┌─────────────┼─────────────┐
+           ▼             ▼             ▼
+        Monitor        Manager       OSD
+       (mon pod)      (mgr pod)   (osd pod)
+```
+
+---
+
+## 核心架構層次
+
+### 1. Rook Operator（控制面）
+
+Rook Operator 是一組 controller，以 Deployment 的形式運行在 `rook-ceph` namespace。它監聽各種 CRD（`CephCluster`、`CephBlockPool`、`CephObjectStore` 等），驅動 Ceph 元件達到宣告的目標狀態。
+
+```go
+// pkg/operator/ceph/cluster/controller.go
+var objectsToWatch = []client.Object{
+    &appsv1.Deployment{...},
+    &corev1.Service{...},
+    &corev1.Secret{...},
+    &corev1.ConfigMap{...},
+}
+```
+
+Operator 不只監聽 CRD，也監聽 Deployment、Service、Secret、ConfigMap — 當 Ceph pod 意外消失時，reconcile loop 會自動重建它。
+
+### 2. Ceph 儲存平面
+
+Ceph 本身由三種核心 daemon 組成：
+
+- **Monitor（mon）**：維護 cluster map，負責仲裁機制。生產環境需 3 或 5 個，以奇數確保 quorum。
+- **Manager（mgr）**：提供 Ceph Dashboard、Prometheus metrics、編排模組，通常部署 2 個（active + standby）。
+- **OSD（Object Storage Daemon）**：實際寫入磁碟資料，每顆磁碟對應一個 OSD pod。
+
+### 3. CSI Driver（資料路徑）
+
+Rook 透過 [Ceph CSI Driver](https://github.com/ceph/ceph-csi) 將 Ceph 的儲存能力暴露給 Kubernetes workload。當使用者建立 PVC，CSI Driver 負責動態佈建（provision）、掛載（attach/mount）至應用 pod。
+
+詳細流程請參考 [CSI Driver 架構](/rook/features/csi-driver)。
+
+---
+
+## 支援的儲存型態
+
+| 儲存型態 | Ceph 技術 | Kubernetes 用法 |
+|---------|-----------|----------------|
+| Block Storage | RBD（RADOS Block Device） | ReadWriteOnce PVC |
+| Shared Filesystem | CephFS（MDS 管理） | ReadWriteMany PVC |
+| Object Storage | RGW（RADOS Gateway） | S3 API / OBC |
+
+三種型態都透過 StorageClass 定義，使用方式請見 [StorageClass 與動態佈建](/rook/features/storage-classes)。
+
+---
+
+## 部署流程概覽
+
+```bash
+# 1. 安裝 CRD 與 RBAC
+kubectl create -f crds.yaml -f common.yaml
+
+# 2. 部署 Rook Operator
+kubectl create -f operator.yaml
+
+# 3. 建立 CephCluster（觸發 mon/mgr/osd 依序啟動）
+kubectl create -f cluster.yaml
+```
+
+Operator 收到 `CephCluster` 物件後，會依序：
+
+1. 啟動 Monitor pod（等待 quorum 形成）
+2. 啟動 Manager pod
+3. 掃描 node 上的磁碟，部署 OSD pod
+4. 更新 CSI ConfigMap，讓 CSI Driver 能取得 cluster 連線資訊
+
+<Callout type="info" title="CephCluster 狀態追蹤">
+`kubectl -n rook-ceph get cephcluster` 可以看到 `HEALTH` 欄位。`HEALTH_OK` 表示所有 OSD 正常、所有 Monitor 在線且 quorum 達成。
+</Callout>
+
+---
+
+## 自我修復機制
+
+Rook 的 cluster controller 持續監視 Ceph daemon 狀態：
+
+- OSD pod 消失 → controller reconcile 重建 OSD Deployment
+- Monitor 不足 quorum → `startMons()` 補足 mon 數量
+- Monitor 連線 endpoint 變化 → 更新 `rook-ceph-mon-endpoints` ConfigMap
+
+這套機制讓儲存叢集的維運從「手動值班」變成「宣告式自動化」。
+
+---
+
+## CNCF Graduated 專案的意義
+
+Rook 在 2020 年成為 CNCF Graduated 專案，代表它已通過安全審計、有穩定的 API、且有足夠的生產使用案例。這意味著：
+
+- API（CRD 欄位）具備向後相容保證
+- 升級路徑有明確文件說明
+- 社群支援活躍，有定期發布的 patch release
+
+相對於直接在 VM 上管理 Ceph，使用 Rook 的最大差異是：**Ceph 的運維知識被封裝進 controller 邏輯**，工程師只需要宣告「我要什麼」，不需要理解每一步「怎麼做」。
+
+---
+
+## 延伸閱讀
+
+- [CephCluster CRD 設計](/rook/features/ceph-cluster) — 了解如何宣告 cluster 規格
+- [OSD 生命週期與 Monitor 仲裁機制](/rook/features/osds-monitors) — 深入儲存引擎
+- [Rook Operator Controller Reconcile 邏輯](/rook/features/ceph-controllers) — 追蹤 reconcile 流程

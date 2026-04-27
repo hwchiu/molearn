@@ -1,0 +1,114 @@
+---
+layout: doc
+title: KubeVirt — virt-controller Reconcile 邏輯
+description: 剖析 VM Controller 與 VMI Controller 的 reconcile 迴路，說明 RunStrategy、Pod 建立與狀態同步的實作細節。
+---
+
+## 工程師遇到的問題
+
+你設定 `spec.running: true` 卻等不到 VM 啟動，或是刪除 VMI 之後 VM 一直重建——這些行為都源自 virt-controller 的 reconcile 邏輯。理解它的決策樹，才能預測 VM 的行為並正確設定 `RunStrategy`。
+
+## virt-controller 的架構
+
+virt-controller 以 Deployment 形式部署，透過 leader election 確保只有一個 instance 處理事件。它內部運行三個獨立的 controller：
+
+- **VM Controller**（`pkg/virt-controller/watch/vm/`）：負責 `VirtualMachine` 物件
+- **VMI Controller**（`pkg/virt-controller/watch/vmi/`）：負責 `VirtualMachineInstance` 物件
+- **Migration Controller**（`pkg/virt-controller/watch/migration/`）：負責 `VirtualMachineInstanceMigration` 物件
+
+每個 controller 都實作標準的 work queue 模式，事件進入 queue → `Execute()` 拉取 → 呼叫 `execute(key)` 實際處理。
+
+## VM Controller：RunStrategy 驅動
+
+VM Controller 的核心是 `sync()` 函數，它根據 `RunStrategy` 決定動作：
+
+```go
+// pkg/virt-controller/watch/vm/vm.go
+func (c *Controller) sync(
+    vm *virtv1.VirtualMachine,
+    vmi *virtv1.VirtualMachineInstance,
+    key string,
+) (*virtv1.VirtualMachine, *virtv1.VirtualMachineInstance, common.SyncError, error) {
+    runStrategy, err := vm.RunStrategy()
+    // ...
+    return c.syncRunStrategy(vm, vmi, runStrategy)
+}
+```
+
+`RunStrategy` 有四個值：
+
+| RunStrategy | 行為 |
+|---|---|
+| `Always` | VMI 不在時立刻建立；VMI 結束後重建 |
+| `RerunOnFailure` | VMI 因失敗終止時重建；正常關機不重建 |
+| `Manual` | 只有使用者手動 start/stop 才會建立或刪除 VMI |
+| `Halted` | 確保沒有 VMI 運行（刪除現有 VMI） |
+
+<Callout type="info" title="RunStrategy 與 spec.running">
+`spec.running: true/false` 是舊版 API，內部會自動轉換成 `RunStrategy Always/Halted`。新版建議直接使用 `spec.runStrategy`。
+</Callout>
+
+### 建立 VMI 的時機
+
+當 VM Controller 決定需要啟動 VM，它會呼叫 `clientset.VirtualMachineInstance().Create()`，建立與 VM 同名的 VMI 物件。此後 VMI 的生命週期移交給 VMI Controller。
+
+## VMI Controller：Pod 管理
+
+VMI Controller 的職責是讓 VMI spec 在 cluster 上有對應的 virt-launcher Pod，並持續同步 Pod 狀態回 VMI status。
+
+```go
+// pkg/virt-controller/watch/vmi/vmi.go
+func (c *Controller) execute(key string) error {
+    vmi := obj.(*virtv1.VirtualMachineInstance)
+
+    // 等待 expectations 滿足（避免 cache 不同步的競態）
+    needsSync := c.podExpectations.SatisfiedExpectations(key) &&
+        c.vmiExpectations.SatisfiedExpectations(key) &&
+        c.pvcExpectations.SatisfiedExpectations(key)
+
+    if !needsSync {
+        return nil
+    }
+
+    pod, err := controller.CurrentVMIPod(vmi, c.podIndexer)
+    // ...
+    syncErr, pod := c.sync(vmi, pod, dataVolumes)
+    return c.updateStatus(vmi, pod, dataVolumes, syncErr)
+}
+```
+
+### Expectation 機制
+
+VMI Controller 使用 `UIDTrackingControllerExpectations` 追蹤「我已送出建立 Pod 的請求，但還沒看到 cache 更新」的狀態。這防止了在 Pod 建立後、cache 同步前就重複建立 Pod 的競態條件。
+
+### DataVolume 就緒檢查
+
+若 VMI 的 volumes 中有 `dataVolume` 類型，VMI Controller 會先確認對應的 `DataVolume` 物件已就緒（CDI import/clone 完成），才建立 virt-launcher Pod：
+
+```go
+// pkg/virt-controller/watch/vmi/vmi.go
+dataVolumes, err := storagetypes.ListDataVolumesFromVolumes(
+    vmi.Namespace, vmi.Spec.Volumes,
+    c.dataVolumeIndexer, c.pvcIndexer,
+)
+```
+
+<Callout type="warning" title="DataVolume 未就緒導致 VMI 卡 Pending">
+如果 DataVolume 的 source image URL 不可存取或 CDI 設定不正確，VMI 會永遠停在 `Pending`。用 `kubectl get datavolume` 查看 DataVolume 的 `Phase` 欄位可以快速定位問題。
+</Callout>
+
+## updateStatus：雙向同步
+
+`updateStatus` 負責把 Pod 狀態映射回 VMI status，包括：
+
+- 設定 `status.nodeName`（從 Pod spec 取得）
+- 更新 `status.phase`（根據 Pod phase 與 conditions）
+- 更新 `status.activePods`（追蹤所有活躍 Pod 的 UID）
+
+這讓 VMI status 永遠反映 Pod 的真實狀態，不依賴 virt-handler 的回報。
+
+## 相關頁面
+
+- [VMI 生命週期](/kubevirt/features/vmi-lifecycle) — phase 狀態機全貌
+- [virt-handler 與 libvirt/KVM 互動](/kubevirt/features/virt-handler) — Pod 建立後的下一步
+- [Live Migration 實作](/kubevirt/features/live-migration) — Migration Controller 的工作

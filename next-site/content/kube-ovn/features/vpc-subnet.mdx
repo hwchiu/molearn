@@ -1,0 +1,100 @@
+---
+layout: doc
+title: Kube-OVN — VPC 與 Subnet CRD 設計
+description: 以 VPC 和 Subnet 兩層 CRD 實現多租戶網路隔離的設計邏輯
+---
+
+## 工程師面臨的問題
+
+電商平台的開發團隊與財務系統要共用同一個 Kubernetes cluster，但合規要求兩者的網路必須完全隔離——不同部門的 Pod 不得直接通訊，各自有獨立的 NAT 出口和 DNS。在純 Kubernetes 的世界裡 namespace 只是邏輯命名空間，NetworkPolicy 雖然可以限制流量，但所有 Pod 仍然共享同一個底層路由域。Kube-OVN 的 VPC CRD 直接在 OVN 層建立獨立的 Logical Router，從根本解決這個問題。
+
+## VPC：獨立的 L3 路由域
+
+VPC（Virtual Private Cloud）在 Kube-OVN 中是 cluster-scoped 的 CRD，對應 OVN 的一個獨立 Logical Router。每個 VPC 有自己的路由表、NAT 規則、Security Group 和 Load Balancer。
+
+```go
+// pkg/apis/kubeovn/v1/vpc.go
+type VpcSpec struct {
+    DefaultSubnet        string          `json:"defaultSubnet,omitempty"`
+    Namespaces           []string        `json:"namespaces,omitempty"`
+    StaticRoutes         []*StaticRoute  `json:"staticRoutes,omitempty"`
+    PolicyRoutes         []*PolicyRoute  `json:"policyRoutes,omitempty"`
+    VpcPeerings          []*VpcPeering   `json:"vpcPeerings,omitempty"`
+    EnableExternal       bool            `json:"enableExternal,omitempty"`
+    EnableBfd            bool            `json:"enableBfd,omitempty"`
+}
+```
+
+`Namespaces` 欄位決定哪些 namespace 的 Pod 屬於這個 VPC。`StaticRoutes` 和 `PolicyRoutes` 則直接映射為 OVN Logical Router 的靜態路由和 Policy-based Routing 規則。
+
+一個 VPC 要對外通訊，必須開啟 `enableExternal: true`，此時 controller 會在這個 VPC 的 Logical Router 上建立通往外部 subnet 的連接埠（Logical Router Port）。
+
+## Subnet：Logical Switch 的抽象
+
+每個 Subnet 對應 OVN 的一個 Logical Switch。Subnet 必須屬於某個 VPC，透過 `spec.vpc` 欄位關聯。
+
+```yaml
+# 範例：為財務系統建立隔離 subnet
+apiVersion: kubeovn.io/v1
+kind: Subnet
+metadata:
+  name: finance-subnet
+spec:
+  vpc: finance-vpc          # 關聯到 VPC
+  cidrBlock: 10.20.0.0/24
+  gateway: 10.20.0.1
+  protocol: IPv4
+  gatewayType: distributed  # 或 centralized
+  natOutgoing: true
+  namespaces:
+    - finance
+```
+
+```go
+// pkg/apis/kubeovn/v1/subnet.go（節錄關鍵欄位）
+type SubnetSpec struct {
+    Vpc          string   `json:"vpc,omitempty"`
+    CIDRBlock    string   `json:"cidrBlock"`
+    Gateway      string   `json:"gateway"`
+    GatewayType  string   `json:"gatewayType,omitempty"` // distributed | centralized
+    NatOutgoing  bool     `json:"natOutgoing"`
+    Private      bool     `json:"private"`
+    AllowSubnets []string `json:"allowSubnets,omitempty"`
+    Namespaces   []string `json:"namespaces,omitempty"`
+    Protocol     string   `json:"protocol,omitempty"` // IPv4 | IPv6 | Dual
+}
+```
+
+## Gateway 模式的選擇
+
+`gatewayType` 是 Subnet 最重要的設計決策之一：
+
+**distributed**（預設）：每個節點上的 Pod 直接透過本節點的 OVS 進行 SNAT 出去，南北向流量分散到各節點，適合高吞吐場景。
+
+**centralized**：所有出口流量集中到 `gatewayNode` 指定的節點，便於在固定 IP 上做審計或防火牆規則，但該節點成為單點。
+
+<Callout type="tip" title="ECMP 分散式 centralized">
+若指定多個 `gatewayNode`，Kube-OVN 會自動啟用 ECMP 路由，讓多個 gateway 節點負載分擔，兼顧固定出口與高可用。
+</Callout>
+
+## Private Subnet 與東西向隔離
+
+設定 `private: true` 時，Subnet controller 會在 OVN NB 為這個 Logical Switch 加入 deny-all ACL，只允許來自 `allowSubnets` 清單中的 CIDR 訪問。這讓東西向隔離不需要撰寫任何 NetworkPolicy，直接在 OVN 層完成。
+
+## 多 namespace 共用 Subnet
+
+`spec.namespaces` 支援多個 namespace，讓跨 namespace 的 Pod 共用同一個 IP 段。例如 `frontend` 和 `frontend-staging` 可以指向同一個 Subnet，簡化 IP 管理。
+
+Subnet 狀態會即時反映使用情況：
+
+```bash
+kubectl get subnet finance-subnet -o wide
+# NAME            VPC          CIDR           V4Used  V4Available
+# finance-subnet  finance-vpc  10.20.0.0/24   12      241
+```
+
+## VPC 與 Subnet 的對應關係
+
+系統預設存在一個 `ovn-cluster` VPC（即 `cluster-router`），所有未指定 VPC 的 Subnet 都屬於它。自訂 VPC 創建後，controller 會為它建立獨立的 OVN Logical Router，與 `cluster-router` 完全隔離。
+
+更多關於 IP 分配的細節，請見 [IPAM 設計](/kube-ovn/features/ipam)。Controller 如何同步這些 CRD 到 OVN，請見 [核心 Controller Reconcile 邏輯](/kube-ovn/features/controllers)。

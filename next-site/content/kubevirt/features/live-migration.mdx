@@ -1,0 +1,148 @@
+---
+layout: doc
+title: KubeVirt — Live Migration 實作
+description: 深入 VirtualMachineInstanceMigration 的九個 phase 狀態機，說明 virt-controller 如何協調 source 與 target 完成 QEMU 記憶體遷移。
+---
+
+## 工程師遇到的問題
+
+你需要在不中斷服務的情況下對 node 進行維護（node drain），但 VM 不能停機。KubeVirt 的 Live Migration 讓 VM 在用戶毫無感知的情況下從一個 node 遷移到另一個——理解它的狀態機，你才能判斷遷移為什麼卡住、何時會失敗、以及如何安全地取消。
+
+## Migration 的觸發方式
+
+Live Migration 透過建立 `VirtualMachineInstanceMigration` 物件觸發：
+
+```yaml
+apiVersion: kubevirt.io/v1
+kind: VirtualMachineInstanceMigration
+metadata:
+  name: migrate-my-vm
+spec:
+  vmiName: my-vm
+```
+
+也可以透過 virt-api subresource 觸發：`kubectl virt migrate my-vm`。
+
+## Migration Phase 狀態機
+
+`VirtualMachineInstanceMigrationPhase` 定義在 `staging/src/kubevirt.io/api/core/v1/types.go`：
+
+```go
+// staging/src/kubevirt.io/api/core/v1/types.go
+MigrationPhaseUnset      = ""
+MigrationPending         = "Pending"
+MigrationScheduling      = "Scheduling"
+MigrationScheduled       = "Scheduled"
+MigrationPreparingTarget = "PreparingTarget"
+MigrationTargetReady     = "TargetReady"
+MigrationRunning         = "Running"
+MigrationSucceeded       = "Succeeded"
+MigrationFailed          = "Failed"
+```
+
+## 各 Phase 詳解
+
+### Pending → Scheduling
+
+Migration Controller 收到新的 Migration 物件，先確認 VMI 是否可以遷移（`canMigrateVMI`）：
+
+```go
+// pkg/virt-controller/watch/migration/migration.go
+func (c *Controller) canMigrateVMI(
+    migration *virtv1.VirtualMachineInstanceMigration,
+    vmi *virtv1.VirtualMachineInstance,
+) (bool, error) {
+    // 檢查是否已有進行中的 migration
+    // 檢查 VMI 是否使用不支援 migration 的設定（如 SR-IOV、HostDisk）
+}
+```
+
+確認可以遷移後，Migration Controller 建立 **target virt-launcher Pod**（與 source Pod spec 相同），Migration phase 進入 `Scheduling`。
+
+<Callout type="info" title="同時只有一個 active migration">
+若同一 VMI 已有進行中的 migration，新的 Migration 物件會立刻被標記為 `Failed`，並發出 event：`VMI is not eligible for migration because another migration job is in progress.`
+</Callout>
+
+### Scheduling → Scheduled → PreparingTarget
+
+Target Pod 被 K8s Scheduler 選到 node 後，phase 推進到 `Scheduled`。接著 Migration Controller 把 target Pod 資訊（`TargetState.Pod`）寫入 VMI `status.migrationState`，phase 進入 `PreparingTarget`。
+
+### PreparingTarget → TargetReady
+
+target node 上的 **virt-handler** 看到 VMI 的 `migrationState` 後，開始在 target Pod 內準備環境：
+
+1. 設定 target 端的網路（呼叫 CNI）
+2. 啟動 virt-launcher 在 migration 接收模式（QEMU 等待接收記憶體）
+3. 建立 migration proxy（TCP tunnel），讓 source 端可以連到 target 端的 QEMU migration port
+
+target 準備完成後，virt-handler 把 phase 更新為 `TargetReady`。
+
+### TargetReady → Running
+
+**source node 的 virt-handler** 看到 `TargetReady` 後，透過 gRPC 通知 source virt-launcher 開始 QEMU migration：
+
+```go
+// pkg/virt-handler/controller.go
+// source virt-handler 呼叫 migration source 邏輯
+// → virt-launcher 呼叫 libvirt 的 migrateToURI
+// → QEMU 開始透過 TCP 傳輸記憶體 pages（pre-copy 模式）
+```
+
+QEMU 的 Live Migration 採用 **pre-copy** 策略：先傳輸全部記憶體，再反覆傳輸 dirty pages，直到 dirty page rate 低於閾值，最後短暫暫停 VM（停機時間通常 < 100ms）做最後一次同步。
+
+Migration phase 在傳輸進行中標記為 `Running`。
+
+```go
+// pkg/virt-handler/controller.go
+const parallelMultifdMigrationThreads = uint(8)
+// libvirt multifd 使用 8 條並行 TCP 連線加速記憶體傳輸
+```
+
+### Running → Succeeded / Failed
+
+QEMU migration 完成後：
+
+1. QEMU 在 target node 繼續執行
+2. source virt-launcher 終止 QEMU domain
+3. Migration phase 更新為 `Succeeded`
+4. VMI 的 `status.nodeName` 更新為 target node
+5. source virt-launcher Pod 被刪除
+
+若 migration 超時或 QEMU 傳輸失敗，phase 進入 `Failed`，VM 繼續在原 source node 運行。
+
+<Callout type="tip" title="migration 失敗不等於 VM 損毀">
+Migration 失敗時 VM 仍在 source node 正常運行，不會造成服務中斷。可以安全地重試或使用 `kubectl virt migrate-cancel` 清理資源。
+</Callout>
+
+## migration 的前提條件
+
+| 條件 | 說明 |
+|---|---|
+| 磁碟格式 | root disk 必須是 RWX PVC 或 ContainerDisk（否則需要 block migration） |
+| 網路綁定 | SR-IOV 介面不支援 migration（需移除或換成 virtio） |
+| HostDisk | 使用 HostDisk 的 VM 不支援 migration |
+| target node | 必須有足夠的 CPU 與 Memory 資源 |
+
+## VMI 的 migrationState
+
+遷移進行中，VMI `status.migrationState` 記錄完整的遷移資訊：
+
+```go
+// staging/src/kubevirt.io/api/core/v1/types.go
+type VirtualMachineInstanceMigrationState struct {
+    StartTimestamp   *metav1.Time
+    EndTimestamp     *metav1.Time
+    TargetNode       string
+    SourceNode       string
+    Completed        bool
+    Failed           bool
+    // migration 傳輸統計（bytes transferred 等）
+    MigrationUID     types.UID
+}
+```
+
+## 相關頁面
+
+- [整體架構](/kubevirt/features/architecture) — virt-handler 在 migration 中的定位
+- [VM 磁碟管理](/kubevirt/features/vm-storage) — RWX PVC 與 migration 的關係
+- [VM 網路模型](/kubevirt/features/vm-network) — 網路綁定方式對 migration 可用性的影響
