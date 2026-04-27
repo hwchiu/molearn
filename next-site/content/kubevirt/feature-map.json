@@ -1,0 +1,22 @@
+{
+  "projectId": "kubevirt",
+  "nodes": [
+    {"id": "architecture", "label": "整體架構", "description": "四大元件：virt-api / virt-controller / virt-handler / virt-launcher", "featureSlug": "architecture", "category": "infra", "position": {"x": 400, "y": 50}},
+    {"id": "vmi-lifecycle", "label": "VMI 生命週期", "description": "VM/VMI 狀態機，從 Pending 到 Running 的完整流程", "featureSlug": "vmi-lifecycle", "category": "lifecycle", "position": {"x": 400, "y": 200}},
+    {"id": "virt-controller", "label": "virt-controller", "description": "VM 決策核心：建立 VMI、管理 virt-launcher Pod", "featureSlug": "virt-controller", "category": "controller", "position": {"x": 150, "y": 370}},
+    {"id": "virt-handler", "label": "virt-handler", "description": "節點層 VM 代理：呼叫 libvirt/KVM 啟動 VM", "featureSlug": "virt-handler", "category": "controller", "position": {"x": 650, "y": 370}},
+    {"id": "vm-storage", "label": "VM 儲存", "description": "DataVolume、PVC boot disk、ContainerDisk", "featureSlug": "vm-storage", "category": "api", "position": {"x": 150, "y": 540}},
+    {"id": "vm-network", "label": "VM 網路", "description": "Multus 多網卡、masquerade/bridge 網路模式", "featureSlug": "vm-network", "category": "api", "position": {"x": 400, "y": 540}},
+    {"id": "live-migration", "label": "Live Migration", "description": "不停機 VM 遷移：記憶體複製與切換機制", "featureSlug": "live-migration", "category": "lifecycle", "position": {"x": 650, "y": 540}}
+  ],
+  "edges": [
+    {"id": "e-arch-vmi", "source": "architecture", "target": "vmi-lifecycle", "label": "defines"},
+    {"id": "e-ctrl-vmi", "source": "virt-controller", "target": "vmi-lifecycle", "label": "manages"},
+    {"id": "e-handler-vmi", "source": "virt-handler", "target": "vmi-lifecycle", "label": "executes"},
+    {"id": "e-ctrl-handler", "source": "virt-controller", "target": "virt-handler", "label": "delegates", "animated": true},
+    {"id": "e-vmi-storage", "source": "vmi-lifecycle", "target": "vm-storage", "label": "uses"},
+    {"id": "e-vmi-network", "source": "vmi-lifecycle", "target": "vm-network", "label": "uses"},
+    {"id": "e-ctrl-migration", "source": "virt-controller", "target": "live-migration", "label": "coordinates"},
+    {"id": "e-migration-handler", "source": "live-migration", "target": "virt-handler", "label": "triggers", "animated": true}
+  ]
+}
