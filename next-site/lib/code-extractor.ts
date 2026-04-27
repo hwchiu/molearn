@@ -27,6 +27,9 @@ function buildGithubUrl(project: ProjectId, file: string, start: number, end: nu
     'cluster-api': 'https://github.com/kubernetes-sigs/cluster-api',
     'cluster-api-provider-maas': 'https://github.com/spectrocloud/cluster-api-provider-maas',
     'cluster-api-provider-metal3': 'https://github.com/metal3-io/cluster-api-provider-metal3',
+    'rook': 'https://github.com/rook/rook',
+    'kube-ovn': 'https://github.com/kubeovn/kube-ovn',
+    'kubevirt': 'https://github.com/kubevirt/kubevirt',
   }
   return `${bases[project]}/blob/main/${file}#L${start}-L${end}`
 }

@@ -4,6 +4,9 @@ const GITHUB_BASES: Record<ProjectId, string> = {
   'cluster-api': 'https://github.com/kubernetes-sigs/cluster-api',
   'cluster-api-provider-maas': 'https://github.com/spectrocloud/cluster-api-provider-maas',
   'cluster-api-provider-metal3': 'https://github.com/metal3-io/cluster-api-provider-metal3',
+  'rook': 'https://github.com/rook/rook',
+  'kube-ovn': 'https://github.com/kubeovn/kube-ovn',
+  'kubevirt': 'https://github.com/kubevirt/kubevirt',
 }
 
 export function buildGithubBlobUrl(project: ProjectId, file: string, lineStart?: number, lineEnd?: number): string {
