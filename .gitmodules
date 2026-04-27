@@ -10,3 +10,15 @@
 	path = cluster-api
 	url = https://github.com/kubernetes-sigs/cluster-api.git
 	branch = main
+[submodule "kube-ovn"]
+	path = kube-ovn
+	url = https://github.com/kubeovn/kube-ovn.git
+	branch = master
+[submodule "kubevirt"]
+	path = kubevirt
+	url = https://github.com/kubevirt/kubevirt.git
+	branch = main
+[submodule "rook"]
+	path = rook
+	url = https://github.com/rook/rook.git
+	branch = main
