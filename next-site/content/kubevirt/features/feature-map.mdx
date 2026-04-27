@@ -1,0 +1,146 @@
+---
+layout: doc
+title: KubeVirt — 功能全景地圖
+description: 以鳥瞰視角瀏覽 KubeVirt 的所有核心功能模組，了解 VM 如何在 Kubernetes 上運行，以及各元件的協作關係。
+---
+
+## 為什麼需要這張地圖
+
+KubeVirt 讓虛擬機器（VM）在 Kubernetes 上以「Pod 同等公民」的身份運行。要達到這個目標，它需要四個角色分工：**virt-api**（入口驗證）、**virt-controller**（生命週期決策）、**virt-handler**（節點執行）、**virt-launcher**（QEMU 容器）。
+
+每個角色都有獨立的部署方式、獨立的職責、以及與 Kubernetes 原生元件不同的互動模式。這張地圖幫你在閱讀細節之前，先建立**整體認知框架**。
+
+---
+
+## 功能模組全景
+
+![KubeVirt Feature Map](/diagrams/kubevirt/feature-map.png)
+
+四個核心功能域圍繞著 `virt-controller` 運作：
+
+| 功能域 | 核心職責 | 對應文件 |
+|--------|---------|---------|
+| **API & 入口** | CRD 驗證、Webhook、Subresource endpoint | [整體架構](/kubevirt/features/architecture) |
+| **VM 生命週期** | VM/VMI 狀態機、pod 建立、virt-handler 節點代理 | [VMI 生命週期](/kubevirt/features/vmi-lifecycle)、[virt-controller](/kubevirt/features/virt-controller)、[virt-handler](/kubevirt/features/virt-handler) |
+| **儲存 & 網路** | DataVolume、PVC boot disk、Multus 多網卡 | [VM 儲存](/kubevirt/features/vm-storage)、[VM 網路](/kubevirt/features/vm-network) |
+| **Runtime & 遷移** | virt-launcher Pod、QEMU/KVM 行程管理、Live Migration | [virt-handler](/kubevirt/features/virt-handler)、[Live Migration](/kubevirt/features/live-migration) |
+
+---
+
+## 整體架構分層
+
+![KubeVirt Architecture](/diagrams/kubevirt/architecture.png)
+
+### 從上到下：四個層次
+
+**① Kubernetes API Server + User**
+使用者透過 `kubectl apply` 宣告 `VirtualMachine` CRD。`virt-api` 以 API Aggregation 方式掛載，在 VM 建立時觸發 Validating/Mutating Webhook，並提供 `/vnc`、`/console`、`/migrate` 等 Subresource endpoint。
+
+**② virt-controller（Deployment）**
+這是 KubeVirt 的決策核心，以 Deployment 運行並支援 leader election：
+- `VM Controller`：根據 `RunStrategy` 決定是否建立/刪除 `VirtualMachineInstance`
+- `VMI Controller`：為每個 VMI 建立對應的 `virt-launcher Pod`，追蹤 Pod 狀態更新 VMI phase
+- `Migration Controller`：協調 `VirtualMachineInstanceMigration`，管理 source + target Pod 的生命週期
+
+**③ virt-handler（DaemonSet）**
+每個 Node 上運行一個 virt-handler，它是「節點層的 VM 代理人」：
+- 監聽排程到本 Node 的 VMI，透過 Unix socket gRPC 呼叫同 Node 的 virt-launcher
+- 設定節點網路（呼叫 CNI plugin）
+- 協調 Live Migration 的 source 端傳輸通道
+
+**④ virt-launcher Pod（一 VM 一 Pod）**
+每台 VM 對應一個 virt-launcher Pod，包含兩個關鍵行程：
+- `virt-launcher` 主行程：接收 virt-handler 的 gRPC 指令，管理 libvirt domain
+- `QEMU/KVM`：由 libvirt 啟動，是真正執行 VM 的 hypervisor
+
+---
+
+## VM 建立完整流程
+
+![KubeVirt VM Creation Flow](/diagrams/kubevirt/vm-creation-flow.png)
+
+### 控制平面（步驟 ①–⑤）
+
+| 步驟 | 動作 | 元件 |
+|------|------|------|
+| ① | `kubectl apply` VM CRD | User / kubectl |
+| ② | Webhook 驗證 spec 格式，注入預設值 | virt-api |
+| ③ | VM Controller 依 RunStrategy 建立 VMI | virt-controller |
+| ④ | VMI Controller 建立 virt-launcher Pod | virt-controller |
+| ⑤ | Kubernetes Scheduler 選擇具備 KVM 能力的 Node | kube-scheduler |
+
+### 資料平面（步驟 ⑥–⑩）
+
+| 步驟 | 動作 | 元件 |
+|------|------|------|
+| ⑥ | virt-handler 偵測到 VMI 排程到本 Node | virt-handler DaemonSet |
+| ⑦ | 呼叫 gRPC `SyncVMI` 到 virt-launcher | virt-handler |
+| ⑧ | virt-launcher 將 VMI spec 轉換為 libvirt Domain XML | virt-launcher |
+| ⑨ | libvirt 啟動 QEMU 行程 | libvirt / libvirtd |
+| ⑩ | VM 以 KVM 硬體加速運行 | QEMU/KVM |
+
+<Callout type="tip" title="為什麼是一 VM 一 Pod？">
+將每台 VM 包在一個 virt-launcher Pod 裡，VM 就能繼承 Kubernetes 的所有能力：cgroup 資源隔離、CNI 網路、CSI 儲存、RBAC 存取控制。QEMU 崩潰只影響單一 VM，不會波及其他 Pod 或 VM。
+</Callout>
+
+---
+
+## 元件間通訊方式
+
+| 通訊方向 | 協定 | 說明 |
+|---------|------|------|
+| virt-controller → K8s API | HTTP REST (client-go) | Watch/Update CRD、建立 Pod |
+| virt-handler → K8s API | HTTP REST | 更新 VMI Status |
+| virt-handler → virt-launcher | Unix socket gRPC | SyncVMI、KillVMI、MigrateVMI |
+| virt-launcher → libvirt | libvirt C API (Go binding) | 建立/啟動/停止 domain |
+| virt-api → K8s API | API Aggregation | 代理 CRD 資料，暴露 Subresource |
+
+---
+
+## 關鍵 CRD 的層級關係
+
+```
+VirtualMachine (VM)                 ← 持久定義，類似 Deployment
+  └── VirtualMachineInstance (VMI)  ← 執行中的 VM，類似 Pod
+        └── virt-launcher Pod       ← 包裹 QEMU 的 Kubernetes Pod
+
+VirtualMachineInstanceMigration     ← 觸發 Live Migration
+  ├── source VMI (原 Node)
+  └── target VMI (新 Node)
+```
+
+`VirtualMachine` 與 `VirtualMachineInstance` 的分層設計，允許 VM 在關機後重新開機時保留定義（analogous to Deployment/Pod 的關係）。
+
+---
+
+## 學習路徑建議
+
+### 🟢 入門路徑（理解「KubeVirt 做什麼」）
+
+1. **[整體架構](/kubevirt/features/architecture)** — 四大元件與通訊模型
+2. **[VMI 生命週期](/kubevirt/features/vmi-lifecycle)** — VM 從 Pending 到 Running 的狀態機
+3. **[VM 儲存](/kubevirt/features/vm-storage)** — 磁碟 image 與 PVC 的整合方式
+
+### 🟡 中階路徑（理解「KubeVirt 怎麼做到的」）
+
+4. **[virt-controller Reconcile 邏輯](/kubevirt/features/virt-controller)** — 深入 controller 原始碼
+5. **[virt-handler 與 libvirt/KVM 互動](/kubevirt/features/virt-handler)** — 節點層的 VM 執行機制
+6. **[VM 網路模型](/kubevirt/features/vm-network)** — Multus 多網卡與網路模式
+
+### 🔴 進階路徑（深入邊界情境）
+
+7. **[Live Migration](/kubevirt/features/live-migration)** — 不停機遷移的實作與狀態機
+8. **[virt-handler（進階）](/kubevirt/features/virt-handler)** — QEMU 行程管理與資源隔離
+9. **[virt-controller（進階）](/kubevirt/features/virt-controller)** — VM 排程與資源計算的邊界條件
+
+---
+
+## 常見問題定位
+
+| 問題症狀 | 先看哪個模組 |
+|---------|------------|
+| VMI 卡在 `Scheduling` | [VMI 生命週期](/kubevirt/features/vmi-lifecycle) → Node 是否有 KVM 能力 |
+| VMI 卡在 `Pending`（Pod Running 但 VM 未啟動） | [virt-handler](/kubevirt/features/virt-handler) → gRPC 呼叫是否成功 |
+| VNC 無法連線 | [整體架構](/kubevirt/features/architecture) → virt-api Subresource endpoint |
+| Live Migration 超時 | [Live Migration](/kubevirt/features/live-migration) → memory bandwidth 計算 |
+| 磁碟 image 無法掛載 | [VM 儲存](/kubevirt/features/vm-storage) → DataVolume import 狀態 |
