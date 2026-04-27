@@ -54,11 +54,10 @@ export const MDX_COMPONENTS = {
   td: (props: any) => <td className="p-2 border border-[#30363d] text-[#8b949e]" {...props} />,
   a: ({ href, ...props }: any) => {
     const base = process.env.NEXT_PUBLIC_BASE_PATH || ''
-    const resolvedHref = href?.startsWith('/') ? `${base}${href}` : href
     if (href?.startsWith('/')) {
-      return <Link href={resolvedHref} className="text-[#2f81f7] hover:underline" {...props} />
+      return <Link href={`${base}${href}`} className="text-[#2f81f7] hover:underline" {...props} />
     }
-    return <a href={resolvedHref} className="text-[#2f81f7] hover:underline" {...props} />
+    return <a href={href} className="text-[#2f81f7] hover:underline" {...props} />
   },
   blockquote: (props: any) => <blockquote className="border-l-4 border-[#2f81f7] pl-4 italic text-[#8b949e] my-4" {...props} />,
   strong: (props: any) => <strong className="text-white font-semibold" {...props} />,
