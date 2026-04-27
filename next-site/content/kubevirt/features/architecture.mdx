@@ -1,0 +1,96 @@
+---
+layout: doc
+title: KubeVirt — 整體架構
+description: 說明 virt-api、virt-controller、virt-handler、virt-launcher 四大元件如何協作，讓虛擬機器在 Kubernetes 上運行。
+---
+
+## 工程師遇到的問題
+
+你想在 Kubernetes cluster 上直接跑 Windows VM，但又不想讓 VM 離開 K8s 的排程與網路生態。KubeVirt 的答案是：把 VM 包裝成一個 CRD，讓每一台虛擬機器都像 Pod 一樣被 Kubernetes 管理——但這背後需要四個元件分工合作才能辦到。
+
+## 四大元件概觀
+
+KubeVirt 採用分層架構，每個元件職責明確：
+
+```
+用戶 / kubectl
+     ↓  REST API
+ virt-api          ← 入口：驗證、Webhook、Subresource 處理
+     ↓  寫入 CRD
+ virt-controller   ← 大腦：VM/VMI lifecycle、Pod 建立、Migration 協調
+     ↓  VMI 分配到 node
+ virt-handler      ← 節點守衛：監聽本 node 上的 VMI，呼叫 virt-launcher
+     ↓  gRPC
+ virt-launcher     ← VM 進程：每台 VM 一個 Pod，內含 libvirt + QEMU
+```
+
+### virt-api
+
+virt-api 是所有 KubeVirt 客製 API 的入口。它以 Kubernetes API Aggregation 機制掛載，提供：
+
+- **Validating / Mutating Webhook**：在 VMI 建立時驗證 spec 格式正確性，注入預設值（如 `DefaultGracePeriodSeconds = 30`）
+- **Subresource endpoint**：`/vnc`、`/console`、`/migrate` 等操作都走這裡，而非直接操作 etcd
+
+<Callout type="info" title="API Aggregation vs CRD">
+virt-api 透過 `APIService` 資源掛載，因此 `kubectl get vmi` 背後實際上打的是 virt-api 的 endpoint，再由 virt-api 轉發到 etcd 中的 CRD 資料。
+</Callout>
+
+### virt-controller
+
+virt-controller 是 KubeVirt 的核心控制迴路，以 Deployment 形式運行，支援 leader election 確保單點執行。它運行多個 controller：
+
+- **VM Controller**：監聽 `VirtualMachine` 物件，根據 `RunStrategy` 決定是否建立或刪除 VMI
+- **VMI Controller**：監聽 `VirtualMachineInstance`，建立對應的 virt-launcher Pod，追蹤 Pod 狀態更新 VMI phase
+- **Migration Controller**：處理 `VirtualMachineInstanceMigration` 物件，協調 source 與 target node 的 Pod 生命週期
+
+詳細的 reconcile 邏輯請參考 [virt-controller Reconcile 邏輯](/kubevirt/features/virt-controller)。
+
+### virt-handler
+
+virt-handler 是每個 node 上的 DaemonSet，職責是監聽「排程到本 node 的 VMI」，並把 VMI spec 翻譯成 libvirt domain XML 傳給 virt-launcher。它也負責：
+
+- 設定 node 上的網路（呼叫 CNI plugin）
+- 偵測 virt-launcher 的存活狀態，反映回 VMI `Status`
+- 協調 Live Migration 的 source 端傳輸通道
+
+更多細節請看 [virt-handler 與 libvirt/KVM 互動](/kubevirt/features/virt-handler)。
+
+### virt-launcher
+
+每台 VM 對應一個 virt-launcher Pod，Pod 內有兩個核心進程：
+
+1. **virt-launcher 主進程**：以 gRPC 接收來自 virt-handler 的指令（SyncVMI、KillVMI 等）
+2. **QEMU/KVM 進程**：由 virt-launcher 透過 libvirt API 啟動，是真正執行 VM 的 hypervisor
+
+```go
+// pkg/virt-launcher/virtwrap/manager.go
+func (l *LibvirtDomainManager) SyncVMI(
+    vmi *v1.VirtualMachineInstance,
+    allowEmulation bool,
+    options *cmdv1.VirtualMachineOptions,
+) (*api.DomainSpec, error) {
+    // 1. 將 VMI spec 轉成 libvirt Domain XML
+    converter.Convert_v1_VirtualMachineInstance_To_api_Domain(vmi, domain, c)
+    // 2. 查找或建立 libvirt domain
+    dom, err := l.lookupOrCreateVirDomain(domain, vmi, options)
+    // 3. 依照 domain 狀態決定是 start 還是 resume
+}
+```
+
+<Callout type="tip" title="一 VM 一 Pod 的設計哲學">
+virt-launcher Pod 讓每台 VM 繼承 Kubernetes 的資源隔離（cgroup）、網路（CNI）和儲存（CSI）能力，同時 QEMU 進程的崩潰不會影響其他 VM。
+</Callout>
+
+## 元件間通訊
+
+| 通訊方向 | 協定 |
+|---|---|
+| virt-handler → virt-launcher | Unix socket gRPC |
+| virt-controller → K8s API Server | HTTP REST (client-go) |
+| virt-handler → K8s API Server | HTTP REST（更新 VMI status） |
+| virt-launcher → libvirt | libvirt C API (via Go binding) |
+
+## 下一步
+
+- 了解 VMI 如何從 Pending 走到 Running：[VMI 生命週期](/kubevirt/features/vmi-lifecycle)
+- 深入 controller reconcile：[virt-controller Reconcile 邏輯](/kubevirt/features/virt-controller)

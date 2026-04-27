@@ -1,0 +1,182 @@
+---
+layout: doc
+title: Rook — StorageClass 與動態佈建
+description: 說明如何透過 RBD、CephFS、Object 三種 StorageClass 讓 Kubernetes workload 取得動態佈建的持久化儲存。
+---
+
+## 工程師面臨的問題
+
+開發團隊要求「我建一個 PVC 就好，不用管底層磁碟在哪」。但光有 Rook 部署好的 Ceph cluster 還不夠，你需要告訴 Kubernetes：**用哪個 CSI driver、連哪個 pool、用哪組 credentials**。這正是 StorageClass 的職責。
+
+---
+
+## StorageClass 的三種型態
+
+Rook 透過 Ceph CSI Driver 提供三種 StorageClass：
+
+| StorageClass provisioner | 對應技術 | 適合場景 |
+|--------------------------|---------|---------|
+| `rook-ceph.rbd.csi.ceph.com` | RBD Block | 資料庫、單 pod 寫入 |
+| `rook-ceph.cephfs.csi.ceph.com` | CephFS | 多 pod 共享讀寫 |
+| `rook-ceph.bucket.csi.ceph.com` | Object（RGW） | S3 API 物件存取 |
+
+---
+
+## Block StorageClass（RBD）
+
+### 前置條件：建立 CephBlockPool
+
+```yaml
+# deploy/examples/csi/rbd/storageclass.yaml（前段）
+apiVersion: ceph.rook.io/v1
+kind: CephBlockPool
+metadata:
+  name: replicapool
+  namespace: rook-ceph
+spec:
+  failureDomain: host
+  replicated:
+    size: 3
+    requireSafeReplicaSize: true
+```
+
+`failureDomain: host` 確保三份副本分散在不同 node，任一 node 宕機資料不遺失。
+
+### StorageClass 定義
+
+```yaml
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: rook-ceph-block
+provisioner: rook-ceph.rbd.csi.ceph.com
+parameters:
+  clusterID: rook-ceph
+  pool: replicapool
+  imageFormat: "2"
+  imageFeatures: layering
+  csi.storage.k8s.io/provisioner-secret-name: rook-csi-rbd-provisioner
+  csi.storage.k8s.io/provisioner-secret-namespace: rook-ceph
+  csi.storage.k8s.io/node-stage-secret-name: rook-csi-rbd-node
+  csi.storage.k8s.io/node-stage-secret-namespace: rook-ceph
+  csi.storage.k8s.io/fstype: ext4
+allowVolumeExpansion: true
+reclaimPolicy: Delete
+```
+
+`imageFeatures: layering` 是 Linux kernel 5.3 以下的安全選項。kernel 5.4+ 可啟用 `fast-diff,object-map,deep-flatten,exclusive-lock` 以獲得更好的效能。
+
+<Callout type="tip" title="volume 擴容">
+`allowVolumeExpansion: true` 啟用後，只需編輯 PVC 的 `spec.resources.requests.storage`，CSI driver 會自動呼叫 Ceph resize API 完成底層擴容。
+</Callout>
+
+---
+
+## Shared Filesystem StorageClass（CephFS）
+
+### 前置條件：建立 CephFilesystem
+
+```yaml
+apiVersion: ceph.rook.io/v1
+kind: CephFilesystem
+metadata:
+  name: myfs
+  namespace: rook-ceph
+spec:
+  metadataPool:
+    replicated:
+      size: 3
+  dataPools:
+    - name: replicated
+      replicated:
+        size: 3
+  metadataServer:
+    activeCount: 1
+    activeStandby: true
+```
+
+CephFS 需要 MDS（Metadata Server）元件，`activeCount: 1` 表示一個 active MDS，`activeStandby: true` 讓備援 MDS 在 active 失效時立即接管。
+
+### StorageClass 定義
+
+```yaml
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: rook-cephfs
+provisioner: rook-ceph.cephfs.csi.ceph.com
+parameters:
+  clusterID: rook-ceph
+  fsName: myfs
+  pool: myfs-replicated
+  csi.storage.k8s.io/provisioner-secret-name: rook-csi-cephfs-provisioner
+  csi.storage.k8s.io/provisioner-secret-namespace: rook-ceph
+  csi.storage.k8s.io/node-stage-secret-name: rook-csi-cephfs-node
+  csi.storage.k8s.io/node-stage-secret-namespace: rook-ceph
+reclaimPolicy: Delete
+allowVolumeExpansion: true
+```
+
+CephFS StorageClass 支援 `ReadWriteMany`，多個 pod 可以同時掛載同一個 PVC，非常適合 CI/CD artifact 共享或靜態資源服務。
+
+---
+
+## Object StorageClass（Bucket）
+
+Object Storage 的使用方式與 Block/File 不同，透過 **ObjectBucketClaim（OBC）** 申請 bucket：
+
+```yaml
+# deploy/examples/object-bucket-claim-delete.yaml
+apiVersion: objectbucket.io/v1alpha1
+kind: ObjectBucketClaim
+metadata:
+  name: ceph-bucket
+  namespace: default
+spec:
+  generateBucketName: ceph-bkt
+  storageClassName: rook-ceph-bucket
+```
+
+```yaml
+# deploy/examples/storageclass-bucket-delete.yaml
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: rook-ceph-bucket
+provisioner: rook-ceph.ceph.rook.io/bucket
+reclaimPolicy: Delete
+parameters:
+  objectStoreName: my-store
+  objectStoreNamespace: rook-ceph
+```
+
+OBC 建立後，Rook 會在同一個 namespace 自動產生一個同名的 ConfigMap（含 bucket endpoint 與 name）和 Secret（含 access key / secret key），應用可直接注入這些 credentials 存取 S3。
+
+<Callout type="info" title="S3 端點">
+Object store 的 S3 端點詳細設定請見 [CephObjectStore 與 RGW S3 API](/rook/features/s3-object-store)。
+</Callout>
+
+---
+
+## PVC 建立完整流程
+
+```
+使用者建立 PVC
+     │
+     ▼
+kube-scheduler 選定 node
+     │
+     ▼
+external-provisioner sidecar 呼叫 CSI CreateVolume gRPC
+     │
+     ▼
+ceph-csi 驅動向 Ceph 建立 RBD image / CephFS subvolume
+     │
+     ▼
+PVC 狀態變為 Bound
+     │
+     ▼
+pod 被調度時，node-driver-registrar 掛載 volume
+```
+
+整個流程不需要人工介入，詳細的 CSI sidecar 互動請見 [CSI Driver 架構](/rook/features/csi-driver)。

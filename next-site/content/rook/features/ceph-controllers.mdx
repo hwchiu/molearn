@@ -1,0 +1,177 @@
+---
+layout: doc
+title: Rook — Operator Controller Reconcile 邏輯
+description: 剖析 Rook Operator 如何透過 controller-runtime 的 reconcile loop 驅動 Ceph 各元件達到宣告狀態。
+---
+
+## 工程師面臨的問題
+
+你修改了 `CephCluster` 的 mon count 從 3 改為 5，但等了 10 分鐘沒有看到新的 mon pod。你 `kubectl describe cephcluster` 看到 `Progressing` 狀態停在「Configuring Ceph Mons」。問題在哪？理解 reconcile 流程，才能知道該從哪裡查 log、該等多久、什麼情況是真的卡住了。
+
+---
+
+## Operator 的整體架構
+
+Rook Operator 是一組基於 [controller-runtime](https://github.com/kubernetes-sigs/controller-runtime) 的 controller 集合。每種 CRD 對應一個獨立的 controller：
+
+```go
+// pkg/operator/ceph/cluster/controller.go
+const controllerName = "ceph-cluster-controller"
+
+type ReconcileCephCluster struct {
+    client            client.Client
+    scheme            *apituntime.Scheme
+    // ...
+}
+```
+
+Controller 透過 `manager.Add()` 註冊，Manager 啟動時自動啟動所有 controller 的 reconcile loop。
+
+---
+
+## CephCluster Reconcile 序列
+
+`ReconcileCephCluster.Reconcile()` 是整個 cluster 的入口點。它的執行順序嚴格遵循 Ceph 的啟動依賴關係：
+
+```go
+// pkg/operator/ceph/cluster/cluster.go
+func (c *cluster) reconcileCephDaemons(rookImage string, cephVersion cephver.CephVersion) error {
+    // 1. 建立 config override ConfigMap
+    err := populateConfigOverrideConfigMap(...)
+
+    // 2. 執行 mon 前置動作（升級路徑用）
+    err = c.preMonStartupActions(cephVersion)
+
+    // 3. 啟動 Monitor（等待 quorum）
+    controller.UpdateCondition(..., "Configuring Ceph Mons")
+    clusterInfo, err := c.mons.Start(...)
+
+    // 4. 啟動 Manager
+    controller.UpdateCondition(..., "Configuring Ceph Mgr(s)")
+    mgrs := mgr.New(...)
+    err = mgrs.Start()
+
+    // 5. 啟動 OSD
+    // ...
+}
+```
+
+這個序列解釋了為什麼 mon 未就緒時，mgr 和 osd 不會啟動 — 它們都在等待上一步的 `clusterInfo`（包含 FSID、keyring、mon endpoint）。
+
+---
+
+## 監聽的資源與 Event 過濾
+
+```go
+// pkg/operator/ceph/cluster/controller.go
+var objectsToWatch = []client.Object{
+    &appsv1.Deployment{...},
+    &corev1.Service{...},
+    &corev1.Secret{...},
+    &corev1.ConfigMap{...},
+}
+```
+
+Controller 不只監聽 `CephCluster` CRD，也監聽上述資源的變化。當 OSD Deployment 被誤刪時，Delete event 觸發 reconcile，Operator 重建它。
+
+Event 通過 predicate 過濾後才進入 queue，避免無關事件造成不必要的 reconcile：
+
+```go
+// pkg/operator/ceph/cluster/predicate.go（概念示意）
+// 只處理與 rook-ceph namespace 相關的事件
+func rookPredicate() predicate.Predicate { ... }
+```
+
+---
+
+## 狀態機與 Condition 更新
+
+Rook 使用 `status.conditions` 陣列傳遞 cluster 的當前階段：
+
+| Condition Type | 含義 |
+|---------------|------|
+| `Ready` | cluster 完全健康 |
+| `Progressing` | 正在執行某個設定步驟 |
+| `Failure` | reconcile 遇到不可恢復的錯誤 |
+
+```go
+// pkg/operator/ceph/cluster/cluster.go
+controller.UpdateCondition(
+    c.ClusterInfo.Context,
+    c.context,
+    c.namespacedName,
+    k8sutil.ObservedGenerationNotAvailable,
+    cephv1.ConditionProgressing,
+    v1.ConditionTrue,
+    cephv1.ClusterProgressingReason,
+    "Configuring Ceph Mons",
+)
+```
+
+`kubectl get cephcluster -o jsonpath='{.status.conditions}'` 可以即時追蹤 reconcile 進度，比看 pod log 更直觀。
+
+---
+
+## OSD 的 Reconcile 特殊邏輯
+
+OSD 的 reconcile 比其他 daemon 複雜，因為它需要先探索磁碟、再決定要建立哪些 pod：
+
+```go
+// pkg/operator/ceph/cluster/osd/osd.go
+func (c *Cluster) Start() error {
+    // 1. 驗證 topology label 一致性
+    if err := c.validateTopologyAcrossNodes(); err != nil { ... }
+
+    // 2. 驗證 OSD 設定（store type、加密）
+    if err := c.validateOSDSettings(); err != nil { ... }
+
+    // 3. 初始化 node ConfigMap
+    if err := c.initializeNodeConfigmaps(); err != nil { ... }
+
+    // 4. 掃描節點磁碟、啟動 prepare Job
+    // 5. 為每顆已佈建磁碟建立 OSD Deployment
+}
+```
+
+<Callout type="tip" title="跳過特定 OSD 的 reconcile">
+在 OSD Deployment 或特定 label 上加 annotation `rook.io/do-not-reconcile: "true"`，Operator 會跳過這個 OSD，讓你有時間做手動維護。
+</Callout>
+
+---
+
+## 升級期間的 Reconcile 行為
+
+當偵測到 `cephVersion.image` 變更，Operator 進入升級模式：
+
+1. 更新 monitor pod（先確認新版本啟動正常）
+2. 更新 mgr pod
+3. 逐一對 OSD 做 rolling update，每個 OSD 輪換前呼叫 `ceph osd ok-to-stop` 確認安全
+4. 更新其他 daemon（MDS、RGW）
+
+<Callout type="warning" title="升級期間 HEALTH_WARN 是正常的">
+Ceph 在 rolling update 過程中會短暫出現 `HEALTH_WARN`（部分 daemon 版本不一致）。這是預期行為，不需要人工介入。等 reconcile 完成後 cluster 會回到 `HEALTH_OK`。
+</Callout>
+
+---
+
+## 多 controller 並行保護
+
+```go
+// pkg/operator/ceph/cluster/cluster.go
+var telemetryMutex sync.Mutex
+
+type cluster struct {
+    // ...
+    monitoringRoutines sync.Map
+}
+```
+
+同一個 cluster 的 reconcile 以 namespace 為 key 進行序列化，避免並行 reconcile 造成衝突。不同 namespace 的 cluster 可以並行 reconcile。
+
+---
+
+## 延伸閱讀
+
+- [整體架構概覽](/rook/features/architecture) — 從全局理解各元件位置
+- [OSD 生命週期與 Monitor 仲裁](/rook/features/osds-monitors) — mon 與 OSD 的細節行為
+- [CSI Driver 架構](/rook/features/csi-driver) — CSI controller 如何與 Rook 互動

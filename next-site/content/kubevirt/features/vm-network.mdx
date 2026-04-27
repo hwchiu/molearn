@@ -1,0 +1,139 @@
+---
+layout: doc
+title: KubeVirt — VM 網路模型
+description: 解析 KubeVirt 的 Pod Network、Multus 多網卡與 SR-IOV 三種網路模型，以及 Bridge、Masquerade 綁定方式的差異。
+---
+
+## 工程師遇到的問題
+
+你的 VM 需要同時連接公司內網（需要 VLAN tagging）和叢集服務網路，但 Kubernetes 的 Pod 預設只有一張網卡。更複雜的是，VM 跑的是高頻交易系統，需要 SR-IOV 的 kernel bypass 低延遲網路——這些都需要超出預設 Pod network 的能力。
+
+## KubeVirt 的網路模型分層
+
+KubeVirt 的網路設定分兩層：
+
+- **`spec.networks`**：定義「這個 VMI 連到哪個網路來源」
+- **`spec.domain.devices.interfaces`**：定義「這個網卡用什麼方式綁定」
+
+兩者透過 `name` 欄位一對一對應：
+
+```yaml
+spec:
+  networks:
+    - name: default     # 對應下方 interface name
+      pod: {}           # 來源：K8s Pod network
+    - name: internal
+      multus:
+        networkName: bridge-network  # 來源：Multus NetworkAttachmentDefinition
+  domain:
+    devices:
+      interfaces:
+        - name: default
+          masquerade: {}  # 綁定方式
+        - name: internal
+          bridge: {}
+```
+
+## Pod Network：預設網路
+
+`PodNetwork` 讓 VM 共用 virt-launcher Pod 的網路 namespace，使 VM 可以存取 Kubernetes Service、DNS 和叢集內的其他服務：
+
+```go
+// staging/src/kubevirt.io/api/core/v1/schema.go
+type Network struct {
+    Name string `json:"name"`
+    Pod    *PodNetwork    `json:"pod,omitempty"`
+    Multus *MultusNetwork `json:"multus,omitempty"`
+}
+type PodNetwork struct {
+    VMNetworkCIDR     string `json:"vmNetworkCIDR,omitempty"`
+    VMIPv6NetworkCIDR string `json:"vmIPv6NetworkCIDR,omitempty"`
+}
+```
+
+### Masquerade 綁定
+
+Pod network 通常搭配 `masquerade` 綁定方式。virt-handler 在 virt-launcher Pod 的 network namespace 內設定 iptables/nftables NAT 規則，讓 VM 的流量透過 Pod IP 出去：
+
+```go
+// staging/src/kubevirt.io/api/core/v1/schema.go
+type InterfaceMasquerade struct{}  // 透過 NAT 共用 Pod IP
+```
+
+**優點：** 無需特殊 CNI 支援，與任何 Kubernetes CNI plugin 相容。
+**限制：** VM 的 IP 是私有地址（預設 `10.0.2.2/24`），外部不能直接連到 VM IP。
+
+### Bridge 綁定
+
+`bridge` 綁定在 Pod network namespace 內建立 Linux bridge，讓 VM 網卡直接連到 bridge：
+
+```go
+// staging/src/kubevirt.io/api/core/v1/schema.go
+type InterfaceBridge struct{}  // Linux bridge，VM 直接取得 Pod IP
+```
+
+<Callout type="warning" title="Bridge 與 Live Migration">
+使用 `bridge` 綁定在 Pod network 時，預設不支援 Live Migration（因為需要保留 bridge 狀態）。若必須搭配使用，需設定 annotation `kubevirt.io/allow-pod-bridge-network-live-migration: "true"`。
+</Callout>
+
+## Multus：多網卡支援
+
+`MultusNetwork` 讓 VM 額外連接由 [Multus CNI](https://github.com/k8snetworkplumbingwg/multus-cni) 管理的附加網路：
+
+```go
+// staging/src/kubevirt.io/api/core/v1/schema.go
+type MultusNetwork struct {
+    NetworkName string `json:"networkName"`
+    Default     bool   `json:"default,omitempty"`
+}
+```
+
+`networkName` 對應 `NetworkAttachmentDefinition` CRD 的名稱（可以跨 namespace 用 `namespace/name` 格式）。Multus 在 virt-launcher Pod 上建立額外的網路介面，virt-handler 再把這個介面橋接到 VM 的虛擬網卡。
+
+**常見使用場景：**
+- VLAN 隔離的內部網路
+- 專屬儲存網路（iSCSI、NFS over dedicated NIC）
+- Live Migration 專用的高速通道
+
+## SR-IOV：kernel bypass 高性能網路
+
+SR-IOV 讓 VM 直接存取 NIC 的 Virtual Function（VF），完全繞過 Linux kernel 的網路堆疊：
+
+```go
+// staging/src/kubevirt.io/api/core/v1/schema.go
+type InterfaceSRIOV struct{}  // vfio-pci passthrough
+```
+
+SR-IOV 透過 **vfio-pci** 驅動把 VF 直通（passthrough）給 QEMU，QEMU 再把它呈現給 VM 作為 virtio-net 或原生 NIC 裝置。
+
+```yaml
+# SR-IOV VMI 設定範例
+spec:
+  networks:
+    - name: sriov-net
+      multus:
+        networkName: sriov-network
+  domain:
+    devices:
+      interfaces:
+        - name: sriov-net
+          sriov: {}
+```
+
+<Callout type="tip" title="SR-IOV 的前提條件">
+使用 SR-IOV 需要：1) NIC 支援 SR-IOV 且已在 BIOS 啟用，2) node 上安裝 SR-IOV Network Device Plugin，3) 對應的 `NetworkAttachmentDefinition` 設定正確的 VF 資源。
+</Callout>
+
+## 三種模型比較
+
+| 網路類型 | IP 可見性 | Live Migration | 性能 | 設定複雜度 |
+|---|---|---|---|---|
+| Pod Network + Masquerade | Pod IP（NAT） | ✅ 支援 | 中 | 低 |
+| Pod Network + Bridge | Pod IP（直接） | ⚠️ 需額外設定 | 中 | 低 |
+| Multus + Bridge | 自定義 IP | ✅ 支援 | 中 | 中 |
+| SR-IOV | 自定義 IP | ❌ 不支援 | 高 | 高 |
+
+## 相關頁面
+
+- [整體架構](/kubevirt/features/architecture) — virt-handler 設定網路的時機
+- [Live Migration 實作](/kubevirt/features/live-migration) — 網路類型對 migration 可用性的影響

@@ -1,0 +1,147 @@
+---
+layout: doc
+title: KubeVirt — VM 磁碟管理
+description: 比較 ContainerDisk、PVC、DataVolume、HostDisk、EmptyDisk 五種磁碟來源的適用場景與實作方式。
+---
+
+## 工程師遇到的問題
+
+你想部署一台 Ubuntu VM，但不確定該用 `containerDisk` 還是 `dataVolume`——前者每次重啟資料都消失，後者需要先準備 PVC。當 VM 需要持久化資料、快速啟動、或跑臨時測試時，選錯磁碟類型會直接影響資料安全和啟動速度。
+
+## KubeVirt 的 Volume 模型
+
+VMI spec 中，`volumes` 定義「來源」，`domain.devices.disks` 定義「如何掛載」。一個 volume 可以對應一個 disk（block device）或 filesystem（virtiofs）。
+
+```yaml
+# 範例：VMI spec 結構
+spec:
+  domain:
+    devices:
+      disks:
+        - name: rootdisk
+          disk:
+            bus: virtio
+  volumes:
+    - name: rootdisk
+      containerDisk:
+        image: quay.io/containerdisks/fedora:latest
+```
+
+KubeVirt 的 `Volume` struct 定義在 `staging/src/kubevirt.io/api/core/v1/schema.go`，支援多種來源類型。
+
+## ContainerDisk：image 即磁碟
+
+`ContainerDisk` 把 container image 當作磁碟來源，image 內必須包含 QEMU 支援的磁碟格式（qcow2 或 raw）。
+
+```go
+// staging/src/kubevirt.io/api/core/v1/schema.go
+ContainerDisk *ContainerDiskSource `json:"containerDisk,omitempty"`
+```
+
+**工作原理：** virt-launcher 在啟動前先 pull image，把 image layer 中的磁碟檔案掛進 QEMU。每次 VM 重啟都從 image 原始狀態開始——**不保留寫入資料**。
+
+**適用場景：** 無狀態測試環境、CI/CD pipeline 中的臨時 VM、系統 image 分發。
+
+<Callout type="warning" title="ContainerDisk 的資料揮發性">
+ContainerDisk 的寫入資料存在 virt-launcher Pod 的 ephemeral storage 上。Pod 刪除後資料消失。需要持久化請搭配獨立的 PVC volume。
+</Callout>
+
+## DataVolume：CDI 管理的持久磁碟
+
+`DataVolume` 是 KubeVirt 與 Containerized Data Importer（CDI）整合的產物。建立 VMI 時，CDI 會自動從指定來源（HTTP URL、S3、Registry 等）匯入磁碟 image 到 PVC：
+
+```go
+// staging/src/kubevirt.io/api/core/v1/schema.go
+DataVolume *DataVolumeSource `json:"dataVolume,omitempty"`
+```
+
+VM 物件可以在 `spec.dataVolumeTemplates` 中定義 DataVolume 模板，讓 virt-controller 自動建立：
+
+```yaml
+# VM spec 使用 dataVolumeTemplates
+spec:
+  dataVolumeTemplates:
+    - metadata:
+        name: my-vm-disk
+      spec:
+        source:
+          http:
+            url: https://example.com/ubuntu-22.04.qcow2
+        pvc:
+          accessModes: [ReadWriteOnce]
+          resources:
+            requests:
+              storage: 20Gi
+  template:
+    spec:
+      volumes:
+        - name: rootdisk
+          dataVolume:
+            name: my-vm-disk
+```
+
+VMI Controller 在建立 virt-launcher Pod 之前，會先確認所有 DataVolume 已進入 `Succeeded` phase（即匯入完成），才繼續。
+
+## PVC 直接掛載
+
+若 PVC 已存在，可以直接引用而不透過 DataVolume：
+
+```go
+// staging/src/kubevirt.io/api/core/v1/schema.go
+type Volume struct {
+    // ...
+    PersistentVolumeClaim *PersistentVolumeClaimVolumeSource
+}
+```
+
+PVC 的 `accessMode` 限制影響 VM 行為：
+- `ReadWriteOnce`：只能在單一 node 上使用，Live Migration 時需要換 PVC 或使用 RWX
+- `ReadWriteMany`（RWX）：支援 Live Migration，VM 可以在不同 node 上存取同一塊磁碟
+
+<Callout type="info" title="Live Migration 與 RWX">
+要讓 VM 支援 [Live Migration](/kubevirt/features/live-migration)，root disk 必須使用 RWX PVC，或使用 `block migration`（透過網路複製磁碟資料，但速度較慢）。
+</Callout>
+
+## HostDisk：直接使用 node 上的檔案
+
+`HostDisk` 讓 VM 直接使用 node 本地的磁碟映像檔：
+
+```go
+// staging/src/kubevirt.io/api/core/v1/schema.go
+type HostDisk struct {
+    Path     string      `json:"path"`
+    Type     HostDiskType `json:"type"`
+    Capacity resource.Quantity `json:"capacity,omitempty"`
+    Shared   *bool       `json:"shared,omitempty"`
+}
+```
+
+`Type` 分為 `DiskOrCreate`（不存在則建立）和 `Disk`（必須存在）。因為直接依賴 node 本地路徑，HostDisk VM 不支援 Live Migration。
+
+## EmptyDisk：臨時資料磁碟
+
+`EmptyDisk` 建立一個與 VMI 生命週期相同的空白磁碟，常用於需要 swap 空間或臨時暫存的情境：
+
+```go
+// staging/src/kubevirt.io/api/core/v1/schema.go
+EmptyDisk *EmptyDiskSource `json:"emptyDisk,omitempty"`
+// EmptyDiskSource 只有一個欄位：
+type EmptyDiskSource struct {
+    Capacity resource.Quantity `json:"capacity"`
+}
+```
+
+## 選擇磁碟類型的決策樹
+
+| 需求 | 建議類型 |
+|---|---|
+| 快速測試、資料不重要 | `ContainerDisk` |
+| 需要持久化 + 自動匯入 image | `DataVolume` |
+| PVC 已存在、直接使用 | `PersistentVolumeClaim` |
+| 需要 node 本地高性能磁碟 | `HostDisk` |
+| 需要臨時 swap / scratch 空間 | `EmptyDisk` |
+
+## 相關頁面
+
+- [VMI 生命週期](/kubevirt/features/vmi-lifecycle) — DataVolume 就緒前 VMI 卡在 Pending
+- [Live Migration 實作](/kubevirt/features/live-migration) — 磁碟類型對 migration 的影響

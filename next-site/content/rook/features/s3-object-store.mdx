@@ -1,0 +1,205 @@
+---
+layout: doc
+title: Rook — CephObjectStore 與 RGW S3 API
+description: 解析 Rook 如何透過 CephObjectStore CRD 部署 Ceph RADOS Gateway，讓 Kubernetes 應用以 S3 API 存取物件儲存。
+---
+
+## 工程師面臨的問題
+
+你的應用已經使用 AWS S3 SDK，現在要在 on-premises 環境提供相容的物件儲存。你知道 Ceph 有 RADOS Gateway（RGW）可以提供 S3 API，但怎麼在 Kubernetes 裡部署、怎麼讓多個 namespace 的應用都能存取、怎麼做 bucket 的動態申請？
+
+---
+
+## CephObjectStore 架構
+
+Ceph 的 S3 兼容服務由 **RADOS Gateway（RGW）** daemon 提供。Rook 透過 `CephObjectStore` CRD 宣告 RGW 的完整部署規格：
+
+```
+CephObjectStore CRD
+     │
+     ▼
+ReconcileCephObjectStore
+     │
+     ├── CreateObjectStorePools (metadata + data pool)
+     ├── createRGW Deployment
+     └── createRGW Service (port 80 / 443)
+```
+
+---
+
+## CephObjectStore CRD 解析
+
+```yaml
+# deploy/examples/object.yaml
+apiVersion: ceph.rook.io/v1
+kind: CephObjectStore
+metadata:
+  name: my-store
+  namespace: rook-ceph
+spec:
+  metadataPool:
+    failureDomain: host
+    replicated:
+      size: 3
+  dataPool:
+    failureDomain: host
+    replicated:
+      size: 3
+    parameters:
+      bulk: "true"   # PG autoscaler 預配置足夠 PG
+  preservePoolsOnDelete: false
+  gateway:
+    port: 80
+    instances: 1
+    priorityClassName: system-cluster-critical
+```
+
+### Pool 設計
+
+RGW 使用多個 Ceph pool 存放不同類型資料：
+
+- **metadata pool**：儲存 bucket index、user 資料等 metadata，使用 replica（延遲敏感）
+- **data pool**：儲存物件本體，可使用 erasure coding 降低儲存成本
+- **root pool**：RGW 服務本身的設定資料
+
+```go
+// pkg/operator/ceph/object/objectstore.go
+func CreateObjectStorePools(context *Context, cluster *cephv1.ClusterSpec, ...) error {
+    if err := createSimilarPools(context, append(metadataPools, rootPool), cluster, metadataPool, rgwRadosPoolPgNum); err != nil {
+        return errors.Wrap(err, "failed to create metadata pools")
+    }
+    if err := createSimilarPools(context, []string{dataPoolName}, cluster, dataPool, ...); err != nil {
+        return errors.Wrap(err, "failed to create data pool")
+    }
+    // ...
+}
+```
+
+### Gateway 設定
+
+`gateway.instances` 控制 RGW pod 的副本數。生產環境建議 `instances: 2` 以上，配合 `podAntiAffinity` 讓 RGW 分散在不同 node：
+
+```yaml
+gateway:
+  instances: 2
+  placement:
+    podAntiAffinity:
+      preferredDuringSchedulingIgnoredDuringExecution:
+        - weight: 100
+          podAffinityTerm:
+            labelSelector:
+              matchExpressions:
+                - key: app
+                  operator: In
+                  values:
+                    - rook-ceph-rgw
+            topologyKey: kubernetes.io/hostname
+```
+
+---
+
+## Controller Reconcile 邏輯
+
+```go
+// pkg/operator/ceph/object/controller.go
+const controllerName = "ceph-object-controller"
+
+var waitForRequeueIfObjectStoreNotReady = reconcile.Result{
+    Requeue: true, RequeueAfter: 10 * time.Second,
+}
+```
+
+`ReconcileCephObjectStore` 監聽 Secret、Service、Deployment 的變化。若 RGW Deployment 意外刪除，controller 在下個 reconcile 週期（最多 10 秒後）重建它。
+
+---
+
+## S3 存取方式
+
+### 方式一：ObjectBucketClaim（應用自動申請）
+
+詳見 [StorageClass 與動態佈建](/rook/features/storage-classes) 的 Object StorageClass 章節。OBC 建立後，Rook 自動生成：
+
+- ConfigMap `<obc-name>`：含 `BUCKET_HOST`、`BUCKET_PORT`、`BUCKET_NAME`
+- Secret `<obc-name>`：含 `AWS_ACCESS_KEY_ID`、`AWS_SECRET_ACCESS_KEY`
+
+### 方式二：CephObjectStoreUser（固定帳號）
+
+```yaml
+apiVersion: ceph.rook.io/v1
+kind: CephObjectStoreUser
+metadata:
+  name: my-user
+  namespace: rook-ceph
+spec:
+  store: my-store
+  displayName: "My Object Store User"
+```
+
+建立後，Rook 在 `rook-ceph` namespace 生成 Secret `rook-ceph-object-user-my-store-my-user`，內含 S3 credentials。
+
+---
+
+## 跨 namespace 存取
+
+預設 CephObjectStoreUser 只能在 `rook-ceph` namespace 存取。若要讓其他 namespace 的應用使用：
+
+```yaml
+spec:
+  allowUsersInNamespaces:
+    - app-namespace
+    - "*"   # 允許所有 namespace
+```
+
+<Callout type="info" title="存取端點">
+Kubernetes 內部應用使用 Service DNS：`http://rook-ceph-rgw-my-store.rook-ceph.svc.cluster.local`。外部存取需要另外建立 Ingress 或 LoadBalancer Service。
+</Callout>
+
+---
+
+## 啟用 HTTPS 與加密
+
+```yaml
+gateway:
+  securePort: 443
+  sslCertificateRef: rgw-tls-secret  # TLS 憑證存放的 Secret 名稱
+```
+
+支援 Server-Side Encryption（SSE）：
+
+```yaml
+security:
+  kms:                     # SSE-KMS 模式，透過 Vault 管理金鑰
+    connectionDetails:
+      KMS_PROVIDER: "vault"
+      VAULT_ADDR: "http://vault:8200"
+    tokenSecretName: rook-vault-token
+  s3:                      # SSE-S3 模式
+    connectionDetails:
+      KMS_PROVIDER: "vault"
+```
+
+---
+
+## 健康檢查
+
+RGW pod 配備 startup probe 與 readiness probe，確保 pod 在 RGW 進程完全就緒後才接受流量：
+
+```yaml
+healthCheck:
+  startupProbe:
+    disabled: false
+  readinessProbe:
+    disabled: false
+```
+
+<Callout type="tip" title="監控 RGW 效能">
+Ceph Dashboard（透過 mgr 暴露）提供 RGW 的 ops/second、latency 儀表板。啟用 `monitoring.enabled: true` 後可在 Prometheus 查詢 `ceph_rgw_*` 指標。
+</Callout>
+
+---
+
+## 延伸閱讀
+
+- [CephCluster CRD 設計](/rook/features/ceph-cluster) — pool 與 cluster 的基礎設定
+- [StorageClass 與動態佈建](/rook/features/storage-classes) — ObjectBucketClaim 的完整使用方式
+- [Rook Operator Controller Reconcile 邏輯](/rook/features/ceph-controllers) — 理解 controller reconcile 的通用模式

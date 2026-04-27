@@ -1,1 +1,122 @@
-[]
+[
+  {
+    "id": 301,
+    "question": "virt-api 在 KubeVirt 架構中的主要職責是什麼？",
+    "options": [
+      "在每個 node 上以 DaemonSet 形式監聽 VMI，並呼叫 libvirt 啟動 QEMU",
+      "作為所有 KubeVirt 客製 API 的入口，提供 Webhook 驗證與 Subresource endpoint",
+      "透過 work queue 協調 VM/VMI/Migration 物件的 reconcile 迴路",
+      "每台 VM 一個 Pod，內含 libvirt 與 QEMU 進程"
+    ],
+    "answer": 1,
+    "explanation": "virt-api 透過 Kubernetes API Aggregation 掛載，提供 Validating/Mutating Webhook 及 /vnc、/console、/migrate 等 Subresource endpoint。實際 reconcile 邏輯由 virt-controller 處理，node 層操作由 virt-handler 處理。"
+  },
+  {
+    "id": 302,
+    "question": "VMI 的 phase 從 Scheduled 推進到 Running，是由哪個元件負責？",
+    "options": [
+      "virt-api，在收到 start subresource 請求後更新",
+      "virt-controller 的 VMI Controller，透過 watch Pod 狀態更新",
+      "virt-handler，在 node 上啟動 QEMU domain 後更新 VMI status",
+      "Kubernetes Scheduler，在 Pod 排程到 node 後自動更新"
+    ],
+    "answer": 2,
+    "explanation": "virt-handler 是 node 上的 DaemonSet，watch 到排程到本 node 的 VMI 後，透過 gRPC 呼叫 virt-launcher 的 SyncVMI，啟動 libvirt domain。QEMU domain 進入 running 狀態後，由 virt-handler 把 VMI phase 更新為 Running。"
+  },
+  {
+    "id": 303,
+    "question": "以下哪個 VMI phase 是專門用於 Live Migration 流程，一般正常啟動不會經過？",
+    "options": [
+      "Scheduling",
+      "Scheduled",
+      "WaitingForSync",
+      "Pending"
+    ],
+    "answer": 2,
+    "explanation": "WaitingForSync 是 Live Migration 情境下的特殊 phase，用於等待 target node 的 virt-handler 確認準備好接收 VM 記憶體。source code 中 types.go 對此有明確說明。"
+  },
+  {
+    "id": 304,
+    "question": "VM Controller 使用 RunStrategy: Always 時，當 VMI 正常關機（Succeeded）後會發生什麼？",
+    "options": [
+      "VM 物件被刪除，需要重新建立才能啟動",
+      "VMI 進入 Failed phase，等待人工介入",
+      "VM Controller 自動建立新的 VMI 物件，嘗試重新啟動 VM",
+      "VM 進入 Halted 狀態，不再重建"
+    ],
+    "answer": 2,
+    "explanation": "RunStrategy: Always 代表 VM Controller 永遠嘗試維持 VM 運行。VMI 進入 Succeeded 或 Failed 後，VM Controller 的 syncRunStrategy 會重新建立新的 VMI 物件。"
+  },
+  {
+    "id": 305,
+    "question": "VMI Controller 在建立 virt-launcher Pod 之前，會先等待什麼條件成立？",
+    "options": [
+      "等待 virt-handler 在目標 node 上完成 network namespace 設定",
+      "等待所有 DataVolume 進入 Succeeded phase（CDI 匯入完成）",
+      "等待 virt-api 發出 start webhook 確認",
+      "等待 node 上的 SR-IOV device plugin 回報 VF 可用"
+    ],
+    "answer": 1,
+    "explanation": "VMI Controller 的 execute() 函數會先呼叫 storagetypes.ListDataVolumesFromVolumes() 檢查所有 DataVolume 的狀態。若 DataVolume 尚未就緒（CDI 還在匯入），VMI 會停在 Pending 狀態，不會建立 virt-launcher Pod。"
+  },
+  {
+    "id": 306,
+    "question": "virt-launcher 的 SyncVMI 函數中，Convert_v1_VirtualMachineInstance_To_api_Domain 的作用是什麼？",
+    "options": [
+      "把 Kubernetes Secret 解密並注入到 VM 的環境變數",
+      "將 VMI spec（Go struct）轉換成 libvirt 可讀的 Domain XML 格式",
+      "把 containerdisk image 轉換成 raw 格式儲存到本地磁碟",
+      "驗證 VMI spec 是否符合 KubeVirt 的 admission webhook 規則"
+    ],
+    "answer": 1,
+    "explanation": "SyncVMI 中呼叫 converter.Convert_v1_VirtualMachineInstance_To_api_Domain(vmi, domain, c) 是核心步驟，它把 KubeVirt 的 VMI spec 翻譯成 libvirt XML，之後 libvirt 才能根據這份 XML 啟動 QEMU domain。"
+  },
+  {
+    "id": 307,
+    "question": "使用 ContainerDisk 作為 VM 的 root disk，以下敘述哪個正確？",
+    "options": [
+      "ContainerDisk 的資料會永久保存在對應的 PVC 中",
+      "VM 重啟後資料保留，但 Pod 刪除後資料消失",
+      "每次 VM 重啟都從 container image 的原始狀態開始，寫入資料不保留",
+      "ContainerDisk 需要搭配 CDI 才能使用，支援從 HTTP URL 匯入"
+    ],
+    "answer": 2,
+    "explanation": "ContainerDisk 的寫入資料存在 virt-launcher Pod 的 ephemeral storage，每次 VM 重啟都從 image 的原始狀態開始。這是 ContainerDisk 設計上的特性，適合無狀態測試環境。需要持久化必須搭配獨立的 PVC volume。"
+  },
+  {
+    "id": 308,
+    "question": "在 KubeVirt VM 網路設定中，Masquerade 綁定方式的主要特點是什麼？",
+    "options": [
+      "讓 VM 直接取得 Pod IP，外部可以直接連到 VM IP",
+      "透過 SR-IOV Virtual Function 完全繞過 Linux kernel 網路堆疊",
+      "透過 iptables/nftables NAT 讓 VM 共用 Pod IP，VM 使用私有地址",
+      "建立 Linux bridge 讓 VM 網卡直接連到 node 的實體網卡"
+    ],
+    "answer": 2,
+    "explanation": "Masquerade 在 virt-launcher Pod 的 network namespace 設定 NAT 規則，讓 VM 使用私有地址（預設 10.0.2.2/24），流量透過 Pod IP 進出。這與任何 CNI plugin 相容，是最通用的綁定方式，但 VM IP 對外不可見。"
+  },
+  {
+    "id": 309,
+    "question": "Live Migration 的 QEMU 記憶體傳輸採用什麼策略？",
+    "options": [
+      "Post-copy：先讓 VM 在 target 啟動，再按需拉取 source 的記憶體 pages",
+      "Pre-copy：先傳輸全部記憶體，反覆傳 dirty pages，最後短暫暫停做最終同步",
+      "全量停機複製：完整暫停 source VM，複製所有記憶體後再在 target 啟動",
+      "Snapshot：對 source 做記憶體 snapshot，傳輸到 target 後還原"
+    ],
+    "answer": 1,
+    "explanation": "QEMU Live Migration 預設採用 pre-copy 策略。先傳輸全部記憶體，再反覆傳輸 dirty pages，直到 dirty page rate 低於閾值，最後短暫暫停 VM（通常 < 100ms）做最後一次同步。KubeVirt 還設定了 parallelMultifdMigrationThreads = 8 條並行 TCP 連線加速傳輸。"
+  },
+  {
+    "id": 310,
+    "question": "以下哪種情況會導致 Live Migration 無法執行？",
+    "options": [
+      "VM 使用 Pod Network 搭配 Masquerade 綁定",
+      "VM 使用 DataVolume 作為 root disk，且 PVC accessMode 為 ReadWriteMany",
+      "VM 使用 SR-IOV 介面或 HostDisk 作為磁碟",
+      "VM 的 VMI phase 目前是 Running"
+    ],
+    "answer": 2,
+    "explanation": "SR-IOV 介面使用 vfio-pci passthrough 直通給 QEMU，無法在 migration 時遷移設備狀態；HostDisk 依賴 node 本地路徑，target node 不存在相同路徑。這兩種情況在 canMigrateVMI() 中會被判定為不可遷移。"
+  }
+]
