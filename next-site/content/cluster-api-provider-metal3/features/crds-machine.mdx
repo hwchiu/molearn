@@ -25,7 +25,7 @@ title: Metal3 Provider — 機器層級 CRD
 
 ## 概覽
 
-Metal3 Provider 定義兩個機器層級的 CRD，對應 CAPI 的 **InfraMachine 合約**，負責將 CAPI Machine 映射到實際的裸機伺服器：
+Metal3 Provider 定義兩個機器層級的 CRD，對應 CAPI 的 **InfraMachine 合約**，負責將 CAPI Machine 映射到實際的bare-metal伺服器：
 
 | CRD | 用途 |
 |-----|------|
@@ -52,7 +52,7 @@ Metal3 Provider 定義兩個機器層級的 CRD，對應 CAPI 的 **InfraMachine
 `Metal3Machine` 就像一張**餐廳訂位單**：
 
 - **訂位單（Metal3Machine）**：說明「我要一桌 4 人座，靠窗，要有插座」（image、networkdata 要求）
-- **實際桌子（BareMetalHost）**：符合條件的實體裸機
+- **實際桌子（BareMetalHost）**：符合條件的實體bare-metal
 - **訂位流程（chooseHost）**：餐廳服務員根據訂位要求找到合適的桌子
 - **入座確認（status.providerID 設定）**：客人坐下後，訂位單就與桌子綁定了
 

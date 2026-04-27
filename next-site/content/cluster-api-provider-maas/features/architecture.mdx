@@ -22,7 +22,7 @@ title: MAAS Provider — 架構設計
 
 ![MAAS 互動架構](/diagrams/maas/interaction-architecture.png)
 
-MAAS Provider 以標準 CAPI Infrastructure Provider 模式運作。MAAS（Metal as a Service）是 Canonical 開發的裸機雲端管理平台，能夠像管理雲端虛擬機一樣管理實體伺服器。CAPM 的職責是當 CAPI 說「給我一台機器」時，透過 MAAS API 自動分配、部署 OS、設定網路，最終回傳一台可以加入 Kubernetes cluster的實體node。
+MAAS Provider 以標準 CAPI Infrastructure Provider 模式運作。MAAS（Metal as a Service）是 Canonical 開發的bare-metal雲端管理平台，能夠像管理雲端虛擬機一樣管理實體伺服器。CAPM 的職責是當 CAPI 說「給我一台機器」時，透過 MAAS API 自動分配、部署 OS、設定網路，最終回傳一台可以加入 Kubernetes cluster的實體node。
 
 ![架構元件圖](/diagrams/maas/architecture-components.png)
 

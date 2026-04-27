@@ -45,9 +45,9 @@ Bootstrap Provider Controller 根據cluster設定（kubeadm token、CA 憑證等
 
 **第二站：Provisioning — 實體機器正在建立**
 
-Bootstrap 資料就緒後，Machine 進入 `Provisioning` 狀態，輪到 Infrastructure Provider 上場了。無論是 MAAS 上的裸機、Metal3 管理的 BareMetalHost，還是雲端的 VM，Infrastructure Provider 都在這個階段完成以下工作：
+Bootstrap 資料就緒後，Machine 進入 `Provisioning` 狀態，輪到 Infrastructure Provider 上場了。無論是 MAAS 上的bare-metal、Metal3 管理的 BareMetalHost，還是雲端的 VM，Infrastructure Provider 都在這個階段完成以下工作：
 
-- 讀取 userdata，開始 provisioning（VM 建立、裸機 OS 安裝等）
+- 讀取 userdata，開始 provisioning（VM 建立、bare-metal OS 安裝等）
 - 機器啟動後，cloud-init / ignition 執行 `kubeadm join`，嘗試加入cluster
 - Provisioning 完成後，回寫 `InfrastructureMachine.Status.ProviderID`
 

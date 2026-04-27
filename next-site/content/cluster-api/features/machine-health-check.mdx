@@ -35,7 +35,7 @@ MHC 的核心運作邏輯：
   - 自定義策略：透過 `remediationTemplate` 指定（如 Metal3Remediation 執行 BMC 重開機）
 - **Circuit Breaker 保護**：透過 `maxUnhealthy` 防止大量node同時被 remediate，避免cluster雪崩
 
-MHC 是保持cluster高可用性的重要機制，特別是在裸機環境中，node硬體故障時可自動觸發 BMC 重開機或重新 provisioning。
+MHC 是保持cluster高可用性的重要機制，特別是在bare-metal環境中，node硬體故障時可自動觸發 BMC 重開機或重新 provisioning。
 
 ---
 
@@ -171,19 +171,19 @@ spec:
 
 當 Machine 建立後，若在 `nodeStartupTimeout` 時間內 Node 仍未加入cluster，MHC 會將此 Machine 標記為不健康，進而觸發 remediation。
 
-- **預設值**：10 分鐘（對裸機環境可能不夠，建議設定 20–30 分鐘）
+- **預設值**：10 分鐘（對bare-metal環境可能不夠，建議設定 20–30 分鐘）
 - **設為 `0` 或不設定**：停用此檢查
 
 </Callout>
 
 
-**裸機環境建議：**
+**bare-metal環境建議：**
 
 ```yaml
-nodeStartupTimeout: 30m    # 裸機環境 provisioning 可能需要 20-30 分鐘
+nodeStartupTimeout: 30m    # bare-metal環境 provisioning 可能需要 20-30 分鐘
 ```
 
-裸機環境因需要 IPMI/Redfish 開機、PXE 啟動、OS 安裝等步驟，整體 provisioning 時間較雲端 VM 長，務必調整此值以避免誤觸 remediation。
+bare-metal環境因需要 IPMI/Redfish 開機、PXE 啟動、OS 安裝等步驟，整體 provisioning 時間較雲端 VM 長，務必調整此值以避免誤觸 remediation。
 
 ---
 

@@ -25,7 +25,7 @@ title: Cluster API — Core Controller 詳解
 
 ## 🌐 整體觀念：為什麼需要這些 Controllers？
 
-想像你是一個 Kubernetes 工程師，今天需要在雲端或裸機上建立一套三node的工作cluster。在傳統方式下，你需要手動建立 VM、安裝作業系統、執行 kubeadm init、設定網路……每個步驟出錯就要從頭再來，而且沒有辦法「自動修復」任何問題。某天一台node壞掉，你得半夜起床手動處理。
+想像你是一個 Kubernetes 工程師，今天需要在雲端或bare-metal上建立一套三node的工作cluster。在傳統方式下，你需要手動建立 VM、安裝作業系統、執行 kubeadm init、設定網路……每個步驟出錯就要從頭再來，而且沒有辦法「自動修復」任何問題。某天一台node壞掉，你得半夜起床手動處理。
 
 CAPI 的 Core Controllers 徹底改變了這個流程。你只需要宣告「我想要一個三nodecluster」，剩下的全部交給 Controllers 自動完成。更重要的是，這些 Controllers **永遠不停止監視**——哪天一台node意外壞掉，Controller 會自動偵測並替換，不需要人工介入。
 

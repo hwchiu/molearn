@@ -173,9 +173,9 @@ ntp:
 ```
 
 
-<Callout type="warning" title="裸機環境特別注意">
+<Callout type="warning" title="bare-metal環境特別注意">
 
-在裸機環境中，NTP 設定尤為重要。時鐘偏差（clock skew）會導致：
+在bare-metal環境中，NTP 設定尤為重要。時鐘偏差（clock skew）會導致：
 - **etcd cluster不穩定**：etcd 採用 Raft 一致性算法，對時間敏感
 - **憑證驗證失敗**：TLS 憑證的有效期間驗證依賴系統時鐘
 - **Kubernetes Token 過期**：bootstrap token 有時效限制
@@ -197,7 +197,7 @@ CABPK Controller 負責監聽 KubeadmConfig 物件，並依序完成以下步驟
 - CABPK Controller watch 所有 KubeadmConfig 物件，偵測到新建或未就緒的物件後開始處理
 
 <Callout type="tip" title="新手提示：Bootstrap Data 是什麼格式？">
-Bootstrap Data 本質上是一段「開機腳本」，格式通常是 **cloud-init**（cloud-config 格式）。當 Infrastructure Provider 建立一台新 VM 或裸機時，會把這段腳本作為 `user-data` 注入機器。機器第一次開機時，cloud-init 程式會自動執行這段腳本，安裝 containerd、kubelet，並執行 `kubeadm init` 或 `kubeadm join` 將node加入 Kubernetes cluster。整個過程完全自動，無需人工介入。
+Bootstrap Data 本質上是一段「開機腳本」，格式通常是 **cloud-init**（cloud-config 格式）。當 Infrastructure Provider 建立一台新 VM 或bare-metal時，會把這段腳本作為 `user-data` 注入機器。機器第一次開機時，cloud-init 程式會自動執行這段腳本，安裝 containerd、kubelet，並執行 `kubeadm init` 或 `kubeadm join` 將node加入 Kubernetes cluster。整個過程完全自動，無需人工介入。
 </Callout>
 
 ### Step 2 — 等待必要資訊就緒
@@ -245,7 +245,7 @@ spec:
 
 - `files` 欄位的語法與 cloud-init 略有不同，部分子欄位（如 `encoding`）的處理方式有差異
 - Ignition 的 `users` 和 `ntp` 設定也會轉換為對應的 Ignition 規格
-- 在 Metal3 環境中，BMH（BareMetalHost）支援透過 live-ISO 或 virtual media 方式注入 Ignition 設定，適合無狀態、不可變的裸機node管理場景
+- 在 Metal3 環境中，BMH（BareMetalHost）支援透過 live-ISO 或 virtual media 方式注入 Ignition 設定，適合無狀態、不可變的bare-metalnode管理場景
 
 > 💡 **思考一下**：Bootstrap Data 只能被使用一次（一次性 Secret）。如果機器開機失敗需要重試，CAPI 是如何處理的？為什麼不直接讓機器重新讀取同一份 Secret？
 

@@ -6,7 +6,7 @@
     {"id": "maasclusterctrl", "label": "MAASCluster Controller", "description": "協調 MAASCluster，設定 DNS VIP", "featureSlug": "controllers", "category": "controller", "position": {"x": 300, "y": 200}},
     {"id": "maasmachinectrl", "label": "MAASMachine Controller", "description": "協調 MAASMachine，呼叫 MAAS API 分配/釋放機器", "featureSlug": "controllers", "category": "controller", "position": {"x": 500, "y": 200}},
     {"id": "lifecycle", "label": "Machine Lifecycle", "description": "Allocate → Commission → Deploy → Release 狀態機", "featureSlug": "machine-lifecycle", "category": "lifecycle", "position": {"x": 300, "y": 350}},
-    {"id": "integration", "label": "MAAS API Integration", "description": "呼叫 MAAS REST API 完成裸機操作", "featureSlug": "integration", "category": "infra", "position": {"x": 100, "y": 350}}
+    {"id": "integration", "label": "MAAS API Integration", "description": "呼叫 MAAS REST API 完成bare-metal操作", "featureSlug": "integration", "category": "infra", "position": {"x": 100, "y": 350}}
   ],
   "edges": [
     {"id": "e-cluster-ctrl", "source": "maasclusterctrl", "target": "maascluster", "label": "reconciles"},

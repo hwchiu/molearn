@@ -4,7 +4,7 @@
     {"id": "metal3cluster", "label": "Metal3Cluster", "description": "InfraCluster 實作，管理 APIEndpoint", "featureSlug": "crds-cluster", "category": "api", "position": {"x": 400, "y": 50}},
     {"id": "metal3machine", "label": "Metal3Machine", "description": "InfraMachine 實作，綁定 BareMetalHost", "featureSlug": "crds-machine", "category": "api", "position": {"x": 200, "y": 200}},
     {"id": "metal3machinetemplate", "label": "Metal3MachineTemplate", "description": "Machine 範本，用於 MachineSet/KCP", "featureSlug": "crds-machine", "category": "api", "position": {"x": 400, "y": 200}},
-    {"id": "bmh", "label": "BareMetalHost (BMO)", "description": "Metal3 BMO 管理的裸機 CRD", "featureSlug": "bmh-lifecycle", "category": "infra", "position": {"x": 0, "y": 200}},
+    {"id": "bmh", "label": "BareMetalHost (BMO)", "description": "Metal3 BMO 管理的bare-metal CRD", "featureSlug": "bmh-lifecycle", "category": "infra", "position": {"x": 0, "y": 200}},
     {"id": "bmh-lifecycle", "label": "BMH Lifecycle", "description": "Provisioning → Running → Deprovisioning 狀態機", "featureSlug": "bmh-lifecycle", "category": "lifecycle", "position": {"x": 200, "y": 350}},
     {"id": "datatemplate", "label": "Metal3DataTemplate", "description": "為每台機器注入網路 / cloud-init 資料", "featureSlug": "data-templates", "category": "infra", "position": {"x": 600, "y": 200}},
     {"id": "ipam", "label": "IPAM", "description": "IP 位址池分配管理", "featureSlug": "ipam", "category": "infra", "position": {"x": 600, "y": 350}},

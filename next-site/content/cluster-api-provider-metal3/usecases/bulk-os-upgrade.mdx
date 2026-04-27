@@ -1,21 +1,21 @@
 ---
 layout: doc
-title: Metal3 — 批量裸機 OS 升級
-description: 如何在不重新配置 IP 和 hostname 的情況下，對 100 台裸機節點進行滾動 OS 升級，利用 Node Reuse 讓同一台裸機重新 provision 並自動加回 cluster
+title: Metal3 — 批量bare-metal OS 升級
+description: 如何在不重新配置 IP 和 hostname 的情況下，對 100 台bare-metal節點進行滾動 OS 升級，利用 Node Reuse 讓同一台bare-metal重新 provision 並自動加回 cluster
 ---
 
-# 使用情境：批量裸機 OS 升級
+# 使用情境：批量bare-metal OS 升級
 
-> **目標效果**：把 100 台裸機節點的 OS 從 Ubuntu 22.04 升到 24.04（或更換 K8s 版本），保持同一台機器的 IP 和 hostname 不變，服務不中斷，全程自動化無需人工登入機器。
+> **目標效果**：把 100 台bare-metal節點的 OS 從 Ubuntu 22.04 升到 24.04（或更換 K8s 版本），保持同一台機器的 IP 和 hostname 不變，服務不中斷，全程自動化無需人工登入機器。
 
 ## 你會遇到什麼問題
 
-裸機的 OS 升級比 VM 困難得多：
+bare-metal的 OS 升級比 VM 困難得多：
 
-- **無 Live Migration**：裸機不能像 VM 一樣在不關機的情況下遷移，必須 drain → decommission → 重裝 → rejoin
+- **無 Live Migration**：bare-metal不能像 VM 一樣在不關機的情況下遷移，必須 drain → decommission → 重裝 → rejoin
 - **IP 和 hostname 要保持**：某些服務（BGP peer、靜態路由、監控 target）是根據 IP 設定的，更換 IP 成本極高
 - **大量操作風險高**：100 台機器手動操作，每台需要 20+ 步驟，容易出錯
-- **新機器不一定可用**：裸機集群大小固定，不像雲端可以先加新機器再刪舊機器
+- **新機器不一定可用**：bare-metal集群大小固定，不像雲端可以先加新機器再刪舊機器
 
 ## 哪些元件協作解決這個問題
 

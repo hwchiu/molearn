@@ -27,7 +27,7 @@ title: Metal3 Provider — Data Templates 與 IPAM
 
 ## 什麼是 Metal3 Data Templates
 
-裸機node部署時，每台機器需要特定的設定——例如靜態 IP 位址、hostname、UUID 等。這些資訊無法預先硬編碼到image中，必須在部署時動態注入。
+bare-metalnode部署時，每台機器需要特定的設定——例如靜態 IP 位址、hostname、UUID 等。這些資訊無法預先硬編碼到image中，必須在部署時動態注入。
 
 ![Data Template 流程](/diagrams/metal3/data-template-flow.png)
 
@@ -222,7 +222,7 @@ Metal3Data 是每台機器的實際渲染結果：
 
 ## 完整資料流程
 
-以下為從模板定義到裸機 provisioning 的完整流程：
+以下為從模板定義到bare-metal provisioning 的完整流程：
 
 1. **使用者建立 Metal3DataTemplate**，定義 metadata 和 networkdata 的模板格式，並指定 IPPool 等資源引用。
 2. **CAPI 建立 Machine**，Metal3MachineReconciler 建立對應的 Metal3Machine。
@@ -231,7 +231,7 @@ Metal3Data 是每台機器的實際渲染結果：
 5. **Metal3DataReconciler 偵測到新的 Metal3Data** → 讀取對應的 Metal3DataTemplate → 根據 index、BMH 資訊、IPPool 結果填入變數進行渲染 → 建立 metadata Secret 和 networkdata Secret。
 6. **Metal3Data.Status.ready 設為 true**，Status 中填入 metaData 和 networkData 的 Secret 引用。
 7. **Metal3MachineReconciler 偵測到 Metal3Data 已 ready** → 取得 Secret 引用 → 將引用設定到 `BMH.spec.metaData` 和 `BMH.spec.networkData`。
-8. **BMO（Bare Metal Operator）讀取 Secrets** → 在 provisioning 時透過 Ironic 將 metadata 和 networkdata 注入裸機。
+8. **BMO（Bare Metal Operator）讀取 Secrets** → 在 provisioning 時透過 Ironic 將 metadata 和 networkdata 注入bare-metal。
 
 ---
 
@@ -247,7 +247,7 @@ Metal3Data 是每台機器的實際渲染結果：
 3. Metal3Data 渲染時，根據機器的 `index` 從 IPPool 取得唯一 IP
 4. 每台機器獲得固定、不重複的靜態 IP 位址
 
-此方式可確保cluster中每台裸機擁有可預期的靜態網路設定，便於 DNS 管理與安全策略設定。
+此方式可確保cluster中每台bare-metal擁有可預期的靜態網路設定，便於 DNS 管理與安全策略設定。
 
 </Callout>
 
@@ -258,7 +258,7 @@ Metal3Data 是每台機器的實際渲染結果：
 
 - Metal3Machine 的 `spec.dataTemplate` 留空，不設定任何引用
 - 不需要建立 Metal3DataTemplate、Metal3DataClaim、Metal3Data 等物件
-- BMH 的 `spec.networkData` 保持空白，裸機開機後自動透過 DHCP 取得 IP
+- BMH 的 `spec.networkData` 保持空白，bare-metal開機後自動透過 DHCP 取得 IP
 - 適合測試環境、概念驗證（PoC），或生產環境中已有成熟 DHCP 基礎設施的情況
 
 </Callout>

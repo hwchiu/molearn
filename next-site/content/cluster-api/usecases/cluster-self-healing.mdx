@@ -190,7 +190,7 @@ spec:
 
 ### 搭配 Metal3 實現 BMC 硬重啟
 
-如果 node 是裸機，OS 崩潰後 SSH 不通，預設的 delete Machine 可能無法釋放機器。這時可以透過 `remediationTemplate` 指向 [Metal3RemediationTemplate](/cluster-api-provider-metal3/features/remediation)，讓 Metal3 透過 BMC（iDRAC/iLO）強制重啟。
+如果 node 是bare-metal，OS 崩潰後 SSH 不通，預設的 delete Machine 可能無法釋放機器。這時可以透過 `remediationTemplate` 指向 [Metal3RemediationTemplate](/cluster-api-provider-metal3/features/remediation)，讓 Metal3 透過 BMC（iDRAC/iLO）強制重啟。
 
 ## 深入閱讀
 

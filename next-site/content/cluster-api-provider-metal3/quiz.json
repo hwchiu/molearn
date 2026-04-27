@@ -13,7 +13,7 @@
   },
   {
     "id": 2,
-    "question": "Q2. 以下哪個元件負責直接與 IPMI/Redfish 通訊來管理裸機電源？",
+    "question": "Q2. 以下哪個元件負責直接與 IPMI/Redfish 通訊來管理bare-metal電源？",
     "options": [
       "CAPM3（cluster-api-provider-metal3）",
       "Bare Metal Operator（BMO）",
@@ -21,7 +21,7 @@
       "Metal3MachineReconciler"
     ],
     "answer": 1,
-    "explanation": "Bare Metal Operator（BMO）負責直接與 IPMI/Redfish 等帶外管理介面通訊，管理 BareMetalHost 的電源狀態、韌體更新和 OS 安裝。CAPM3 是 CAPI 的 Infrastructure Provider，透過管理 BMH 物件間接控制裸機。"
+    "explanation": "Bare Metal Operator（BMO）負責直接與 IPMI/Redfish 等帶外管理介面通訊，管理 BareMetalHost 的電源狀態、韌體更新和 OS 安裝。CAPM3 是 CAPI 的 Infrastructure Provider，透過管理 BMH 物件間接控制bare-metal。"
   },
   {
     "id": 3,
@@ -126,7 +126,7 @@
       "Metal3Remediation 保持 Running 狀態等待人工介入",
       "Metal3Remediation 標記為 Failed，MachineHealthCheck 改用 CAPI 預設策略（刪除 Machine）",
       "自動增加 retryLimit 繼續重試",
-      "直接刪除 BMH 並請求新的裸機"
+      "直接刪除 BMH 並請求新的bare-metal"
     ],
     "answer": 1,
     "explanation": "當 Reboot 重試次數超過 retryLimit 後，Metal3Remediation 的 Status.Phase 會被標記為 Failed。此時 MachineHealthCheck controller 會改用 CAPI 預設的 Remediation 策略——刪除不健康的 Machine，讓 MachineSet 或 KCP 建立新的 Machine（需要完整的 deprovisioning 和 reprovisioning 流程）。"
@@ -148,7 +148,7 @@
     "question": "Q13. 下列哪種場景最適合使用 Node Reuse 功能？",
     "options": [
       "首次安裝新cluster",
-      "更換損壞的裸機硬體",
+      "更換損壞的bare-metal硬體",
       "Control Plane K8s 版本滾動升級",
       "水平擴展 Worker node"
     ],
