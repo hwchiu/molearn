@@ -1,0 +1,22 @@
+{
+  "projectId": "rook",
+  "nodes": [
+    {"id": "architecture", "label": "整體架構", "description": "Rook + Ceph 在 Kubernetes 中的定位與元件角色", "featureSlug": "architecture", "category": "infra", "position": {"x": 400, "y": 50}},
+    {"id": "ceph-cluster", "label": "CephCluster CRD", "description": "宣告整個 Ceph 叢集的設定，Rook 的核心 CRD", "featureSlug": "ceph-cluster", "category": "api", "position": {"x": 400, "y": 200}},
+    {"id": "ceph-controllers", "label": "Operator Controllers", "description": "監聽 CRD 變化，驅動 Ceph daemon 達到期望狀態", "featureSlug": "ceph-controllers", "category": "controller", "position": {"x": 150, "y": 370}},
+    {"id": "osds-monitors", "label": "OSD & Monitor", "description": "Ceph 核心：Monitor 仲裁叢集狀態，OSD 實際儲存資料", "featureSlug": "osds-monitors", "category": "lifecycle", "position": {"x": 650, "y": 370}},
+    {"id": "storage-classes", "label": "StorageClass", "description": "Block / File / Object 三種 StorageClass，動態佈建 PVC", "featureSlug": "storage-classes", "category": "api", "position": {"x": 150, "y": 540}},
+    {"id": "csi-driver", "label": "CSI Driver", "description": "動態 PVC 佈建與 Volume attach/mount 資料路徑", "featureSlug": "csi-driver", "category": "infra", "position": {"x": 400, "y": 540}},
+    {"id": "s3-object-store", "label": "S3 Object Store", "description": "RGW 提供 S3 相容 API，適合 AI 訓練資料集", "featureSlug": "s3-object-store", "category": "addon", "position": {"x": 650, "y": 540}}
+  ],
+  "edges": [
+    {"id": "e-arch-cluster", "source": "architecture", "target": "ceph-cluster", "label": "defines"},
+    {"id": "e-cluster-ctrl", "source": "ceph-cluster", "target": "ceph-controllers", "label": "reconciled by"},
+    {"id": "e-cluster-osds", "source": "ceph-cluster", "target": "osds-monitors", "label": "manages"},
+    {"id": "e-ctrl-osds", "source": "ceph-controllers", "target": "osds-monitors", "label": "drives", "animated": true},
+    {"id": "e-ctrl-sc", "source": "ceph-controllers", "target": "storage-classes", "label": "exposes"},
+    {"id": "e-sc-csi", "source": "storage-classes", "target": "csi-driver", "label": "backed by"},
+    {"id": "e-csi-osds", "source": "csi-driver", "target": "osds-monitors", "label": "writes via", "animated": true},
+    {"id": "e-osds-s3", "source": "osds-monitors", "target": "s3-object-store", "label": "stores"}
+  ]
+}
