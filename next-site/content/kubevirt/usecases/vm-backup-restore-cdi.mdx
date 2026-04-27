@@ -1,0 +1,556 @@
+---
+layout: doc
+title: KubeVirt — VM 備份還原與跨 Namespace 克隆
+description: 使用 CDI DataVolume snapshot 機制實現 VM 定期備份、快速還原，以及將 VM image 克隆到不同 namespace 作為開發環境模板
+---
+
+# 使用情境：VM 備份還原與跨 Namespace 克隆
+
+> **目標效果**：生產環境的 VM 每日自動建立 VolumeSnapshot 備份，發生 OS 損毀或誤刪時可在 10 分鐘內從任意備份點還原；同時，DevOps 團隊可以將生產 VM snapshot 克隆到 dev namespace，建立隔離的開發測試環境，整個過程無需複製完整磁碟資料。
+
+## 你會遇到什麼問題
+
+Kubernetes 上的 VM 面臨與傳統虛擬化環境相同的資料保護挑戰，但解決方案必須融入 Kubernetes 生態系：
+
+- **誤操作 OS 損毀**：VM 內部執行了錯誤的系統更新或設定，導致無法開機；需要快速回到上一個已知良好狀態
+- **勒索軟體攻擊**：VM 磁碟資料被加密；備份必須存放在 VM 無法存取的地方（不同的存儲 pool 或離線備份）
+- **Velero 備份不完整**：標準 Velero 備份 Kubernetes YAML 資源定義（VMI、PVC 的 spec），但 PVC 裡的實際磁碟資料（OS binary、應用資料）預設不包含在備份內，還原後 VM 是空的
+- **開發環境需要生產副本**：開發者希望用近似生產的環境測試，但直接複製整個磁碟（50-200GB）耗時且浪費空間
+- **VM 範本管理**：維運團隊希望維護標準化的「黃金映像」，各個 team 可以快速從範本建立 VM，但黃金映像更新後各 team 的環境應該可以選擇性升級
+
+## 哪些元件協作解決這個問題
+
+| 元件 | 職責 |
+|------|------|
+| [CDI DataVolume](/kubevirt/features/cdi-datavolume) | 管理 VM 磁碟的完整生命週期，支援從 snapshot、HTTP URL、其他 DataVolume 等多種來源建立磁碟 |
+| [VolumeSnapshot](/kubevirt/features/snapshot-restore) | Kubernetes CSI 標準的 snapshot API，建立 PVC 的時間點副本（依賴底層 CSI driver 支援） |
+| VolumeSnapshotClass | 定義使用哪個 CSI driver 的 snapshot 功能（Rook RBD 或 Rook CephFS） |
+| CronJob | 排程定期執行 snapshot 建立腳本，實現自動化備份 |
+| DataVolume (from snapshot) | 從 VolumeSnapshot 建立新的 DataVolume，作為還原或克隆的磁碟來源 |
+| CDI DataSource / DataImportCron | 跨 namespace 共享 DataVolume 來源的機制，讓不同 namespace 的 VM 引用同一個黃金映像 |
+
+## 協作流程
+
+```
+── 備份流程 ──────────────────────────────────────────────────────
+                                                    
+CronJob（每日 02:00）                               
+  │                                                  
+  ▼ 建立 VolumeSnapshot CRD                         
+VolumeSnapshot "vm-disk-backup-20240115"            
+  │                                                  
+  ▼ CSI driver（rook-ceph.rbd.csi.ceph.com）        
+Ceph RBD snapshot（copy-on-write，幾乎即時完成）    
+  │                                                  
+  ▼ snapshot 物件持久化                              
+VolumeSnapshot 狀態：readyToUse: true               
+
+── 還原流程 ──────────────────────────────────────────────────────
+
+故障 VM（OS 損毀）                                  
+  │                                                  
+  ▼ 工程師選擇還原點                                 
+建立 DataVolume（source: VolumeSnapshot）           
+  │                                                  
+  ▼ CDI controller 協調                             
+CDI Importer Pod 從 snapshot 建立新 PVC             
+  │（copy-on-write，寫入時才複製資料，幾乎即時）    
+  ▼                                                  
+建立新 VMI，掛載還原後的 DataVolume                 
+  │                                                  
+  ▼                                                  
+VM 從備份點開機（5-10 分鐘）                        
+
+── 跨 Namespace 克隆流程 ────────────────────────────────────────
+
+production namespace                  dev namespace   
+  DataVolume "golden-image" ──────────►  DataVolume "dev-vm-disk"
+  (黃金映像，production 維護)             source.ref: golden-image
+                                          (CDI 自動處理跨 namespace 複製)
+```
+
+## 最小可行配置
+
+### 第一步：建立 VolumeSnapshotClass（使用 Rook RBD）
+
+```yaml
+# volume-snapshot-class.yaml
+apiVersion: snapshot.storage.k8s.io/v1
+kind: VolumeSnapshotClass
+metadata:
+  name: csi-rbdplugin-snapclass
+  annotations:
+    # ★ 設為預設 snapshot class
+    snapshot.storage.kubernetes.io/is-default-class: "true"
+# ★ 使用 Rook RBD CSI driver
+driver: rook-ceph.rbd.csi.ceph.com
+parameters:
+  clusterID: rook-ceph
+  csi.storage.k8s.io/snapshotter-secret-name: rook-csi-rbd-provisioner
+  csi.storage.k8s.io/snapshotter-secret-namespace: rook-ceph
+# ★ Retain: snapshot 不隨 PVC 刪除而自動刪除
+deletionPolicy: Retain
+```
+
+```bash
+kubectl apply -f volume-snapshot-class.yaml
+
+# 確認 snapshot class 就緒
+kubectl get volumesnapshotclass
+# NAME                       DRIVER                            DELETIONPOLICY   AGE
+# csi-rbdplugin-snapclass    rook-ceph.rbd.csi.ceph.com       Retain           1m
+```
+
+### 第二步：手動建立一次 Snapshot（測試）
+
+```yaml
+# vm-snapshot.yaml
+apiVersion: snapshot.storage.k8s.io/v1
+kind: VolumeSnapshot
+metadata:
+  name: prod-vm-disk-snap-20240115
+  namespace: production
+  labels:
+    # ★ 用 label 追蹤備份的 VM 和日期，方便後續查詢
+    vm-name: prod-webserver
+    backup-date: "20240115"
+spec:
+  volumeSnapshotClassName: csi-rbdplugin-snapclass
+  source:
+    # ★ 指向要備份的 VM 磁碟 PVC
+    persistentVolumeClaimName: prod-webserver-disk
+```
+
+```bash
+kubectl -n production apply -f vm-snapshot.yaml
+
+# 監控 snapshot 建立狀態
+kubectl -n production get volumesnapshot prod-vm-disk-snap-20240115 -w
+# NAME                           READYTOUSE   SOURCEPVC              RESTORESIZE   AGE
+# prod-vm-disk-snap-20240115     true         prod-webserver-disk    50Gi          30s
+
+# readyToUse: true 表示 snapshot 建立完成（Ceph COW，通常幾秒內完成）
+```
+
+### 第三步：設定自動備份 CronJob
+
+```yaml
+# backup-cronjob.yaml
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: vm-backup-sa
+  namespace: production
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: vm-backup-role
+  namespace: production
+rules:
+  - apiGroups: ["snapshot.storage.k8s.io"]
+    resources: ["volumesnapshots"]
+    verbs: ["create", "get", "list", "delete"]
+  - apiGroups: [""]
+    resources: ["persistentvolumeclaims"]
+    verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: vm-backup-rolebinding
+  namespace: production
+subjects:
+  - kind: ServiceAccount
+    name: vm-backup-sa
+roleRef:
+  kind: Role
+  name: vm-backup-role
+  apiGroup: rbac.authorization.k8s.io
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: vm-daily-backup
+  namespace: production
+spec:
+  # ★ 每天凌晨 02:00 執行備份
+  schedule: "0 2 * * *"
+  concurrencyPolicy: Forbid    # 若上次備份未完成，不執行新備份
+  successfulJobsHistoryLimit: 7   # 保留最近 7 次成功記錄
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          serviceAccountName: vm-backup-sa
+          restartPolicy: OnFailure
+          containers:
+            - name: backup
+              image: bitnami/kubectl:latest
+              command:
+                - /bin/sh
+                - -c
+                - |
+                  DATE=$(date +%Y%m%d)
+                  VM_NAME="prod-webserver"
+                  PVC_NAME="prod-webserver-disk"
+                  SNAP_NAME="${VM_NAME}-backup-${DATE}"
+                  
+                  echo "Creating snapshot: ${SNAP_NAME}"
+                  
+                  # 建立今日備份
+                  cat <<EOF | kubectl apply -f -
+                  apiVersion: snapshot.storage.k8s.io/v1
+                  kind: VolumeSnapshot
+                  metadata:
+                    name: ${SNAP_NAME}
+                    namespace: production
+                    labels:
+                      vm-name: ${VM_NAME}
+                      backup-date: "${DATE}"
+                  spec:
+                    volumeSnapshotClassName: csi-rbdplugin-snapclass
+                    source:
+                      persistentVolumeClaimName: ${PVC_NAME}
+                  EOF
+                  
+                  # 等待 snapshot 就緒（最多 5 分鐘）
+                  kubectl -n production wait volumesnapshot/${SNAP_NAME} \
+                    --for=jsonpath='{.status.readyToUse}'=true \
+                    --timeout=300s
+                  
+                  # ★ 保留策略：刪除 30 天以前的 snapshot
+                  CUTOFF=$(date -d "30 days ago" +%Y%m%d 2>/dev/null || \
+                            date -v-30d +%Y%m%d)
+                  kubectl -n production get volumesnapshot \
+                    -l vm-name=${VM_NAME} \
+                    -o jsonpath='{range .items[*]}{.metadata.name} {.metadata.labels.backup-date}{"\n"}{end}' | \
+                  while read name date; do
+                    if [ "$date" -lt "$CUTOFF" ]; then
+                      echo "Deleting old snapshot: $name (date: $date)"
+                      kubectl -n production delete volumesnapshot/$name
+                    fi
+                  done
+                  
+                  echo "Backup completed: ${SNAP_NAME}"
+```
+
+### 第四步：從 Snapshot 還原 VM
+
+```yaml
+# restore-datavolume.yaml
+apiVersion: cdi.kubevirt.io/v1beta1
+kind: DataVolume
+metadata:
+  name: prod-webserver-restored
+  namespace: production
+spec:
+  # ★ 從 VolumeSnapshot 建立新的 DataVolume（COW，幾乎即時）
+  source:
+    snapshot:
+      namespace: production
+      name: prod-webserver-backup-20240114   # 選擇要還原的備份點
+  pvc:
+    accessModes:
+      - ReadWriteMany    # 維持 RWX 以支援 live migration
+    storageClassName: rook-cephfs
+    resources:
+      requests:
+        storage: 50Gi
+    volumeMode: Block
+```
+
+```yaml
+# restored-vm.yaml
+apiVersion: kubevirt.io/v1
+kind: VirtualMachine
+metadata:
+  name: prod-webserver-restored
+  namespace: production
+spec:
+  running: true
+  template:
+    spec:
+      evictionStrategy: LiveMigrate
+      domain:
+        cpu:
+          cores: 4
+        memory:
+          guest: 8Gi
+        devices:
+          disks:
+            - name: rootdisk
+              disk:
+                bus: virtio
+          interfaces:
+            - name: default
+              masquerade: {}
+      networks:
+        - name: default
+          pod: {}
+      volumes:
+        # ★ 掛載還原後的 DataVolume
+        - name: rootdisk
+          dataVolume:
+            name: prod-webserver-restored
+```
+
+```bash
+# 部署還原的 VM
+kubectl -n production apply -f restore-datavolume.yaml
+kubectl -n production apply -f restored-vm.yaml
+
+# 監控 DataVolume 建立進度
+kubectl -n production get datavolume prod-webserver-restored -w
+# NAME                      PHASE       PROGRESS    RESTARTS   AGE
+# prod-webserver-restored   Succeeded   100.0%                 45s
+
+# 確認 VM 開機
+kubectl -n production get vmi prod-webserver-restored
+```
+
+### 第五步：跨 Namespace 克隆（開發環境模板）
+
+<Callout type="info" title="CDI 跨 Namespace 克隆機制">
+CDI 的 DataVolume 支援引用其他 namespace 的 DataVolume 或 VolumeSnapshot 作為來源。
+CDI controller 會在兩個 namespace 之間建立臨時的 clone token，由 CDI Importer Pod 執行實際的資料複製（Ceph COW clone 幾乎瞬間完成）。
+使用前需要確認目標 namespace 有 `CDIConfig` 允許跨 namespace clone。
+</Callout>
+
+```yaml
+# cross-ns-clone.yaml
+# 在 dev namespace 建立一個 DataVolume，來源是 production 的 snapshot
+apiVersion: cdi.kubevirt.io/v1beta1
+kind: DataVolume
+metadata:
+  name: dev-vm-disk
+  namespace: dev-team-alpha    # ★ 目標 namespace
+spec:
+  source:
+    # ★ 引用 production namespace 的 snapshot（跨 namespace 克隆）
+    snapshot:
+      namespace: production
+      name: prod-webserver-backup-20240115
+  pvc:
+    accessModes:
+      - ReadWriteOnce    # dev 環境通常不需要 RWX
+    storageClassName: rook-ceph-block
+    resources:
+      requests:
+        storage: 50Gi
+    volumeMode: Block
+```
+
+```yaml
+# dev-vm.yaml
+apiVersion: kubevirt.io/v1
+kind: VirtualMachine
+metadata:
+  name: dev-webserver
+  namespace: dev-team-alpha
+spec:
+  running: true
+  template:
+    spec:
+      domain:
+        cpu:
+          cores: 2    # dev 環境降低資源配置
+        memory:
+          guest: 4Gi
+        devices:
+          disks:
+            - name: rootdisk
+              disk:
+                bus: virtio
+          interfaces:
+            - name: default
+              masquerade: {}
+      networks:
+        - name: default
+          pod: {}
+      volumes:
+        - name: rootdisk
+          dataVolume:
+            name: dev-vm-disk    # 使用跨 namespace 克隆的磁碟
+```
+
+### 第六步：建立黃金映像模板（DataImportCron）
+
+```yaml
+# golden-image-datasource.yaml
+# DataImportCron：定期從外部來源更新黃金映像，供所有 namespace 使用
+apiVersion: cdi.kubevirt.io/v1beta1
+kind: DataImportCron
+metadata:
+  name: ubuntu-2204-golden
+  namespace: kubevirt-os-images    # 存放黃金映像的專用 namespace
+spec:
+  # ★ 每週日凌晨更新最新 Ubuntu 22.04 cloud image
+  schedule: "0 0 * * 0"
+  managedDataSource: ubuntu-2204   # 建立/更新的 DataSource 名稱
+  template:
+    spec:
+      source:
+        http:
+          url: "https://cloud-images.ubuntu.com/jammy/current/jammy-server-cloudimg-amd64.img"
+      pvc:
+        accessModes:
+          - ReadWriteOnce
+        storageClassName: rook-ceph-block
+        resources:
+          requests:
+            storage: 10Gi
+        volumeMode: Block
+---
+# 其他 namespace 透過 DataSource 引用黃金映像
+# CDI 會自動建立指向最新版本的 DataVolumeSource
+apiVersion: cdi.kubevirt.io/v1beta1
+kind: DataVolume
+metadata:
+  name: new-vm-disk
+  namespace: team-b
+spec:
+  sourceRef:
+    # ★ 引用黃金映像 DataSource（自動取得最新版本）
+    kind: DataSource
+    namespace: kubevirt-os-images
+    name: ubuntu-2204
+  pvc:
+    accessModes:
+      - ReadWriteOnce
+    storageClassName: rook-ceph-block
+    resources:
+      requests:
+        storage: 30Gi
+    volumeMode: Block
+```
+
+## Velero 整合：完整的 VM 備份方案
+
+<Callout type="tip" title="Velero + CSI Snapshot 組合方案">
+單獨使用 VolumeSnapshot 只能備份磁碟資料；VM 的設定（VMI YAML、Service、ConfigMap）也需要備份。
+Velero 搭配 `velero-plugin-for-csi` 可以同時備份 Kubernetes 資源和 PVC 資料（透過 VolumeSnapshot），實現完整的 VM 備份還原。
+</Callout>
+
+```bash
+# 安裝 Velero with CSI plugin
+velero install \
+  --provider aws \
+  --plugins velero/velero-plugin-for-aws:v1.8.0,velero/velero-plugin-for-csi:v0.6.0 \
+  --bucket velero-backup \
+  --backup-location-config region=minio,s3ForcePathStyle=true,s3Url=http://minio.minio.svc:9000 \
+  --secret-file ./credentials-velero \
+  --features=EnableCSI    # ★ 啟用 CSI snapshot 整合
+
+# 備份整個 production namespace（含 VMI YAML + PVC snapshot）
+velero backup create prod-vm-backup-20240115 \
+  --include-namespaces production \
+  --snapshot-volumes=true \
+  --volume-snapshot-locations default
+
+# 監控備份進度
+velero backup describe prod-vm-backup-20240115
+
+# 還原整個 namespace 到另一個 cluster
+velero restore create --from-backup prod-vm-backup-20240115 \
+  --namespace-mappings production:production-restored
+```
+
+## 關鍵參數說明
+
+| 參數 | 位置 | 說明 | 建議值 |
+|------|------|------|--------|
+| `deletionPolicy` | VolumeSnapshotClass | snapshot 刪除策略 | `Retain`（防止誤刪） |
+| `source.snapshot` | DataVolume | 從 snapshot 建立磁碟 | 指定 namespace + name |
+| `sourceRef.kind: DataSource` | DataVolume | 引用黃金映像（DataImportCron 管理） | 搭配 DataImportCron 使用 |
+| `schedule` | CronJob / DataImportCron | 備份/更新排程 | 備份 `0 2 * * *`，映像更新 `0 0 * * 0` |
+| `concurrencyPolicy: Forbid` | CronJob | 防止備份任務重疊執行 | 必設 |
+| `volumeMode: Block` | PVC / DataVolume | VM 磁碟使用 block device | 效能優於 Filesystem mode |
+
+## 常見問題與解法
+
+### 問題 1：DataVolume 卡在 `ImportScheduled` 狀態
+
+```bash
+# 查看 CDI Importer Pod 的日誌
+kubectl -n production get pod | grep importer
+kubectl -n production logs importer-prod-webserver-restored
+
+# 常見原因：
+# 1. source snapshot 的 namespace 不允許跨 namespace clone
+#    確認 CDIConfig 允許
+kubectl get cdiconfig -o yaml | grep importProxy
+
+# 2. destination namespace 缺少 clone 權限的 ServiceAccount
+#    CDI 需要在 source namespace 建立 clone token
+kubectl -n production get rolebinding | grep cdi
+```
+
+### 問題 2：Snapshot 建立很慢（超過 5 分鐘）
+
+```bash
+# Ceph RBD snapshot 正常情況應在幾秒內完成（COW 機制）
+# 若很慢，通常是 CSI driver 在等待 PVC unmount
+# VM 使用中的 PVC 可以直接 snapshot（Ceph 支援在線 snapshot）
+
+# 確認 VolumeSnapshot 的 CSI driver 是否正確
+kubectl get volumesnapshot prod-vm-disk-snap-20240115 -o yaml | \
+  grep -A5 "status"
+
+# 若 readyToUse: false 超過 5 分鐘，查看 snapshot controller 日誌
+kubectl -n kube-system logs -l app=snapshot-controller
+```
+
+### 問題 3：跨 Namespace clone 失敗，提示 `permission denied`
+
+```yaml
+# CDI 跨 namespace clone 需要在 source namespace 建立 ClusterRole
+# 允許 CDI 在 source namespace 建立 clone token
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: cdi-cross-ns-clone
+  namespace: production    # source namespace
+subjects:
+  - kind: ServiceAccount
+    name: cdi-sa
+    namespace: cdi          # CDI 的 namespace
+roleRef:
+  kind: ClusterRole
+  name: edit
+  apiGroup: rbac.authorization.k8s.io
+```
+
+### 問題 4：還原的 VM 開機後資料不一致
+
+<Callout type="warning" title="Application-Consistent Snapshot 注意事項">
+Ceph RBD snapshot 是 storage-level snapshot，不保證應用層的一致性。
+對於資料庫（PostgreSQL、MySQL），snapshot 前應先讓資料庫 flush redo log（PostgreSQL: `SELECT pg_start_backup(...)`；MySQL: `FLUSH TABLES WITH READ LOCK`），再建立 snapshot，最後解除 lock。
+或者，在 VM 關機的情況下建立 snapshot（cold snapshot）以獲得 100% 一致的資料。
+</Callout>
+
+```bash
+# 使用 VM snapshot（KubeVirt 的 VirtualMachineSnapshot CRD）
+# 可以協調 guest agent 做 application quiesce 再 snapshot
+kubectl apply -f - <<EOF
+apiVersion: snapshot.kubevirt.io/v1beta1
+kind: VirtualMachineSnapshot
+metadata:
+  name: prod-webserver-consistent-snap
+  namespace: production
+spec:
+  source:
+    apiGroup: kubevirt.io
+    kind: VirtualMachine
+    name: prod-webserver
+  # ★ 啟用 guest agent 協助 quiesce（需要 VM 安裝 qemu-guest-agent）
+  indications:
+    - NoGuestAgent    # 移除此行啟用 guest agent quiesce
+EOF
+```
+
+## 深入閱讀
+
+- [CDI DataVolume 詳解](/kubevirt/features/cdi-datavolume) — DataVolume 狀態機、source 類型、importer Pod 運作原理
+- [Snapshot 與還原](/kubevirt/features/snapshot-restore) — VirtualMachineSnapshot CRD、application-consistent snapshot 機制

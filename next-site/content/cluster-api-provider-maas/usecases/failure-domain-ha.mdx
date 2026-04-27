@@ -1,0 +1,550 @@
+---
+layout: doc
+title: MAAS Provider — 利用 MAAS 可用區實現 Control Plane 高可用
+description: 將機房三個實體機架映射為 MAAS availability zone，透過 CAPI failure domain 讓三個 control plane 節點分散在不同機架，確保單一機架故障時 etcd 仍保有 quorum，cluster 持續可用
+---
+
+# 使用情境：利用 MAAS 可用區實現 Control Plane 高可用
+
+> **目標效果**：將機房三個實體機架（rack）各自映射為一個 MAAS availability zone，透過 `MaasCluster.spec.failureDomains` 讓 KubeadmControlPlane 把三個 etcd 成員分散部署在不同機架，任何單一機架完全斷電或網路中斷，cluster 依然有 2/3 etcd quorum 保持可用。
+
+## 你會遇到什麼問題
+
+### 三個 control plane 節點全部在同一個機架
+
+這是最常見的高可用誤區。工程師設定了 `replicas: 3`，以為三個節點就是高可用，實際上 CAPI 在沒有 failure domain 約束的情況下，會把三台機器分配到 MAAS 覺得方便的任何地方——很可能是同一個 resource pool 的相鄰機器，而這些機器正好都在同一個機架上。
+
+```
+錯誤的「高可用」配置（無 failure domain）：
+
+  Rack A                  Rack B                  Rack C
+  ┌─────────────────┐     ┌─────────────────┐     ┌─────────────────┐
+  │  cp-node-0 ★   │     │                 │     │                 │
+  │  cp-node-1 ★   │     │  (空的)         │     │  (空的)         │
+  │  cp-node-2 ★   │     │                 │     │                 │
+  └─────────────────┘     └─────────────────┘     └─────────────────┘
+         ↓
+  Rack A 斷電 → 三個 control plane 全滅 → etcd 無 quorum
+  → API server 無法回應 → 整個 cluster 掛掉
+```
+
+### etcd quorum 的數學
+
+etcd 是 Raft 共識算法，`n` 個成員需要 `(n/2)+1` 個成員存活才能繼續服務：
+
+| 成員數 | 需要存活數 | 可以容忍失效數 |
+|--------|------------|----------------|
+| 1      | 1          | 0              |
+| 3      | 2          | 1              |
+| 5      | 3          | 2              |
+
+三個成員分散三個機架，任何一個機架故障，還有 2 個成員存活，仍然滿足 quorum（2 ≥ 2）。若三個全在同一機架，機架故障 = 0 個成員存活 = 0 < 2，服務中斷。
+
+### 僅靠 MAAS 本身無法保證跨機架分散
+
+MAAS 的 resource pool 和 tag 只能做粗粒度過濾，無法表達「這三台機器必須在三個不同的 availability zone」的約束。這個跨 zone 分散的邏輯必須在 CAPI 層面用 failure domain 來表達。
+
+## 哪些元件協作解決這個問題
+
+| 元件 | 職責 |
+|------|------|
+| [架構概覽](/cluster-api-provider-maas/features/architecture) | CAPM 作為 Infrastructure Provider，負責把 CAPI 的 failure domain 抽象映射到 MAAS 的 availability zone |
+| [API Types](/cluster-api-provider-maas/features/api-types) | `MaasCluster.spec.failureDomains` 聲明哪些 zone 可用；`MaasMachine.spec.availabilityZone` 指定機器必須在哪個 zone |
+| [Failure Domain HA](/cluster-api-provider-maas/features/failure-domains-ha) | CAPM Controller 如何讀取 failure domain 資訊並在 MaasMachine Reconcile 時傳遞 zone 約束給 MAAS API |
+| KubeadmControlPlane | CAPI 核心元件，`replicas: 3` 時自動對照 failure domain 清單，把每個 replica 分配到不同 domain |
+| MAAS Availability Zones | MAAS 端的機架/網路區域抽象，是 failure domain 的物理實現 |
+
+## 概念映射：MAAS Zone → CAPI Failure Domain
+
+```
+物理世界                  MAAS 抽象                   CAPI 抽象
+────────────             ──────────────              ──────────────────
+機架 A（一號機房東側）  →  availability zone: rack-a  →  failureDomain: rack-a
+  ├── server-001
+  ├── server-002
+  └── server-003
+
+機架 B（一號機房西側）  →  availability zone: rack-b  →  failureDomain: rack-b
+  ├── server-004
+  ├── server-005
+  └── server-006
+
+機架 C（二號機房）      →  availability zone: rack-c  →  failureDomain: rack-c
+  ├── server-007
+  ├── server-008
+  └── server-009
+
+                         MaasCluster.spec.failureDomains 聲明上述三個 zone 都可用
+                                   ↓
+                         KubeadmControlPlane replicas=3 時：
+                           replica-0 → 選 rack-a 的機器
+                           replica-1 → 選 rack-b 的機器
+                           replica-2 → 選 rack-c 的機器
+```
+
+<Callout type="info" title="MAAS Availability Zone 與網路區域">
+MAAS availability zone 不僅是邏輯標籤，它通常也和 MAAS 的 fabric/space 配置對應。同一個 zone 的機器通常共享同一個交換機上行鏈路。這意味著整個機架的網路中斷（上行交換機故障）會讓整個 zone 的機器同時不可達，正好對應一個 failure domain 的故障邊界。
+</Callout>
+
+## 協作流程
+
+```
+管理員在 MAAS 設定三個 availability zone（rack-a, rack-b, rack-c）
+  ↓
+在每個 zone 的機器上加上對應的 availability zone 設定
+  ↓
+建立 MaasCluster，在 spec.failureDomains 聲明三個 zone
+  ↓
+MaasCluster Controller Reconcile
+  ├── 呼叫 MAAS API 取得 availability zones 清單
+  ├── 比對 spec.failureDomains 聲明的 zone
+  └── 填入 MaasCluster.status.failureDomains（CAPI 標準格式）
+  ↓
+KubeadmControlPlane Controller（replicas=3）
+  ├── 讀取 MaasCluster.status.failureDomains
+  ├── 為 replica-0 選擇 failureDomain: rack-a
+  │     → 建立 Machine（failureDomain: rack-a）
+  │       → 建立 MaasMachine（spec.availabilityZone: rack-a）
+  │         → CAPM 呼叫 MAAS allocate（constraints: zone=rack-a）
+  ├── 為 replica-1 選擇 failureDomain: rack-b（輪替）
+  └── 為 replica-2 選擇 failureDomain: rack-c（輪替）
+  ↓
+三個 etcd 成員分別在 rack-a, rack-b, rack-c 上線
+  ↓
+機架故障模擬（rack-a 斷電）
+  ├── etcd 成員 rack-a 不可達
+  ├── rack-b + rack-c 仍有 2 個成員（quorum = 2/3 ✓）
+  ├── API server 繼續服務讀寫請求
+  └── KubeadmControlPlane 偵測到一個 Machine NotReady
+        → 嘗試在 rack-a（或其他 zone）補充新 replica
+```
+
+## MAAS 端設定
+
+**第一步：確認或建立 availability zone（管理員執行一次）**
+
+```bash
+# 列出目前的 availability zones
+maas admin zones read | jq '.[].name'
+
+# 建立三個對應機架的 zone
+maas admin zones create name=rack-a description="一號機房東側機架 (ToR: sw-1a)"
+maas admin zones create name=rack-b description="一號機房西側機架 (ToR: sw-1b)"
+maas admin zones create name=rack-c description="二號機房主機架 (ToR: sw-2a)"
+
+# 把機器指定到對應的 zone
+# 先查機器的 system_id
+maas admin machines read | jq '.[] | {hostname: .hostname, id: .system_id, zone: .zone.name}'
+
+# 把 server-001~003 指定到 rack-a
+for id in <system_id_1> <system_id_2> <system_id_3>; do
+  maas admin machine update $id zone=rack-a
+done
+
+# 把 server-004~006 指定到 rack-b
+for id in <system_id_4> <system_id_5> <system_id_6>; do
+  maas admin machine update $id zone=rack-b
+done
+
+# 把 server-007~009 指定到 rack-c
+for id in <system_id_7> <system_id_8> <system_id_9>; do
+  maas admin machine update $id zone=rack-c
+done
+
+# 確認分配結果
+maas admin machines read | \
+  jq 'group_by(.zone.name) | 
+      map({zone: .[0].zone.name, count: length, 
+           machines: map(.hostname)})'
+```
+
+## 最小可行配置
+
+### 第一步：MaasCluster 聲明 Failure Domains
+
+```yaml
+# ha-cluster-maas.yaml
+apiVersion: infrastructure.cluster.x-k8s.io/v1alpha3
+kind: MaasCluster
+metadata:
+  name: prod-cluster-maas
+  namespace: default
+spec:
+  dnsDomain: maas.internal
+  controlPlaneEndpoint:
+    host: 192.168.10.100   # VIP，由外部 load balancer 或 keepalived 管理
+    port: 6443
+  # ★ 聲明哪些 availability zone 可作為 failure domain
+  # key 是 domain 名稱，對應 MAAS 的 availability zone 名稱
+  failureDomains:
+    rack-a:
+      controlPlane: true    # 這個 domain 可以放 control plane 節點
+    rack-b:
+      controlPlane: true
+    rack-c:
+      controlPlane: true
+```
+
+### 第二步：KubeadmControlPlane 三副本
+
+```yaml
+# ha-control-plane.yaml
+apiVersion: controlplane.cluster.x-k8s.io/v1beta1
+kind: KubeadmControlPlane
+metadata:
+  name: prod-cluster-kcp
+  namespace: default
+spec:
+  # ★ 三副本，搭配三個 failure domain，自動跨 zone 分散
+  replicas: 3
+  version: v1.29.4
+  machineTemplate:
+    infrastructureRef:
+      apiVersion: infrastructure.cluster.x-k8s.io/v1alpha3
+      kind: MaasMachineTemplate
+      name: prod-cp-template
+  kubeadmConfigSpec:
+    initConfiguration:
+      nodeRegistration:
+        kubeletExtraArgs:
+          # 讓 node 帶上 zone label，方便排程器感知
+          node-labels: "topology.kubernetes.io/zone=$(MAAS_ZONE)"
+    clusterConfiguration:
+      # ★ etcd 設定：data 路徑建議放在 NVMe（效能），
+      # 並設合理的 heartbeat/election timeout（機架間延遲通常 <1ms）
+      etcd:
+        local:
+          dataDir: /var/lib/etcd
+          extraArgs:
+            # 機架間 RTT 通常 < 1ms，預設值已夠用
+            heartbeat-interval: "100"
+            election-timeout: "1000"
+            # 開啟 peer TLS（生產環境必須）
+            peer-auto-tls: "true"
+      apiServer:
+        extraArgs:
+          # 讓 API server 在單 etcd 成員不可達時仍接受請求
+          # （剩餘 2/3 成員維持 quorum）
+          default-not-ready-toleration-seconds: "30"
+          default-unreachable-toleration-seconds: "30"
+```
+
+### 第三步：MaasMachineTemplate（Control Plane 用）
+
+```yaml
+# ha-cp-machine-template.yaml
+apiVersion: infrastructure.cluster.x-k8s.io/v1alpha3
+kind: MaasMachineTemplate
+metadata:
+  name: prod-cp-template
+  namespace: default
+spec:
+  template:
+    spec:
+      # ★ 注意：這裡不設定 availabilityZone
+      # KubeadmControlPlane 會根據 failure domain 輪替，
+      # 在建立 MaasMachine 時由 CAPM Controller 自動填入正確的 zone。
+      # 如果在 template 寫死 zone，三個 replica 會全部強制去同一個 zone。
+      resourcePool: "production-pool"
+      image: "ubuntu-22.04-lts-amd64"
+      minCPU: 8        # control plane 需要更多資源
+      minMemory: 16384  # 16 GB
+```
+
+<Callout type="warning" title="MaasMachineTemplate 不要寫死 availabilityZone">
+這是最常見的配置錯誤。在 `MaasMachineTemplate.spec.availabilityZone` 寫死一個 zone，所有從這個 template 建立的 MaasMachine 都會去同一個 zone，failure domain 輪替機制完全失效。`availabilityZone` 應該由 CAPM Controller 根據 KubeadmControlPlane 指派的 failure domain 動態填入。
+</Callout>
+
+### 第四步：完整 Cluster 宣告
+
+```yaml
+# ha-cluster-full.yaml
+---
+apiVersion: cluster.x-k8s.io/v1beta1
+kind: Cluster
+metadata:
+  name: prod-cluster
+  namespace: default
+spec:
+  clusterNetwork:
+    pods:
+      cidrBlocks: ["10.244.0.0/16"]
+    services:
+      cidrBlocks: ["10.96.0.0/12"]
+  infrastructureRef:
+    apiVersion: infrastructure.cluster.x-k8s.io/v1alpha3
+    kind: MaasCluster
+    name: prod-cluster-maas
+  controlPlaneRef:
+    apiVersion: controlplane.cluster.x-k8s.io/v1beta1
+    kind: KubeadmControlPlane
+    name: prod-cluster-kcp
+---
+# （MaasCluster、KubeadmControlPlane、MaasMachineTemplate 如上方配置）
+---
+# Worker node MachineDeployment（跨 zone 分散）
+apiVersion: cluster.x-k8s.io/v1beta1
+kind: MachineDeployment
+metadata:
+  name: prod-cluster-workers-rack-a
+  namespace: default
+spec:
+  clusterName: prod-cluster
+  replicas: 2
+  selector:
+    matchLabels:
+      cluster.x-k8s.io/cluster-name: prod-cluster
+      topology.kubernetes.io/zone: rack-a
+  template:
+    metadata:
+      labels:
+        cluster.x-k8s.io/cluster-name: prod-cluster
+        topology.kubernetes.io/zone: rack-a
+    spec:
+      version: v1.29.4
+      failureDomain: rack-a     # ★ Worker 也明確指定 zone
+      bootstrap:
+        configRef:
+          apiVersion: bootstrap.cluster.x-k8s.io/v1beta1
+          kind: KubeadmConfigTemplate
+          name: prod-worker-bootstrap
+      infrastructureRef:
+        apiVersion: infrastructure.cluster.x-k8s.io/v1alpha3
+        kind: MaasMachineTemplate
+        name: prod-worker-template-rack-a
+---
+# 同結構重複兩次，建立 rack-b 和 rack-c 的 MachineDeployment
+# prod-cluster-workers-rack-b（failureDomain: rack-b）
+# prod-cluster-workers-rack-c（failureDomain: rack-c）
+```
+
+### Worker 節點跨 Rack 的 MaasMachineTemplate
+
+```yaml
+# 每個 rack 一個 template，明確鎖定 availabilityZone
+# Worker 可以（也應該）寫死 zone，每個 MachineDeployment 對應一個 zone
+apiVersion: infrastructure.cluster.x-k8s.io/v1alpha3
+kind: MaasMachineTemplate
+metadata:
+  name: prod-worker-template-rack-a
+  namespace: default
+spec:
+  template:
+    spec:
+      availabilityZone: "rack-a"   # ★ Worker template 可以寫死 zone
+      resourcePool: "production-pool"
+      image: "ubuntu-22.04-lts-amd64"
+      minCPU: 4
+      minMemory: 8192
+---
+apiVersion: infrastructure.cluster.x-k8s.io/v1alpha3
+kind: MaasMachineTemplate
+metadata:
+  name: prod-worker-template-rack-b
+  namespace: default
+spec:
+  template:
+    spec:
+      availabilityZone: "rack-b"
+      resourcePool: "production-pool"
+      image: "ubuntu-22.04-lts-amd64"
+      minCPU: 4
+      minMemory: 8192
+---
+apiVersion: infrastructure.cluster.x-k8s.io/v1alpha3
+kind: MaasMachineTemplate
+metadata:
+  name: prod-worker-template-rack-c
+  namespace: default
+spec:
+  template:
+    spec:
+      availabilityZone: "rack-c"
+      resourcePool: "production-pool"
+      image: "ubuntu-22.04-lts-amd64"
+      minCPU: 4
+      minMemory: 8192
+```
+
+## 關鍵參數說明
+
+| 參數 | 位置 | 說明 |
+|------|------|------|
+| `spec.failureDomains` | `MaasCluster` | 聲明可用的 zone，key 必須與 MAAS availability zone 名稱完全一致（大小寫敏感）|
+| `spec.failureDomains[*].controlPlane` | `MaasCluster` | `true` 表示 KubeadmControlPlane 可以在此 zone 放 control plane；`false` 則只允許 worker |
+| `spec.availabilityZone` | `MaasMachine` | 由 CAPM Controller 根據 failure domain 動態填入（control plane 勿手動設定）|
+| `spec.replicas` | `KubeadmControlPlane` | 副本數應等於 failure domain 數量（或其倍數），確保每個 zone 都有 replica |
+| `spec.failureDomain` | `Machine`（CAPI 核心） | KubeadmControlPlane 在建立 Machine 時填入，CAPM 讀取此值決定 MaasMachine 的 zone |
+
+## 機架故障情境模擬
+
+### 模擬 rack-a 斷電
+
+```bash
+# 方法一：在 MAAS 端把 rack-a 的機器標記為斷電（測試用）
+maas admin machines read | \
+  jq '.[] | select(.zone.name == "rack-a") | .system_id' | \
+  xargs -I {} maas admin machine mark-broken {}
+
+# 觀察 cluster 狀態
+watch -n 5 kubectl get machines,maasmachines -A
+
+# 觀察 etcd 健康狀態（連到 rack-b 或 rack-c 上的 control plane）
+KUBECONFIG=./prod-cluster.kubeconfig \
+  kubectl -n kube-system exec -it etcd-<rack-b-node> -- \
+  etcdctl --cacert=/etc/kubernetes/pki/etcd/ca.crt \
+          --cert=/etc/kubernetes/pki/etcd/peer.crt \
+          --key=/etc/kubernetes/pki/etcd/peer.key \
+          endpoint status --cluster -w table
+```
+
+預期輸出（rack-a 機器不可達時）：
+
+```
++--------------------+------------------+---------+---------+-----------+
+|      ENDPOINT      |        ID        | VERSION | DB SIZE | IS LEADER |
++--------------------+------------------+---------+---------+-----------+
+| rack-b-node:2379   | 8e9e05c52164694d |  3.5.10 |   25 MB |     false |
+| rack-c-node:2379   | ebe3c1fc7...     |  3.5.10 |   25 MB |      true |
++--------------------+------------------+---------+---------+-----------+
+# rack-a 的 endpoint 超時，但另外兩個成員仍然有 quorum，cluster 可用
+```
+
+### API server 可用性確認
+
+```bash
+# rack-a 斷電後，API server 應仍可回應
+KUBECONFIG=./prod-cluster.kubeconfig kubectl get nodes
+# NAME              STATUS     ROLES           AGE
+# rack-a-cp-xxxx    NotReady   control-plane   5d   ← 不可達，但不影響整體
+# rack-b-cp-xxxx    Ready      control-plane   5d
+# rack-c-cp-xxxx    Ready      control-plane   5d
+# rack-a-worker-*   NotReady   <none>          5d   ← worker 也不可達
+# rack-b-worker-*   Ready      <none>          5d
+# rack-c-worker-*   Ready      <none>          5d
+```
+
+<Callout type="info" title="KubeadmControlPlane 自動修復">
+當 rack-a 的 control plane Machine 進入 `NotReady` 超過設定的 timeout，KubeadmControlPlane Controller 會嘗試建立替代 Machine。由於 rack-a 本身不可用，Controller 會根據 failure domain 可用性決定是否等待 rack-a 恢復，或在其他 zone 建立新成員（取決於 `MachineHealthCheck` 配置）。
+</Callout>
+
+## 進階：搭配 MachineHealthCheck 自動替換
+
+```yaml
+# 設定當 Machine 超過 5 分鐘 NotReady 時自動觸發替換
+apiVersion: cluster.x-k8s.io/v1beta1
+kind: MachineHealthCheck
+metadata:
+  name: prod-cp-health-check
+  namespace: default
+spec:
+  clusterName: prod-cluster
+  selector:
+    matchLabels:
+      cluster.x-k8s.io/control-plane: ""
+  unhealthyConditions:
+    - type: Ready
+      status: "False"
+      timeout: 5m
+    - type: Ready
+      status: Unknown
+      timeout: 5m
+  # control plane 最多允許 1 台同時不健康（超過則暫停替換，避免 quorum 喪失）
+  maxUnhealthy: "1"
+  # 替換間隔：避免快速連續替換造成 etcd 問題
+  nodeStartupTimeout: 20m
+```
+
+## 驗證 Failure Domain 分配是否正確
+
+```bash
+# 確認三個 control plane Machine 各在不同的 failure domain
+kubectl get machine -n default \
+  -l cluster.x-k8s.io/control-plane="" \
+  -o custom-columns='NAME:.metadata.name,FAILURE_DOMAIN:.spec.failureDomain,STATUS:.status.phase'
+
+# 預期輸出：
+# NAME                       FAILURE_DOMAIN  STATUS
+# prod-cluster-kcp-abc12     rack-a          Running
+# prod-cluster-kcp-def34     rack-b          Running
+# prod-cluster-kcp-ghi56     rack-c          Running
+
+# 確認 MaasMachine 的 availabilityZone 與 failure domain 對應
+kubectl get maasmachine -n default \
+  -l cluster.x-k8s.io/control-plane="" \
+  -o custom-columns='NAME:.metadata.name,ZONE:.spec.availabilityZone'
+
+# 透過 MAAS CLI 確認機器確實在對應的 zone
+maas admin machines read | \
+  jq '.[] | select(.status_name == "Deployed") | 
+      {hostname: .hostname, zone: .zone.name, ip: .ip_addresses[0]}'
+```
+
+## 常見問題與解法
+
+### Q1：三個 control plane 還是跑在同一個 zone
+
+**症狀**：`kubectl get machine` 顯示所有 Machine 的 `FAILURE_DOMAIN` 都是 `rack-a`。
+
+**原因排查**：
+
+```bash
+# 1. 確認 MaasCluster.status.failureDomains 是否被正確填入
+kubectl get maascluster prod-cluster-maas -o jsonpath='{.status.failureDomains}' | jq .
+# 預期：{"rack-a":{"controlPlane":true},"rack-b":{"controlPlane":true},"rack-c":{"controlPlane":true}}
+# 若為 null 或空，CAPM Controller 沒有成功從 MAAS 讀取 zone 資訊
+
+# 2. 確認 MAAS 端 zone 名稱是否與 MaasCluster.spec.failureDomains 的 key 完全一致
+maas admin zones read | jq '.[].name'
+```
+
+**常見原因**：
+- `spec.failureDomains` 的 key 和 MAAS zone 名稱大小寫不一致（`Rack-A` vs `rack-a`）
+- CAPM Controller 沒有 MAAS zone 讀取權限（MAAS API token 權限問題）
+- `MaasCluster.status.failureDomains` 尚未被填入（Controller 還在 Reconcile）
+
+### Q2：MaasMachine 建立失敗，錯誤是 `no machines available in zone rack-c`
+
+**原因**：rack-c 沒有處於 Ready 狀態的機器。
+
+```bash
+# 確認 rack-c 有可用機器
+maas admin machines read | \
+  jq '.[] | select(.zone.name == "rack-c" and .status_name == "Ready") | 
+      {hostname: .hostname, status: .status_name}'
+
+# 若 rack-c 的機器都在 Deployed 或其他狀態，需要釋放或新增機器
+```
+
+### Q3：機架恢復後，control plane 沒有自動恢復到三副本
+
+KubeadmControlPlane 預設不會在 Machine 恢復 Ready 後自動重新加入 etcd。需要設定 `MachineHealthCheck`（見上方設定），或手動刪除 `NotReady` 的 Machine 讓 KubeadmControlPlane 重新建立。
+
+```bash
+# 手動觸發替換（謹慎操作）
+# 先確認 etcd 目前健康（至少 2/3 成員正常）
+# 再刪除 NotReady 的 Machine
+kubectl delete machine prod-cluster-kcp-abc12 -n default
+# KubeadmControlPlane 會自動在適當的 failure domain 建立新 Machine
+```
+
+### Q4：worker node 的 workload 在 rack 故障後沒有重新排程
+
+Worker node NotReady 後，Kubernetes 排程器需要等待 `node.kubernetes.io/not-ready` toleration 超時（預設 300 秒），才會把 Pod 重新排程到其他 node。
+
+```yaml
+# 縮短 toleration，讓排程更快響應（視業務容忍度調整）
+# 在 Deployment 的 Pod template 設定
+spec:
+  tolerations:
+    - key: "node.kubernetes.io/not-ready"
+      operator: "Exists"
+      effect: "NoExecute"
+      tolerationSeconds: 60   # 60 秒後重新排程（預設 300）
+```
+
+## 深入閱讀
+
+- [架構概覽](/cluster-api-provider-maas/features/architecture) — CAPM 作為 Infrastructure Provider 的完整架構，以及如何實作 CAPI Provider 合約
+- [API Types](/cluster-api-provider-maas/features/api-types) — `MaasCluster.spec.failureDomains` 和 `MaasMachine.spec.availabilityZone` 的完整 CRD 欄位說明
+- [Failure Domain HA 實作原理](/cluster-api-provider-maas/features/failure-domains-ha) — CAPM Controller 如何讀取 MAAS zone 資訊並填入 `status.failureDomains`，以及 failure domain 輪替演算法的實作細節

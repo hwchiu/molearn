@@ -1,0 +1,439 @@
+---
+layout: doc
+title: Metal3 — 新機房 Zero-Touch Provisioning（ZTP）
+description: 電信業者收到一架 40 台 bare-metal 伺服器的新機架，如何無需親手操作任何一台伺服器，讓整機架從「電源關閉」自動變成「Kubernetes worker node」
+---
+
+# 使用情境：新機房 Zero-Touch Provisioning（ZTP）
+
+> **目標效果**：40 台全新 bare-metal 伺服器入架後，只要確認 BMC 網路通、DHCP/PXE 設定就緒，整個 onboarding 流程從人工 3 個工作天壓縮到 4 小時，零人工鍵盤操作，每台伺服器平均 15-20 分鐘完成 OS 安裝並加入 cluster。
+
+## 你會遇到什麼問題
+
+傳統 bare-metal 機房 onboarding 的痛點在「人工操作的線性時間成本」：
+
+- **逐台 BIOS 設定**：每台伺服器需要工程師插鍵盤螢幕，進 BIOS 設定 PXE boot 順序、關閉 Secure Boot（或匯入自簽憑證）、設定 IPMI/Redfish 帳號
+- **硬體清查耗時**：每台要記錄 MAC address、CPU 核心數、記憶體大小、硬碟型號，才能判斷要用哪個 MachineDeployment
+- **OS 安裝序列化**：工程師通常一次處理一台，40 台 × 2 小時 = 80 工時，約 3 個工作天
+- **人為錯誤累積**：IP 輸錯、hostname 抄錯、join token 過期——每個步驟都是一個潛在的故障點
+- **無審計軌跡**：人工操作留不下可追溯的操作記錄，發生問題難以回溯
+
+<Callout type="warning" title="ZTP 的前提條件">
+ZTP 不是「什麼都不用準備」。你需要提前完成：（1）BMC 網路可達（Out-of-Band 管理網路）、（2）DHCP/PXE 伺服器設定、（3）Ironic conductor 部署完成、（4）OS image 上傳到 image server。這些是一次性基礎設施設定，不是每台伺服器都要做的事。
+</Callout>
+
+## 哪些元件協作解決這個問題
+
+| 元件 | 職責 |
+|------|------|
+| [Ironic（ironic-inspector）](/cluster-api-provider-metal3/features/ironic-integration) | 透過 PXE 啟動 inspection ramdisk，自動探測硬體規格（CPU、RAM、磁碟、NIC MAC），回填 BareMetalHost status |
+| [BareMetalHost（BMO）](/cluster-api-provider-metal3/features/bmh-lifecycle) | 封裝 BMC 操作，追蹤每台 bare-metal 的 provisioning 狀態機（registering → inspecting → available → provisioning → provisioned）|
+| [Metal3MachineTemplate](/cluster-api-provider-metal3/features/architecture) | 宣告式描述 node 的硬體需求與 image，CAPI 用它來 claim BareMetalHost |
+| [MachineDeployment（CAPI）](/cluster-api-provider-metal3/features/architecture) | 宣告期望的 worker node 數量，自動從 available 的 BareMetalHost 中選取並 provision |
+| Redfish BMC | 提供遠端電源控制、Virtual Media boot，讓 Ironic 能在不接實體鍵盤的情況下操控伺服器 |
+| cloud-init / ignition | OS 啟動後自動執行：安裝 kubelet、設定 kubeconfig、將 node 加入 cluster |
+
+## 協作流程
+
+```
+[Phase 1：硬體發現]
+
+  新 bare-metal 入架，接上電源與 BMC 網路
+            ↓
+  (1) 工程師在 Kubernetes 建立 BareMetalHost（只填 BMC address + credentials）
+      spec.bmc.address: redfish+https://192.168.1.101/...
+      spec.inspect.metal3.io annotation = "" （觸發 inspection）
+            ↓
+  (2) Ironic 透過 Redfish 對伺服器發送 Power On 指令
+            ↓
+  (3) 伺服器 PXE boot → 載入 ironic-inspector ramdisk
+      ramdisk 收集：CPU cores、RAM GB、Disk size/model、NIC MAC address
+            ↓
+  (4) ramdisk 回傳硬體資料給 Ironic conductor
+      Ironic 更新 BareMetalHost.status.hardware（HardwareDetails）
+      BMH 狀態：registering → inspecting → available
+            ↓
+[Phase 2：Cluster 擴容]
+
+  (5) MachineDeployment replicas 設定為期望數量（如 40）
+      Metal3MachineTemplate 指定 image URL 與 rootDeviceHints
+            ↓
+  (6) CAPI MachineSet controller 發現 available 的 BareMetalHost
+      建立 Metal3Machine，Metal3Machine 綁定（consume）一個 BMH
+      BMH 狀態：available → provisioning
+            ↓
+  (7) Ironic 寫入 OS image（qcow2 或 raw）到目標磁碟
+      方法：Redfish Virtual Media 或 iSCSI deploy（取決於 driver）
+            ↓
+  (8) Ironic 透過 Redfish 重啟伺服器，從本機磁碟開機
+      BMH 狀態：provisioning → provisioned
+            ↓
+  (9) OS 啟動，cloud-init 執行：
+      - 設定 hostname（來自 Metal3DataTemplate）
+      - 安裝 kubelet、containerd
+      - 執行 kubeadm join（token 由 KubeadmConfigTemplate 產生）
+            ↓
+  (10) node 出現在 cluster，狀態變為 Ready
+       MachineDeployment 確認 replicas 達到期望數量
+```
+
+## 最小可行配置
+
+### 第一步：預先定義所有 BareMetalHost（只需 BMC 資訊）
+
+ZTP 的關鍵在於「你不需要知道每台伺服器的硬體規格」，只需要知道 BMC IP 和認證，Ironic inspector 會幫你填滿其他欄位。
+
+```yaml
+# 每台伺服器一個 BareMetalHost，可以用腳本批次產生
+apiVersion: metal3.io/v1alpha1
+kind: BareMetalHost
+metadata:
+  name: rack-a-node-01
+  namespace: metal3
+  annotations:
+    # ★ 這個 annotation 觸發 Ironic 主動探測硬體，無需等到有 Machine 來 claim 它
+    inspect.metal3.io: ""
+  labels:
+    # label 讓 Metal3MachineTemplate 的 nodeSelector 可以篩選
+    rack: rack-a
+    role: worker
+spec:
+  bmc:
+    # Redfish 是現代伺服器首選；舊機器可用 ipmi://
+    address: redfish+https://192.168.100.101/redfish/v1/Systems/1
+    credentialsName: rack-a-node-01-bmc-secret
+    disableCertificateVerification: true
+  # ★ bootMACAddress：PXE boot 用哪張 NIC，inspection 前就要知道
+  bootMACAddress: "aa:bb:cc:dd:01:01"
+  # ★ online: true 告訴 BMO 伺服器應該保持通電狀態
+  online: true
+  # ★ externallyProvisioned: false（預設），讓 Metal3 全程管理
+  externallyProvisioned: false
+---
+# BMC 認證 Secret（保存 iDRAC/iLO/BMC 帳密）
+apiVersion: v1
+kind: Secret
+metadata:
+  name: rack-a-node-01-bmc-secret
+  namespace: metal3
+type: Opaque
+stringData:
+  username: admin
+  password: "your-bmc-password"
+```
+
+<Callout type="tip" title="批次建立 40 台 BareMetalHost">
+實務上通常用腳本從機房的 DCIM（Data Center Infrastructure Management）系統匯出 CSV，再用 `envsubst` 或 Helm template 批次產生 40 個 BareMetalHost YAML，一次 `kubectl apply -f rack-a/` 全部下去。
+</Callout>
+
+### 第二步：確認 BareMetalHost 完成 inspection
+
+```bash
+# 監看所有 BMH 的狀態變化（-w 持續監看）
+kubectl get baremetalhost -n metal3 -w
+
+# 預期輸出（每台會依序經過這幾個狀態）：
+# NAME              STATE          CONSUMER   ONLINE   ERROR
+# rack-a-node-01    registering               true
+# rack-a-node-01    inspecting                true
+# rack-a-node-01    available                 true
+# rack-a-node-01    provisioning   md-abc12   true
+# rack-a-node-01    provisioned    md-abc12   true
+
+# 查看 Ironic inspection 後回填的硬體資訊
+kubectl get baremetalhost rack-a-node-01 -n metal3 -o yaml | grep -A 30 "hardware:"
+# 你會看到 cpu.count, ram.gigabytes, storage[].sizeGibibytes 等欄位
+```
+
+<Callout type="info" title="inspect.metal3.io annotation 的作用">
+如果建立 BareMetalHost 時**沒有**加上 `inspect.metal3.io: ""` annotation，BMH 會停在 `available` 狀態但沒有硬體資訊（`status.hardware` 為空）。加上這個 annotation 後，Ironic 會主動 PXE boot 伺服器並執行 inspection ramdisk，整個探測過程約 5-10 分鐘。
+</Callout>
+
+### 第三步：定義 Metal3MachineTemplate
+
+Metal3MachineTemplate 宣告如何從 BareMetalHost 建立一台 worker node，包含 image 來源與磁碟選擇邏輯。
+
+```yaml
+apiVersion: infrastructure.cluster.x-k8s.io/v1beta1
+kind: Metal3MachineTemplate
+metadata:
+  name: rack-a-worker-template
+  namespace: metal3
+spec:
+  template:
+    spec:
+      # ★ OS image：Ironic 會把這個 image 寫入目標磁碟
+      image:
+        url: http://image-server.internal/ubuntu-22.04-kube-v1.29.img
+        checksum: http://image-server.internal/ubuntu-22.04-kube-v1.29.img.sha256
+        checksumType: sha256
+        format: raw   # raw 比 qcow2 省略解壓縮，寫入更快
+      # ★ rootDeviceHints：告訴 Ironic 把 OS 裝到哪顆磁碟
+      # 避免每台伺服器磁碟順序不同造成裝錯碟
+      rootDeviceHints:
+        deviceName: /dev/sda
+        minSizeGigabytes: 200
+      # ★ dataTemplate：每個 node 的個別化資料（hostname、IP）
+      dataTemplate:
+        name: rack-a-worker-data-template
+      # ★ nodeSelector：只 claim 帶有這些 label 的 BareMetalHost
+      # 避免 cluster-a 的 MachineDeployment 搶走 cluster-b 預留的機器
+      hostSelector:
+        matchLabels:
+          rack: rack-a
+          role: worker
+```
+
+### 第四步：定義 Metal3DataTemplate（每台 node 的個別化資料）
+
+```yaml
+apiVersion: infrastructure.cluster.x-k8s.io/v1beta1
+kind: Metal3DataTemplate
+metadata:
+  name: rack-a-worker-data-template
+  namespace: metal3
+spec:
+  clusterName: production-cluster
+  # networkData：透過 cloud-init 設定每台 node 的靜態 IP
+  networkData:
+    links:
+      ethernets:
+        - id: enp1s0
+          type: phy
+          mtu: 9000
+    networks:
+      ipv4:
+        - id: enp1s0
+          link: enp1s0
+          # ★ fromIPPool：從 IPAM pool 自動分配 IP，不需要手動指定每台
+          ipAddressFromIPPool: rack-a-node-pool
+          routes:
+            - network: 0.0.0.0
+              prefix: 0
+              gateway:
+                fromIPPool: rack-a-node-pool
+  # metaData：cloud-init meta-data，設定 hostname
+  metaData:
+    strings:
+      - key: local-hostname
+        value: "rack-a-node-{{ `{{.Machine.Name}}` }}"
+```
+
+### 第五步：部署 MachineDeployment（觸發大規模 ZTP）
+
+```yaml
+apiVersion: cluster.x-k8s.io/v1beta1
+kind: MachineDeployment
+metadata:
+  name: rack-a-worker-md
+  namespace: metal3
+spec:
+  clusterName: production-cluster
+  # ★ 一次設定 40，CAPI 會從 available BMH 中依序 provision
+  replicas: 40
+  selector:
+    matchLabels:
+      cluster.x-k8s.io/deployment-name: rack-a-worker-md
+  template:
+    metadata:
+      labels:
+        cluster.x-k8s.io/deployment-name: rack-a-worker-md
+    spec:
+      clusterName: production-cluster
+      version: "v1.29.0"
+      bootstrap:
+        configRef:
+          apiVersion: bootstrap.cluster.x-k8s.io/v1beta1
+          kind: KubeadmConfigTemplate
+          name: rack-a-kubeadm-config
+      infrastructureRef:
+        apiVersion: infrastructure.cluster.x-k8s.io/v1beta1
+        kind: Metal3MachineTemplate
+        name: rack-a-worker-template
+---
+apiVersion: bootstrap.cluster.x-k8s.io/v1beta1
+kind: KubeadmConfigTemplate
+metadata:
+  name: rack-a-kubeadm-config
+  namespace: metal3
+spec:
+  template:
+    spec:
+      joinConfiguration:
+        nodeRegistration:
+          # ★ kubelet extra args：標記 node 來自哪個機架，方便 scheduling
+          kubeletExtraArgs:
+            node-labels: "topology.kubernetes.io/zone=rack-a"
+      # ★ preKubeadmCommands：在 kubeadm join 之前執行的指令
+      preKubeadmCommands:
+        - systemctl enable --now containerd
+        - swapoff -a
+      # ★ postKubeadmCommands：join 成功後設定
+      postKubeadmCommands:
+        - echo "node joined successfully" >> /var/log/ztp-complete.log
+```
+
+## 關鍵參數說明
+
+| 參數 | 位置 | 說明 |
+|------|------|------|
+| `inspect.metal3.io: ""` | BareMetalHost annotation | 觸發主動 inspection；值為空字串代表「執行 inspection」；設為 `disabled` 可跳過 inspection |
+| `bootMACAddress` | BareMetalHost spec | 指定 PXE boot 用的 NIC，避免伺服器有多張 NIC 時 PXE 從錯誤的網卡開機 |
+| `hostSelector.matchLabels` | Metal3MachineTemplate | 限制 Metal3Machine 只能 claim 帶有特定 label 的 BMH，用於多 cluster 或多機架隔離 |
+| `rootDeviceHints` | Metal3MachineTemplate | 告訴 Ironic OS image 要寫到哪顆磁碟，`minSizeGigabytes` 避免誤裝到小容量的 boot USB |
+| `image.format: raw` | Metal3MachineTemplate | raw 格式比 qcow2 省略解壓縮步驟，40 台同時 provision 時可減少 image server 的 CPU 負擔 |
+| `disableCertificateVerification` | BareMetalHost spec.bmc | 機房早期通常用自簽 TLS 憑證，這個欄位允許 Ironic 跳過 certificate 驗證 |
+
+<Callout type="warning" title="image server 頻寬規劃">
+40 台同時 provision，每個 OS image 假設 2GB raw，理論峰值是 80GB 同時傳輸。實務上 Ironic 有並發限制（`max_concurrent_builds` 參數，預設 20），但 image server 仍需有足夠頻寬。建議在機架內部部署 local image cache（Nginx），避免從外部拉取造成頻寬瓶頸。
+</Callout>
+
+## 監控 ZTP 進度
+
+### 查看整體進度
+
+```bash
+# 一眼看出 40 台各在哪個狀態
+kubectl get baremetalhost -n metal3 \
+  -o custom-columns=\
+"NAME:.metadata.name,\
+STATE:.status.provisioning.state,\
+CONSUMER:.spec.consumerRef.name,\
+ERROR:.status.errorMessage" | sort -k2
+
+# 預期在 provision 高峰期看到：
+# rack-a-node-01    provisioned    rack-a-worker-md-xxxxx
+# rack-a-node-02    provisioning   rack-a-worker-md-yyyyy
+# rack-a-node-03    provisioning   rack-a-worker-md-zzzzz
+# rack-a-node-04    available      (還沒被 claim)
+# ...
+```
+
+### 查看 MachineDeployment 完成進度
+
+```bash
+# 確認 replicas 是否達到期望數量
+kubectl get machinedeployment -n metal3 rack-a-worker-md
+# NAME               CLUSTER             REPLICAS   READY   UPDATED   UNAVAILABLE
+# rack-a-worker-md   production-cluster  40         38      40        2
+
+# 哪些 node 還沒 Ready？
+kubectl get machine -n metal3 \
+  -l cluster.x-k8s.io/deployment-name=rack-a-worker-md \
+  --field-selector='status.phase!=Running'
+```
+
+### 預估時間軸
+
+```
+時間 T+0:    kubectl apply -f bmc-secrets/ && kubectl apply -f bmh-rack-a/
+時間 T+0~10: 40 台同時開始 PXE boot，載入 inspection ramdisk（並發，10 分鐘）
+時間 T+10:   前幾台 BMH 進入 available 狀態，MachineDeployment 開始 claim
+時間 T+10~20 per server: Ironic 寫入 OS image、重啟、cloud-init 執行
+             （並發進行，Ironic 預設最多 20 台同時 provision）
+時間 T+50~70: 第一批 20 台完成；第二批 20 台開始 provision
+時間 T+90:   所有 40 台 provisioned，MachineDeployment READY=40
+時間 T+100:  kubectl get nodes 顯示 40 個 Ready 的 worker node
+```
+
+### 遇到失敗時如何診斷
+
+```bash
+# 查看特定 BMH 的錯誤訊息
+kubectl describe baremetalhost rack-a-node-05 -n metal3
+# 注意 Status.ErrorMessage 和 Events 欄位
+
+# 查看 Ironic conductor 日誌（provisioning 失敗的根因通常在這）
+kubectl logs -n baremetal-operator-system \
+  deployment/baremetal-operator -c ironic --since=30m \
+  | grep -i "rack-a-node-05\|error\|failed"
+
+# 強制重跑 inspection（修正 BMH annotation 後）
+kubectl annotate baremetalhost rack-a-node-05 -n metal3 \
+  inspect.metal3.io="" --overwrite
+
+# 若 BMH 卡在 provisioning error，手動清除錯誤並讓它重試
+kubectl annotate baremetalhost rack-a-node-05 -n metal3 \
+  baremetalhost.metal3.io/detached="" --overwrite
+# 然後刪除 annotation，讓 BMO 重新接管
+kubectl annotate baremetalhost rack-a-node-05 -n metal3 \
+  baremetalhost.metal3.io/detached- 
+```
+
+## 常見問題與解法
+
+### Q1：BMH 停在 `inspecting` 很久沒有變成 `available`
+
+**可能原因**：
+1. PXE boot 失敗（DHCP 沒收到、TFTP 超時）
+2. inspection ramdisk 下載失敗（image URL 404 或網路不通）
+3. ironic-inspector 服務異常
+
+**診斷步驟**：
+
+```bash
+# 查看 ironic-inspector 日誌
+kubectl logs -n baremetal-operator-system \
+  deployment/baremetal-operator -c ironic-inspector --since=20m
+
+# 確認 DHCP/TFTP 服務正常（在 PXE 網路上）
+# 通常是 dnsmasq 或 DHCP relay 的問題
+```
+
+### Q2：Ironic image 寫入失敗，BMH 進入 `provisioning error`
+
+**可能原因**：
+1. image checksum 不匹配（下載不完整或 checksum 寫錯）
+2. target 磁碟 rootDeviceHints 沒有匹配到任何磁碟
+3. Redfish Virtual Media 不支援（舊型 BMC），需要改用 iSCSI deploy
+
+```yaml
+# 修正 rootDeviceHints，改用更寬鬆的條件
+rootDeviceHints:
+  # 移除 deviceName，改用 size 條件
+  minSizeGigabytes: 100
+  # 或者用 model 字串匹配
+  model: "SAMSUNG"
+```
+
+### Q3：cloud-init 執行後 node 沒有加入 cluster
+
+**可能原因**：
+1. kubeadm join token 已過期（預設 24 小時）
+2. 網路 policy 阻擋了 node 到 control plane 的連線
+3. containerd 版本與 Kubernetes 版本不相容
+
+```bash
+# 重新產生 join token
+kubeadm token create --print-join-command
+
+# 更新 KubeadmConfigTemplate 的 joinConfiguration，重新 provision
+```
+
+### Q4：多個 MachineDeployment 互搶 BareMetalHost
+
+**解法**：善用 `hostSelector` + BareMetalHost label 做隔離。每個 cluster 或環境（staging/production）應該有不同的 label 組合：
+
+```yaml
+# production cluster 的 Metal3MachineTemplate
+hostSelector:
+  matchLabels:
+    environment: production
+    rack: rack-a
+
+# staging cluster 的 Metal3MachineTemplate
+hostSelector:
+  matchLabels:
+    environment: staging
+    rack: rack-b
+```
+
+<Callout type="tip" title="ZTP 自動化腳本參考">
+完整 ZTP 流程（從 CSV 機架清單到 40 個 BareMetalHost YAML）可以用約 50 行 Python 搭配 Jinja2 template 完成。核心邏輯是：讀取 DCIM 匯出的 CSV（含 BMC IP、MAC address）→ 渲染 BareMetalHost YAML → 渲染 BMC Secret YAML → kubectl apply。整個 Day 0 設定控制在 15 分鐘內完成。
+</Callout>
+
+## 深入閱讀
+
+- [BareMetalHost 生命週期](/cluster-api-provider-metal3/features/bmh-lifecycle) — BMH 狀態機詳解：每個狀態的觸發條件與允許的轉換路徑
+- [Ironic 整合](/cluster-api-provider-metal3/features/ironic-integration) — inspection ramdisk 工作原理、Redfish vs IPMI driver 選擇
+- [Metal3 架構總覽](/cluster-api-provider-metal3/features/architecture) — CAPI、BMO、Ironic 三層架構的職責分界與資料流

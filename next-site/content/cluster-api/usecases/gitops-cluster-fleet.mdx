@@ -1,0 +1,541 @@
+---
+layout: doc
+title: Cluster API — GitOps 驅動的大規模 Cluster Fleet 管理
+description: 以 ClusterClass 為版本化模板、ArgoCD 同步 Git 倉庫、CAPI Topology Rollout 安全執行金絲雀版本升級，統一管理 200+ 個 cluster 的生命週期
+---
+
+# 使用情境：GitOps 驅動的大規模 Cluster Fleet 管理
+
+> **目標效果**：平台團隊用一份 Git 倉庫作為 cluster fleet 的唯一可信來源，所有新增、更新、刪除 cluster 的操作全部走 Pull Request 流程，審計紀錄完整，K8s 版本升級以金絲雀方式逐步推出，任何一台出問題立即暫停而不波及整個 fleet。
+
+## 你會遇到什麼問題
+
+當企業規模擴大到 200 個以上 cluster 時，「手動管理」的方式會在三個層面同時崩潰：
+
+**問題一：版本漂移（Version Drift）**
+
+每個 cluster 由不同的 team 或 script 建立，六個月後你會發現：
+- 80 個 cluster 跑 v1.28，60 個跑 v1.29，40 個跑 v1.27
+- Control Plane 節點數量各不相同（有的 1 台、有的 3 台）
+- Node 的 bootstrap 設定（kubelet 參數、containerd 版本）在各環境有細微差異
+
+這些差異不是刻意的，是因為「建立 cluster 的 script 版本」沒有跟著 cluster 一起被追蹤。
+
+**問題二：沒有審計軌跡（No Audit Trail）**
+
+「是誰把 production cluster 從 3 台 control plane 縮成 1 台的？」
+在沒有 GitOps 的環境下，這個問題幾乎無法回答。`kubectl` 操作記錄分散在各人的 shell history，或者消失在 CI/CD pipeline 的臨時容器裡。
+
+**問題三：升級風險無法控制**
+
+要把 200 個 cluster 從 v1.29 升到 v1.30：
+- 沒辦法先升「低風險的 dev cluster」再升「高流量的 prod cluster」
+- 如果第 50 個 cluster 升到一半發現 CNI 不相容，你必須手動找出哪些 cluster 已經升了、哪些還沒
+- 回滾沒有標準流程
+
+<Callout type="warning" title="規模門檻">
+這套架構在 20 個 cluster 以下可能是 overengineering。它的價值從大約 30 個 cluster 開始顯現，在 100+ 個 cluster 時幾乎是必要的。
+</Callout>
+
+## 哪些元件協作解決這個問題
+
+| 元件 | 職責 |
+|------|------|
+| [ClusterClass + Topology](/cluster-api/features/clusterclass-topology) | 定義 cluster 的「黃金模板」，所有 cluster 都是這個模板的實例；版本升級改模板，所有實例跟著 rollout |
+| [Core Controller](/cluster-api/features/controller-core) | 監聽 Cluster 物件，偵測 topology 變更，驅動 KCP / MachineDeployment 的 reconcile |
+| [Cluster / Machine API](/cluster-api/features/api-cluster-machine) | 宣告式描述每個 cluster 的期望狀態；ArgoCD 同步的目標就是這些物件 |
+| [MachineDeployment](/cluster-api/features/api-machineset-machinedeployment) | Worker node 的滾動升級載體，由 Topology Controller 自動管理，不需手動修改 |
+| ArgoCD（外部工具） | 監聽 Git 倉庫，將 cluster manifests 同步到 management cluster，處理 drift 偵測與警報 |
+
+## 整體架構
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                        Git Repository                        │
+│                                                              │
+│  clusters/                                                   │
+│  ├── base/                                                   │
+│  │   └── clusterclass-v1.yaml   ← 黃金模板（版本化）          │
+│  ├── dev/                                                    │
+│  │   ├── cluster-dev-us-east.yaml                           │
+│  │   └── cluster-dev-eu-west.yaml                           │
+│  └── prod/                                                   │
+│      ├── cluster-prod-us-east.yaml                          │
+│      └── cluster-prod-ap-south.yaml                         │
+└──────────────────┬──────────────────────────────────────────┘
+                   │ ArgoCD 監聽 & 同步
+                   ▼
+┌─────────────────────────────────────────────────────────────┐
+│                    Management Cluster                        │
+│                                                              │
+│  ┌───────────────┐    ┌────────────────────────────────┐    │
+│  │  ArgoCD       │───▶│  CAPI Controllers              │    │
+│  │  Application  │    │  ┌──────────────────────────┐  │    │
+│  │               │    │  │  Topology Controller     │  │    │
+│  │  (drift 偵測) │    │  │  （讀取 ClusterClass，   │  │    │
+│  └───────────────┘    │  │   驅動 KCP + MD rollout） │  │    │
+│                       │  └──────────────────────────┘  │    │
+│                       └────────────────────────────────┘    │
+│                                  │                           │
+│                                  ▼                           │
+│              200+ Cluster 物件（每個都是 ClusterClass 實例）  │
+└─────────────────────────────────────────────────────────────┘
+                   │
+                   ▼ Provider API（AWS / MAAS / vSphere）
+         實際的 K8s Clusters（Workload Clusters）
+```
+
+## 協作流程
+
+### 流程一：新增 cluster（GitOps 流程）
+
+```
+工程師開 Pull Request
+  └── 在 clusters/prod/ 新增 cluster-prod-new.yaml
+             ↓
+  Code Review + Approval（審計軌跡在 Git）
+             ↓
+  PR 合併到 main branch
+             ↓
+  ArgoCD 偵測到 Git diff
+             ↓
+  ArgoCD sync：kubectl apply cluster-prod-new.yaml 到 management cluster
+             ↓
+  CAPI Topology Controller 讀取 Cluster.spec.topology.class
+  → 找到對應的 ClusterClass
+  → 展開（materialize）所有子資源：
+    ├── KubeadmControlPlane
+    ├── MachineDeployment（可多個）
+    └── Infrastructure Template（Provider 特定資源）
+             ↓
+  Provider Controller 建立實際 VM/BM 並 bootstrap
+             ↓
+  Cluster 狀態變為 Ready
+```
+
+### 流程二：金絲雀版本升級（Canary Rollout）
+
+```
+決定升級 fleet 從 v1.29 → v1.30
+             ↓
+步驟 1：在 Git 中建立新的 ClusterClass v1.30 版本
+  └── clusters/base/clusterclass-v130.yaml
+             ↓
+步驟 2：先只更新「canary 標記」的 cluster（5% of fleet）
+  └── 修改 clusters/dev/cluster-dev-canary.yaml
+      spec.topology.class: clusterclass-v130  ← 換成新版
+             ↓
+步驟 3：觀察 canary cluster 狀態（24-48 小時）
+  ├── 健康 → 繼續下一批（dev → staging → prod）
+  └── 失敗 → 在 Git 還原 class 欄位 → ArgoCD 自動回滾
+             ↓
+步驟 4：批次更新其餘 cluster（透過 PR + 批次 sed/kustomize 工具）
+             ↓
+步驟 5（可選）：使用 paused 欄位暫停問題 cluster 的 rollout
+  └── spec.paused: true → Topology Controller 不再對此 cluster 做任何變更
+```
+
+<Callout type="info" title="Topology Rollout 的安全機制">
+CAPI Topology Controller 在升級時並非同時更新所有子資源。它遵循 KCP 的 rollout 順序：先完成 Control Plane 升級（確保 etcd 仲裁），再啟動 MachineDeployment 的滾動升級。若中途任一步驟失敗，Controller 會停止並在 Cluster 物件的 Conditions 欄位記錄原因，而不是繼續破壞剩餘 node。
+</Callout>
+
+## 最小可行配置
+
+### 1. 定義 ClusterClass（黃金模板）
+
+這是整個 fleet 的核心。每次 K8s 升級，你只需要改這個 ClusterClass，所有引用它的 cluster 會依照各自的 rollout 策略跟著更新。
+
+```yaml
+# clusters/base/clusterclass-v129.yaml
+apiVersion: cluster.x-k8s.io/v1beta1
+kind: ClusterClass
+metadata:
+  name: platform-standard-v129
+  namespace: fleet-management
+  labels:
+    # ★ 用 label 標記版本，方便後續 ArgoCD ApplicationSet 選擇
+    platform.io/k8s-version: "1.29"
+    platform.io/class-generation: "v129"
+spec:
+  # ─── Control Plane 定義 ───────────────────────────────────────
+  controlPlane:
+    ref:
+      apiVersion: controlplane.cluster.x-k8s.io/v1beta1
+      kind: KubeadmControlPlaneTemplate
+      name: platform-kcp-template-v129
+      namespace: fleet-management
+    machineInfrastructure:
+      ref:
+        apiVersion: infrastructure.cluster.x-k8s.io/v1beta2
+        kind: AWSMachineTemplate
+        name: platform-cp-infra-v129
+        namespace: fleet-management
+    # ★ machineHealthCheck：所有使用此 ClusterClass 的 cluster 自動繼承
+    machineHealthCheck:
+      unhealthyConditions:
+        - type: Ready
+          status: "False"
+          timeout: 5m
+        - type: Ready
+          status: Unknown
+          timeout: 10m
+      maxUnhealthy: 34%
+
+  # ─── Worker 定義（可多個 MachineDeployment class） ────────────
+  workers:
+    machineDeployments:
+      - class: general-worker
+        template:
+          bootstrap:
+            ref:
+              apiVersion: bootstrap.cluster.x-k8s.io/v1beta1
+              kind: KubeadmConfigTemplate
+              name: platform-worker-bootstrap-v129
+              namespace: fleet-management
+          infrastructure:
+            ref:
+              apiVersion: infrastructure.cluster.x-k8s.io/v1beta2
+              kind: AWSMachineTemplate
+              name: platform-worker-infra-v129
+              namespace: fleet-management
+        strategy:
+          type: RollingUpdate
+          rollingUpdate:
+            maxUnavailable: 0
+            maxSurge: 1
+        # ★ Worker 也繼承 MachineHealthCheck
+        machineHealthCheck:
+          unhealthyConditions:
+            - type: Ready
+              status: "False"
+              timeout: 5m
+          maxUnhealthy: 40%
+
+      - class: gpu-worker
+        template:
+          bootstrap:
+            ref:
+              apiVersion: bootstrap.cluster.x-k8s.io/v1beta1
+              kind: KubeadmConfigTemplate
+              name: platform-gpu-bootstrap-v129
+              namespace: fleet-management
+          infrastructure:
+            ref:
+              apiVersion: infrastructure.cluster.x-k8s.io/v1beta2
+              kind: AWSMachineTemplate
+              name: platform-gpu-infra-v129
+              namespace: fleet-management
+
+  # ─── 變數：允許每個 cluster 實例覆寫特定參數 ─────────────────
+  variables:
+    - name: region
+      required: true
+      schema:
+        openAPIV3Schema:
+          type: string
+          enum: ["us-east-1", "eu-west-1", "ap-southeast-1"]
+    - name: workerReplicas
+      required: false
+      schema:
+        openAPIV3Schema:
+          type: integer
+          default: 3
+          minimum: 1
+          maximum: 100
+
+  # ─── Patches：把變數注入到 Template 裡 ───────────────────────
+  patches:
+    - name: inject-region
+      definitions:
+        - selector:
+            apiVersion: infrastructure.cluster.x-k8s.io/v1beta2
+            kind: AWSMachineTemplate
+            matchResources:
+              controlPlane: true
+              machineDeploymentClass:
+                names: ["general-worker", "gpu-worker"]
+          jsonPatches:
+            - op: replace
+              path: /spec/template/spec/ami/id
+              valueFrom:
+                variable: region
+```
+
+### 2. Cluster 實例 Manifest（Git 倉庫中每個 cluster 一個檔案）
+
+```yaml
+# clusters/prod/cluster-prod-us-east-01.yaml
+apiVersion: cluster.x-k8s.io/v1beta1
+kind: Cluster
+metadata:
+  name: prod-us-east-01
+  namespace: fleet-management
+  labels:
+    # ★ 這些 label 是 ArgoCD drift 偵測與金絲雀分組的關鍵
+    platform.io/env: production
+    platform.io/region: us-east-1
+    platform.io/canary: "false"     # 金絲雀升級時改為 "true"
+    platform.io/tier: critical
+spec:
+  # ★ 核心：引用 ClusterClass，而不是直接寫出所有子資源
+  topology:
+    class: platform-standard-v129        # ← 升級時只改這個欄位
+    version: v1.29.5                     # ← K8s patch version
+
+    # 傳入變數值（覆寫 ClusterClass default）
+    variables:
+      - name: region
+        value: "us-east-1"
+      - name: workerReplicas
+        value: 5
+
+    # ★ Control Plane 實例設定（覆寫 template 的部分欄位）
+    controlPlane:
+      replicas: 3                        # HA：3 台 control plane
+
+    # ★ Worker 實例設定
+    workers:
+      machineDeployments:
+        - class: general-worker
+          name: general
+          replicas: 5
+        - class: gpu-worker
+          name: gpu
+          replicas: 2
+          # 可以在實例層面覆寫 metadata，加 label 給 workload 排程使用
+          metadata:
+            labels:
+              node-role.kubernetes.io/gpu: ""
+
+  # ★ 暫停欄位：緊急時可在 Git 改這個欄位來停止 Topology Controller 的所有操作
+  # paused: false
+```
+
+<Callout type="tip" title="一個 cluster，一個 YAML 檔案">
+在 Git 倉庫中，建議每個 cluster 只有一個 YAML 檔案，而且這個 YAML 只包含 `Cluster` 物件（不含 KCP、MachineDeployment 等子資源）。Topology Controller 負責從 ClusterClass 展開這些子資源。這樣 Git diff 會非常清晰：你能一眼看出「這次 PR 把 prod-us-east-01 的 class 從 v129 換成 v130」。
+</Callout>
+
+### 3. ArgoCD ApplicationSet（自動為每個 cluster YAML 建立 ArgoCD Application）
+
+```yaml
+# argocd/applicationset-cluster-fleet.yaml
+apiVersion: argoproj.io/v1alpha1
+kind: ApplicationSet
+metadata:
+  name: cluster-fleet
+  namespace: argocd
+spec:
+  generators:
+    # ★ 使用 Git 目錄 generator：自動為 clusters/ 下每個子目錄建立 Application
+    - git:
+        repoURL: https://github.com/your-org/cluster-fleet
+        revision: main
+        directories:
+          - path: "clusters/dev/*"
+          - path: "clusters/staging/*"
+          - path: "clusters/prod/*"
+
+  template:
+    metadata:
+      name: "{{path.basenameNormalized}}"
+      labels:
+        app.kubernetes.io/managed-by: argocd-fleet
+    spec:
+      project: cluster-management
+      source:
+        repoURL: https://github.com/your-org/cluster-fleet
+        targetRevision: main
+        path: "{{path}}"
+      destination:
+        server: https://kubernetes.default.svc   # management cluster
+        namespace: fleet-management
+      syncPolicy:
+        automated:
+          prune: true          # ★ Git 刪除 cluster YAML → ArgoCD 自動刪除 Cluster 物件
+          selfHeal: true       # ★ 手動修改 Cluster 物件 → ArgoCD 自動還原（drift 修復）
+          allowEmpty: false
+        syncOptions:
+          - CreateNamespace=true
+          - ServerSideApply=true
+        retry:
+          limit: 5
+          backoff:
+            duration: 5s
+            factor: 2
+            maxDuration: 3m
+```
+
+### 4. 金絲雀升級的操作腳本
+
+```bash
+# ────── 步驟 1：準備新的 ClusterClass ──────
+# 複製現有 ClusterClass，修改 K8s 版本相關的 template 引用
+cp clusters/base/clusterclass-v129.yaml clusters/base/clusterclass-v130.yaml
+# 修改 name、template 引用，以及 KubeadmControlPlaneTemplate 中的 version
+
+# ────── 步驟 2：找出 canary cluster ──────
+# 通常選擇 dev 環境或標記了 canary: "true" 的 cluster
+kubectl get clusters -n fleet-management \
+  -l platform.io/canary=true \
+  --no-headers | awk '{print $1}'
+
+# ────── 步驟 3：在 Git 中更新 canary cluster ──────
+# 用 yq 或手動編輯
+yq eval '.spec.topology.class = "platform-standard-v130"' \
+  -i clusters/dev/cluster-dev-canary.yaml
+
+# 提交並開 PR，等待 code review
+git add clusters/dev/cluster-dev-canary.yaml
+git commit -m "feat(cluster-fleet): canary upgrade dev-canary to ClusterClass v130"
+git push origin canary/k8s-v130
+
+# ────── 步驟 4：觀察 Topology rollout 進度 ──────
+# 等待 ArgoCD sync 完成後，持續觀察
+watch kubectl get cluster prod-us-east-canary \
+  -n fleet-management \
+  -o jsonpath='{.status.conditions[*]}'
+
+# 更細粒度：觀察 KCP 的升級進度
+kubectl get kubeadmcontrolplane \
+  -n fleet-management \
+  -l cluster.x-k8s.io/cluster-name=dev-canary \
+  -w
+
+# ────── 步驟 5：如果 canary 失敗，立即暫停並回滾 ──────
+# 方法 A：在 Git 還原（推薦，保留審計軌跡）
+git revert HEAD
+git push origin canary/k8s-v130
+
+# 方法 B：緊急暫停，避免 Topology Controller 繼續操作
+kubectl patch cluster dev-canary \
+  -n fleet-management \
+  -p '{"spec":{"paused":true}}' \
+  --type merge
+
+# ────── 步驟 6：批次升級所有 cluster（canary 成功後）──────
+# 用 sed 批次替換（謹慎使用，建議先 dry-run）
+find clusters/prod -name "*.yaml" -exec \
+  sed -i 's/class: platform-standard-v129/class: platform-standard-v130/g' {} \;
+
+# 驗證變更
+git diff clusters/prod/
+
+# 開 PR 審查後合併
+```
+
+## 關鍵參數說明
+
+### ClusterClass 版本策略
+
+| 策略 | 做法 | 適合情境 |
+|------|------|----------|
+| 並存多版本 | 同時維護 `clusterclass-v129`、`clusterclass-v130` | 多個 cluster 在不同升級階段 |
+| 滾動替換 | 逐步將 cluster 的 `spec.topology.class` 改指向新版 | 金絲雀升級 |
+| 原地修改 | 直接修改既有 ClusterClass | 小變更（如 kubelet 參數），但所有 cluster 同時受影響 |
+
+<Callout type="warning" title="不要原地修改用於生產的 ClusterClass">
+如果 200 個 prod cluster 都引用同一個 ClusterClass，直接修改它會讓 Topology Controller 同時對所有 cluster 發起 reconcile。雖然每個 cluster 各自的 rollout 是安全的，但同時 200 個 rollout 可能對 management cluster 的 API server 造成壓力。建議使用「建立新版 ClusterClass + 分批切換 cluster」的策略。
+</Callout>
+
+### `spec.paused` 欄位的使用時機
+
+```yaml
+spec:
+  paused: true   # Topology Controller、MachineHealthCheck 全部停止對此 cluster 操作
+```
+
+- **使用時機**：canary 升級失敗、緊急維護視窗、Provider 故障需要暫停自動修復
+- **副作用**：MachineHealthCheck 也會停止，不健康的 node 不會被自動修復
+- **還原**：改回 `paused: false`，或在 Git 中刪除這個欄位後 ArgoCD sync
+
+### ArgoCD `selfHeal` 與 CAPI 的互動
+
+當 `selfHeal: true` 時，任何直接修改 management cluster 上 Cluster 物件的操作都會被 ArgoCD 還原。這正是我們想要的「Git 是唯一可信來源」行為。
+
+但有一個例外：**CAPI Controller 會更新 Cluster 物件的 `status` 欄位**，ArgoCD 的 sync 機制會忽略 `status` 的差異（ArgoCD 比較的是 spec，不是 status）。
+
+## 常見問題與解法
+
+### Q1：ArgoCD 一直報 OutOfSync，但 Git 沒有變更
+
+**原因**：CAPI Topology Controller 會在 Cluster 物件的 `metadata.annotations` 或子資源上加入自動產生的欄位，ArgoCD 偵測到這些欄位不在 Git 定義中。
+
+**解法**：在 ArgoCD Application 中設定忽略這些欄位：
+
+```yaml
+spec:
+  ignoreDifferences:
+    - group: cluster.x-k8s.io
+      kind: Cluster
+      jsonPointers:
+        - /metadata/annotations/cluster.x-k8s.io~1topology-version
+    - group: cluster.x-k8s.io
+      kind: KubeadmControlPlane
+      jsonPointers:
+        - /spec/rolloutAfter   # CAPI 自動填入
+    - group: cluster.x-k8s.io
+      kind: MachineDeployment
+      jsonPointers:
+        - /metadata/annotations
+        - /spec/selector       # Topology Controller 自動填入
+```
+
+### Q2：Topology rollout 卡住（Cluster stuck in upgrading）
+
+```bash
+# 查看 Cluster 的 Condition
+kubectl describe cluster <name> -n fleet-management | grep -A 20 "Conditions:"
+
+# 查看 Topology Controller 的 log
+kubectl logs -n capi-system \
+  -l control-plane=controller-manager \
+  --since=1h | grep -i "topology\|error\|failed"
+
+# 常見原因：KCP 升級後有 Machine 一直不健康
+kubectl get machines -n fleet-management \
+  -l cluster.x-k8s.io/cluster-name=<name> \
+  -o wide
+```
+
+### Q3：如何確認哪些 cluster 已完成升級
+
+```bash
+# 列出所有 cluster 及其當前 topology class
+kubectl get clusters -n fleet-management \
+  -o custom-columns=\
+"NAME:.metadata.name,\
+CLASS:.spec.topology.class,\
+VERSION:.spec.topology.version,\
+READY:.status.conditions[?(@.type=='Ready')].status"
+```
+
+### Q4：誤刪 Git 中的 cluster YAML，ArgoCD 刪除了 prod cluster
+
+**預防**：為 prod namespace 設定 ArgoCD App Project 的 resource deny list：
+
+```yaml
+apiVersion: argoproj.io/v1alpha1
+kind: AppProject
+metadata:
+  name: cluster-management
+spec:
+  # 禁止刪除 Cluster 物件（需要人工確認）
+  namespaceResourceBlacklist:
+    - group: "cluster.x-k8s.io"
+      kind: "Cluster"
+```
+
+或者使用 ArgoCD 的 `Prune=false` annotation 保護特定 cluster：
+
+```yaml
+metadata:
+  annotations:
+    argocd.argoproj.io/sync-options: Prune=false
+```
+
+## 延伸閱讀
+
+- [ClusterClass 與 Topology 詳解](/cluster-api/features/clusterclass-topology) — ClusterClass 的 Patch 機制、變數系統、materialized 子資源生命週期
+- [Core Controller 深度分析](/cluster-api/features/controller-core) — Topology Controller 的 reconcile 邏輯與狀態機
+- [Cluster 與 Machine API](/cluster-api/features/api-cluster-machine) — Cluster 物件的所有欄位與 Condition 意義
+- [MachineSet 與 MachineDeployment](/cluster-api/features/api-machineset-machinedeployment) — 理解 Topology Controller 如何管理 MachineDeployment 生命週期

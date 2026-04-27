@@ -1,0 +1,540 @@
+---
+layout: doc
+title: Kube-OVN — VPC Peering 實現受控跨租戶服務存取
+description: 在多租戶 VPC 架構中，如何透過 Kube-OVN VPC Peering 讓兩個租戶的特定服務互相存取，同時保持其他流量完全隔離，並搭配 OVN ACL 實現精細的跨 VPC 存取控制
+---
+
+# 使用情境：VPC Peering 實現受控跨租戶服務存取
+
+> **目標效果**：Team A 的 billing-service 可以呼叫 Team B 的 payment-api（TCP 8080），但兩個 VPC 之間所有其他流量一律拒絕。VPC Peering 讓封包完全在 OVN fabric 內流通（無 LoadBalancer、無外部 IP、無 NAT），RTT 比 LoadBalancer 方案低 60–70%，同時 OVN ACL 提供欄位級別的存取稽核。
+
+## 你會遇到什麼問題
+
+在多租戶平台上（每個 team 擁有獨立 VPC），跨 team 服務呼叫是常見需求：
+
+- **全隔離 VPC 無法互通**：VPC 設計本身就是隔離，Team A 的 Pod 無法直接存取 Team B 的 Pod IP
+- **LoadBalancer 方案繞遠路**：傳統解法是讓 Team B 把 payment-api 暴露為 LoadBalancer Service，Team A 透過外部 IP 呼叫；封包出 cluster → 進 LB → 再進 cluster，加上 SNAT 來回，RTT 增加 2–5 ms
+- **VPC Peering 過於粗放**：若直接打通兩個 VPC 的全部路由，等於取消隔離，平台安全需求不允許
+- **無流量稽核**：LoadBalancer 模式 log 只記錄到 LB 層，看不到哪個 Pod 在呼叫哪個 Pod
+- **DNS 名稱解析跨 VPC 失效**：CoreDNS 在各 VPC 的 namespace 內只能解析本 VPC 的 Service，跨 VPC Service name 無效
+
+**目標架構**
+
+```
+VPC-A（team-a namespace）           VPC-B（team-b namespace）
+┌─────────────────────────┐         ┌─────────────────────────┐
+│  billing-service Pod    │         │  payment-api Pod         │
+│  IP: 10.10.1.20         │─ TCP ──►│  IP: 10.20.1.50:8080    │
+│                         │  8080   │                          │
+│  other-pod              │ ✗ BLOCK │  other-service           │
+│  IP: 10.10.1.21         │─ ─ ─ ─ ─│  IP: 10.20.1.51         │
+└─────────────────────────┘         └─────────────────────────┘
+         │                                    │
+         └── OVN Logical Router A ────────────┘
+                    VPC Peering Route（只開放 /32 對 /32）
+                    OVN ACL：只允許 10.10.1.20 → 10.20.1.50:8080
+```
+
+## 哪些元件協作解決這個問題
+
+| 元件 | 職責 |
+|------|------|
+| [VPC 與 Subnet](/kube-ovn/features/vpc-subnet) | 為兩個 team 各建立獨立 OVN Logical Router + Logical Switch，IP 空間彼此隔離 |
+| [OVN 整合](/kube-ovn/features/ovn-integration) | 將 Kube-OVN CRD 同步到 OVN Northbound DB，生成 Logical Router Route 和 ACL 規則 |
+| [網路策略與 ACL](/kube-ovn/features/network-policy-acl) | SecurityGroup CRD 在 OVN 層（非 iptables）實現精細的跨 VPC 允許/拒絕規則 |
+| [EIP / SNAT / DNAT](/kube-ovn/features/eip-snat-dnat) | 若需要對外或跨 VPC 使用固定 IP，可搭配 EIP；VPC Peering 本身不需要 EIP |
+| VpcNatGateway（可選） | 若使用 NAT 型 Peering（IP 重疊場景），透過 NAT Gateway 橋接；本場景 IP 不重疊，使用靜態路由模式 |
+
+## 協作流程
+
+```
+平台工程師申請 VPC Peering
+          │
+          ▼
+步驟 1：在 VPC-A 的 Logical Router 加入靜態路由
+          目標：10.20.1.50/32（Team B 的 payment-api Pod IP）
+          Next-hop：OVN 內部 Peering Port（transit IP）
+          │
+          ▼
+步驟 2：在 VPC-B 的 Logical Router 加入靜態路由（回程）
+          目標：10.10.1.20/32（Team A 的 billing Pod IP）
+          Next-hop：OVN 內部 Peering Port
+          │
+          ▼
+步驟 3：OVN ACL 在 Subnet 層（而非 node iptables）加入規則
+          ALLOW：src=10.10.1.20 dst=10.20.1.50 tcp dport=8080
+          DROP：所有其他跨 VPC 流量
+          │
+          ▼
+步驟 4（可選）：設定 ExternalName Service
+          payment-api-cross.team-a.svc → 10.20.1.50
+          讓 Team A 的 Pod 用 DNS 名稱存取 Team B 服務
+          │
+          ▼
+billing-service 呼叫 payment-api：
+  10.10.1.20 → OVN LR-A → transit port → OVN LR-B → 10.20.1.50:8080
+  （封包完全在 OVN fabric 內，無外部 hop，無 NAT）
+```
+
+**OVN Northbound DB 中的路由表（示意）**
+
+```
+LR-team-a（VPC-A Logical Router）
+  └── Route Table:
+        0.0.0.0/0       → lrp-a-nat-gw（預設路由）
+        10.20.1.50/32   → lrp-a-to-b-transit（★ Peering 路由，只開放這一個 IP）
+
+LR-team-b（VPC-B Logical Router）
+  └── Route Table:
+        0.0.0.0/0       → lrp-b-nat-gw
+        10.10.1.20/32   → lrp-b-to-a-transit（★ 回程路由）
+```
+
+## 最小可行配置
+
+### 第一步：建立兩個隔離 VPC
+
+```yaml
+# vpc-team-a.yaml
+apiVersion: kubeovn.io/v1
+kind: Vpc
+metadata:
+  name: vpc-team-a
+spec:
+  # ★ 初始沒有 staticRoutes，完全隔離
+  namespaces:
+    - team-a
+---
+# vpc-team-b.yaml
+apiVersion: kubeovn.io/v1
+kind: Vpc
+metadata:
+  name: vpc-team-b
+spec:
+  namespaces:
+    - team-b
+```
+
+```bash
+kubectl apply -f vpc-team-a.yaml -f vpc-team-b.yaml
+kubectl get vpc
+# NAME         READY   STANDBY   SUBNETS
+# vpc-team-a   true    false     []
+# vpc-team-b   true    false     []
+```
+
+### 第二步：在各 VPC 內建立 Subnet
+
+```yaml
+# subnet-team-a.yaml
+apiVersion: kubeovn.io/v1
+kind: Subnet
+metadata:
+  name: subnet-team-a
+spec:
+  vpc: vpc-team-a
+  cidrBlock: 10.10.1.0/24
+  gateway: 10.10.1.1
+  excludeIps:
+    - 10.10.1.1
+  namespaces:
+    - team-a
+  natOutgoing: false          # ★ 關閉 SNAT，保留 Pod 真實 IP
+  gatewayType: distributed
+---
+# subnet-team-b.yaml
+apiVersion: kubeovn.io/v1
+kind: Subnet
+metadata:
+  name: subnet-team-b
+spec:
+  vpc: vpc-team-b
+  cidrBlock: 10.20.1.0/24
+  gateway: 10.20.1.1
+  excludeIps:
+    - 10.20.1.1
+  namespaces:
+    - team-b
+  natOutgoing: false
+  gatewayType: distributed
+```
+
+```bash
+kubectl apply -f subnet-team-a.yaml -f subnet-team-b.yaml
+```
+
+### 第三步：部署服務 Pod（確認 IP 後再做 Peering）
+
+```yaml
+# payment-api-pod.yaml（Team B）
+apiVersion: v1
+kind: Pod
+metadata:
+  name: payment-api
+  namespace: team-b
+  annotations:
+    # ★ 靜態 IP：Peering 路由寫的是固定 IP，Pod 重啟不能改變
+    ovn.kubernetes.io/ip_address: "10.20.1.50"
+  labels:
+    app: payment-api
+spec:
+  containers:
+    - name: payment-api
+      image: internal-registry/payment-api:v2.1
+      ports:
+        - containerPort: 8080
+---
+# billing-service-pod.yaml（Team A）
+apiVersion: v1
+kind: Pod
+metadata:
+  name: billing-service
+  namespace: team-a
+  annotations:
+    ovn.kubernetes.io/ip_address: "10.10.1.20"
+  labels:
+    app: billing-service
+spec:
+  containers:
+    - name: billing
+      image: internal-registry/billing:v1.5
+```
+
+```bash
+kubectl apply -f payment-api-pod.yaml -f billing-service-pod.yaml
+
+# 確認靜態 IP 已分配
+kubectl get ip -A | grep -E "payment-api|billing-service"
+```
+
+### 第四步：加入 VPC Peering 靜態路由
+
+透過更新 VPC 的 `staticRoutes`，在兩個 Logical Router 之間建立路由：
+
+```yaml
+# vpc-team-a-with-peering.yaml
+apiVersion: kubeovn.io/v1
+kind: Vpc
+metadata:
+  name: vpc-team-a
+spec:
+  namespaces:
+    - team-a
+  staticRoutes:
+    # ★ 精確路由：只有 payment-api 的 /32，不開放整個 Team B 的 /24
+    - cidr: 10.20.1.50/32
+      nextHopIP: "10.200.0.2"   # ★ VPC Peering 的 transit port IP（Team B 側）
+      policy: policyDst
+```
+
+```yaml
+# vpc-team-b-with-peering.yaml
+apiVersion: kubeovn.io/v1
+kind: Vpc
+metadata:
+  name: vpc-team-b
+spec:
+  namespaces:
+    - team-b
+  staticRoutes:
+    # ★ 回程路由：只有 billing-service 的 /32
+    - cidr: 10.10.1.20/32
+      nextHopIP: "10.200.0.1"   # ★ Transit port IP（Team A 側）
+      policy: policyDst
+```
+
+<Callout type="info" title="Transit IP 說明">
+`nextHopIP` 是 OVN Logical Router Peering Port 的 IP。當兩個 VPC 的 Logical Router 透過 Logical Router Port（lrp）連接時，需要分配一個 transit network（例如 10.200.0.0/30）。Kube-OVN 1.12+ 版本支援透過 `VpcPeering` CRD 自動管理這個 transit IP；較舊版本需要手動在 OVN NB 層設定。
+</Callout>
+
+```bash
+kubectl apply -f vpc-team-a-with-peering.yaml
+kubectl apply -f vpc-team-b-with-peering.yaml
+
+# 驗證路由已寫入 OVN
+kubectl ko nbctl lr-route-list lr-vpc-team-a
+# 預期輸出包含：10.20.1.50/32 10.200.0.2 dst-ip
+```
+
+### 第五步：建立 OVN ACL 精細存取控制
+
+僅有靜態路由還不夠——此時兩個 VPC 的任何 Pod 都能互通。需要加入 ACL 限制：
+
+```yaml
+# security-group-cross-vpc.yaml
+apiVersion: kubeovn.io/v1
+kind: SecurityGroup
+metadata:
+  name: payment-api-cross-vpc-allow
+spec:
+  allowSameGroupTraffic: false
+  ingressRules:
+    # ★ 只允許 Team A 的 billing Pod IP 存取 TCP 8080
+    - ipVersion: ipv4
+      protocol: tcp
+      remoteType: address
+      remoteAddress: "10.10.1.20/32"
+      portRangeMin: 8080
+      portRangeMax: 8080
+      policy: allow
+      priority: 100
+    # ★ 允許 ICMP（方便維運診斷，可選）
+    - ipVersion: ipv4
+      protocol: icmp
+      remoteType: address
+      remoteAddress: "10.10.1.20/32"
+      policy: allow
+      priority: 100
+    # ★ 拒絕所有其他跨 VPC 入站流量
+    - ipVersion: ipv4
+      protocol: tcp
+      remoteType: address
+      remoteAddress: "10.0.0.0/8"
+      portRangeMin: 1
+      portRangeMax: 65535
+      policy: drop
+      priority: 200
+  egressRules:
+    # ★ payment-api 只需回應，不需主動發起跨 VPC 連線
+    - ipVersion: ipv4
+      protocol: tcp
+      remoteType: address
+      remoteAddress: "10.10.1.20/32"
+      portRangeMin: 1
+      portRangeMax: 65535
+      policy: allow
+      priority: 100
+```
+
+```yaml
+# 將 SecurityGroup 套用到 payment-api Pod
+apiVersion: v1
+kind: Pod
+metadata:
+  name: payment-api
+  namespace: team-b
+  annotations:
+    ovn.kubernetes.io/ip_address: "10.20.1.50"
+    # ★ 套用 SecurityGroup
+    ovn.kubernetes.io/security_groups: "payment-api-cross-vpc-allow"
+```
+
+```bash
+kubectl apply -f security-group-cross-vpc.yaml
+# 更新 payment-api Pod 的 annotation（若 Pod 已存在，需 patch）
+kubectl patch pod payment-api -n team-b --type='merge' \
+  -p '{"metadata":{"annotations":{"ovn.kubernetes.io/security_groups":"payment-api-cross-vpc-allow"}}}'
+```
+
+### 第六步：設定跨 VPC DNS（ExternalName Service）
+
+CoreDNS 在不同 VPC 的 namespace 之間無法解析 Service，需要在 Team A 的 namespace 裡建立一個 ExternalName Service 指向 Team B 的 Pod IP：
+
+```yaml
+# cross-vpc-dns.yaml（部署到 team-a namespace）
+apiVersion: v1
+kind: Service
+metadata:
+  name: payment-api-ext
+  namespace: team-a
+spec:
+  # ★ ExternalName：DNS 查詢 payment-api-ext.team-a.svc.cluster.local
+  #    會解析為 10.20.1.50（Team B Pod IP）
+  type: ExternalName
+  externalName: "10.20.1.50"
+  ports:
+    - port: 8080
+      protocol: TCP
+```
+
+```bash
+kubectl apply -f cross-vpc-dns.yaml
+
+# Team A 的 Pod 現在可以用 DNS 名稱存取
+# curl http://payment-api-ext.team-a.svc.cluster.local:8080/health
+```
+
+<Callout type="warning" title="ExternalName 限制">
+`ExternalName` Service 解析為 CNAME，若目標是 IP 而非 hostname，部分 DNS 實作會直接回傳 A record。此外，ExternalName 不支援 iptables DNAT——呼叫方的封包目標 IP 是 `10.20.1.50`（Team B Pod IP），這表示 VPC Peering 路由**必須**已正確設定，否則 DNS 解析成功但連線仍失敗。
+</Callout>
+
+## 關鍵參數說明
+
+| 參數 | 位置 | 說明 |
+|------|------|------|
+| `staticRoutes[].cidr` | Vpc spec | 目標 CIDR；強烈建議用 /32 精確路由，避免意外開放整個對方 Subnet |
+| `staticRoutes[].nextHopIP` | Vpc spec | Transit port IP；VPC Peering 的虛擬 "border" IP |
+| `staticRoutes[].policy` | Vpc spec | `policyDst`（目標路由）或 `policySrc`（來源路由）；跨 VPC 用 `policyDst` |
+| `natOutgoing: false` | Subnet spec | 必須關閉，否則 Pod 出站 IP 被 SNAT 成 node IP，ACL 的 `/32` 規則失效 |
+| SecurityGroup `priority` | SecurityGroup spec | 數字越小優先級越高；allow 規則（100）必須放在 drop 規則（200）之前 |
+| SecurityGroup `remoteType` | SecurityGroup spec | `address`（IP/CIDR）或 `securityGroup`（跨 SG 引用）|
+| ExternalName `externalName` | Service spec | 指向跨 VPC 的 Pod IP 或 Hostname |
+
+### 路徑比較
+
+```
+方案                     | 路徑跳數 | 有無 NAT | 典型 RTT | 稽核能力
+─────────────────────────────────────────────────────────────────────
+VPC Peering + OVN ACL   | 2（LR hop）| 無       | 0.5 ms   | OVN ACL log
+LoadBalancer（外部 IP）  | 5+（出/入 cluster）| SNAT×2  | 3–5 ms   | LB access log
+NodePort                 | 3（kube-proxy）| DNAT+SNAT | 2–4 ms  | 無
+iptables NetworkPolicy   | 2（node iptables）| 視設定  | 0.5 ms   | conntrack log（有限）
+```
+
+## ACL Log 稽核設定
+
+啟用 OVN ACL 日誌，記錄所有跨 VPC 連線嘗試：
+
+```yaml
+# security-group-cross-vpc-with-log.yaml
+apiVersion: kubeovn.io/v1
+kind: SecurityGroup
+metadata:
+  name: payment-api-cross-vpc-allow
+spec:
+  ingressRules:
+    - ipVersion: ipv4
+      protocol: tcp
+      remoteType: address
+      remoteAddress: "10.10.1.20/32"
+      portRangeMin: 8080
+      portRangeMax: 8080
+      policy: allow
+      priority: 100
+      # ★ 啟用 log：成功連線也記錄
+      log: true
+    - ipVersion: ipv4
+      protocol: tcp
+      remoteType: address
+      remoteAddress: "10.0.0.0/8"
+      portRangeMin: 1
+      portRangeMax: 65535
+      policy: drop
+      priority: 200
+      # ★ 啟用 log：非法存取嘗試一定要記錄
+      log: true
+```
+
+```bash
+# 查看 OVN ACL 日誌（在 kube-ovn-cni Pod 的 OVS 日誌）
+kubectl logs -n kube-system -l app=kube-ovn-cni | grep "acl"
+
+# 或直接看 node 上的 OVS 日誌
+journalctl -u ovs-vswitchd | grep "acl.*10.10.1.20"
+```
+
+<Callout type="tip" title="將 ACL log 接入 SIEM">
+OVN ACL log 格式為結構化文字（包含 src/dst IP、port、policy、timestamp），可透過 Fluentd 或 Vector 採集後送入 Elasticsearch / Splunk，實現即時跨 VPC 存取稽核，滿足金融等級合規需求。
+</Callout>
+
+## 常見問題與解法
+
+### ① 路由設定正確但 ping 不通
+
+```bash
+# 步驟 A：確認 OVN 路由表已更新
+kubectl ko nbctl lr-route-list lr-vpc-team-a
+# 應看到 10.20.1.50/32 <transit-ip> dst-ip
+
+kubectl ko nbctl lr-route-list lr-vpc-team-b
+# 應看到 10.10.1.20/32 <transit-ip> dst-ip
+
+# 步驟 B：確認 ACL 規則已生效（check-in 方向）
+kubectl ko nbctl acl-list <team-b-logical-switch>
+# 應看到 allow tcp src=10.10.1.20 dst=10.20.1.50 dport=8080
+
+# 步驟 C：做 OVN 封包追蹤
+kubectl ko trace team-a/billing-service 10.20.1.50 tcp 8080
+# 若輸出末行是 "drop" → ACL 問題
+# 若輸出末行是 "output to ..." → 轉發正常，檢查 container 層
+```
+
+### ② ACL allow 規則存在但連線仍被拒
+
+最常見原因是 `natOutgoing: true`（預設值），Subnet 的 Pod 出站流量被 SNAT 成 node IP，導致 ACL 的 `remoteAddress: "10.10.1.20/32"` 無法匹配：
+
+```bash
+# 確認 Subnet 的 natOutgoing 設定
+kubectl get subnet subnet-team-a -o jsonpath='{.spec.natOutgoing}'
+# 若輸出為 "true"，需改為 false
+
+kubectl patch subnet subnet-team-a --type='merge' \
+  -p '{"spec":{"natOutgoing":false}}'
+```
+
+### ③ ExternalName Service 回傳 NXDOMAIN
+
+ExternalName 指向 IP 位址時，CoreDNS 行為因版本而異。更可靠的替代方案是用 `Endpoints` + `Service` 組合：
+
+```yaml
+# 替代方案：用 Endpoints 直接指向 Pod IP
+apiVersion: v1
+kind: Service
+metadata:
+  name: payment-api-ext
+  namespace: team-a
+spec:
+  ports:
+    - port: 8080
+      protocol: TCP
+---
+apiVersion: v1
+kind: Endpoints
+metadata:
+  name: payment-api-ext
+  namespace: team-a
+subsets:
+  - addresses:
+      - ip: "10.20.1.50"    # ★ Team B Pod IP
+    ports:
+      - port: 8080
+```
+
+```bash
+# 驗證 DNS 解析
+kubectl exec -n team-a billing-service -- \
+  nslookup payment-api-ext.team-a.svc.cluster.local
+# 應回傳 10.20.1.50
+```
+
+### ④ 多 Pod 場景：Team B 有多個 payment-api 副本
+
+若 Team B 的 payment-api 是 Deployment（多副本），需要：
+1. **不用靜態 IP**：改用 Subnet CIDR 路由（10.20.1.0/24，但需搭配更嚴格的 ACL）
+2. 或用 **Kube-OVN EIP**：為 Team B 的 Service 分配一個固定的跨 VPC EIP
+
+```yaml
+# 使用 CIDR 路由（開放整個 Team B 的 10.20.1.x，依靠 ACL 做 Port 限制）
+spec:
+  staticRoutes:
+    - cidr: 10.20.1.0/24   # ★ 開放整個 Subnet，但 ACL 只允許 TCP 8080
+      nextHopIP: "10.200.0.2"
+      policy: policyDst
+```
+
+```yaml
+# SecurityGroup 對應改為限制 Port 而非 dst IP
+ingressRules:
+  - ipVersion: ipv4
+    protocol: tcp
+    remoteType: address
+    remoteAddress: "10.10.1.20/32"   # 仍精確限制來源 IP
+    portRangeMin: 8080
+    portRangeMax: 8080
+    policy: allow
+    priority: 100
+```
+
+### ⑤ VPC Peering 後兩個 VPC 的 IP 有重疊
+
+若 Team A 和 Team B 使用相同的 CIDR（例如都是 10.10.0.0/24），靜態路由模式會衝突。解法：
+
+- 使用 **VpcNatGateway**：在每個 VPC 加一個 NAT Gateway，透過獨立的 transit network 做 NAT 轉譯；這種模式保留了 IP 重疊能力，代價是增加 NAT 延遲（適合隔離強度要求高於延遲要求的場景）
+- 規劃期間**強制各 team 使用不同 CIDR 範圍**（平台工程師統一分配，例如 team-a 用 10.10.0.0/16，team-b 用 10.20.0.0/16）
+
+## 深入閱讀
+
+- [VPC 與 Subnet](/kube-ovn/features/vpc-subnet) — Logical Router/Switch 架構、staticRoutes 欄位完整說明
+- [OVN 整合](/kube-ovn/features/ovn-integration) — OVN NB DB 中 ACL 和 Route 的資料結構，理解為何 ACL 在 Logical Switch 層而非 iptables
+- [網路策略與 ACL](/kube-ovn/features/network-policy-acl) — SecurityGroup CRD 與 Kubernetes NetworkPolicy 的關係，priority 衝突解析
+- [EIP / SNAT / DNAT](/kube-ovn/features/eip-snat-dnat) — 若需要 IP 重疊的 VPC Peering，如何搭配 EIP 做 NAT 轉譯

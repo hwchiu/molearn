@@ -1,0 +1,443 @@
+---
+layout: doc
+title: Metal3 — 透過 BMC 自動化韌體生命週期管理
+description: 金融機構需要在維護視窗內對 200 台 bare-metal 伺服器完成 BIOS 與 NIC 韌體更新，如何透過 Metal3 BareMetalHost firmware API 與 Redfish 自動化整個流程並留下完整的合規審計軌跡
+---
+
+# 使用情境：透過 BMC 自動化韌體生命週期管理
+
+> **目標效果**：200 台 bare-metal 伺服器的 BIOS + NIC 韌體批次更新，在單一維護視窗內（4 小時）完成，不需工程師逐台登入 iDRAC/iLO，更新過程全程可追蹤，完成後自動產生合規審計報告，錯誤率從人工操作的 3-5% 降至接近 0。
+
+## 你會遇到什麼問題
+
+金融業的 bare-metal 基礎設施面臨嚴格的合規要求（PCI-DSS、SOC 2），加上規模龐大，韌體管理是傳統方式最難自動化的環節之一：
+
+- **逐台登入耗時**：200 台伺服器 × 每台需要登入 iDRAC/iLO GUI 或 CLI → 上傳韌體檔案 → 排程重開機 → 確認更新成功，最保守估計 200 × 20 分鐘 = 66 工時
+- **協調重開機視窗困難**：韌體更新需要重開機，不能所有伺服器同時重開（會讓 workload 無處調度），必須分批進行，但人工協調「這 20 台可以重開、那 20 台不行」本身就是高認知負擔的工作
+- **合規審計軌跡缺失**：手動操作無法自動記錄「誰在什麼時間對哪台伺服器更新了哪個版本」，每次審計都需要工程師手動整理日誌
+- **人工操作錯誤風險**：點錯機器、上傳錯版本、忘記確認是否更新成功——在 200 台的規模下，這類錯誤幾乎不可避免
+- **更新後狀態不一致**：人工更新可能有些台跑舊版本、有些台跑新版本，系統整體處於不一致狀態，卻沒有一個地方可以統一查看
+
+<Callout type="info" title="Metal3 韌體管理的能力邊界">
+Metal3 的韌體管理依賴 Ironic 透過 Redfish 與 BMC 溝通。**前提條件**：（1）伺服器 BMC 支援 Redfish UpdateService API（Dell iDRAC 7+、HPE iLO 5+、Lenovo XCC 均支援）；（2）韌體更新包需要放到 Metal3 可存取的 HTTP server 上；（3）BMH 必須不在 `provisioned` 的 active workload 狀態下（更新韌體需要重開機，需要先將 workload 遷移走）。
+</Callout>
+
+## 哪些元件協作解決這個問題
+
+| 元件 | 職責 |
+|------|------|
+| [BareMetalHost（BMO）](/cluster-api-provider-metal3/features/bmh-lifecycle) | 透過 `spec.firmware` 欄位宣告期望的韌體設定；`status.hardware.firmware` 記錄當前韌體版本 |
+| [FirmwareSchema CRD](/cluster-api-provider-metal3/features/advanced-features) | 描述每個韌體設定項目的可選值與型別，讓 BMH firmware spec 可以做 validation |
+| Ironic（Redfish UpdateService） | 實際執行韌體更新：下載韌體包、呼叫 BMC 的 Redfish UpdateService endpoint、監控更新進度 |
+| [HardwareData CRD](/cluster-api-provider-metal3/features/advanced-features) | 儲存 inspection 後的完整硬體資訊，包含已安裝的韌體版本清單，是審計報告的資料來源 |
+| Redfish BMC（iDRAC / iLO / XCC） | 實際執行韌體 flash 操作，管理 reboot 排程，回報更新結果 |
+
+## 協作流程
+
+```
+[Phase 1：現況盤點]
+
+  kubectl get baremetalhost -A -o json
+  → 解析 status.hardware.firmware，收集 200 台的現有韌體版本
+            ↓
+  比對目標版本清單（維護計畫指定的 BIOS v2.9.1、NIC fw v21.0.17）
+  找出哪些台需要更新（可能只有 150 台，其他 50 台已是最新）
+            ↓
+[Phase 2：滾動更新（每批 20 台）]
+
+  (1) 選取第一批 20 台（確保這 20 台的 workload 已遷移完畢）
+            ↓
+  (2) 對這 20 台的 BareMetalHost 加上韌體更新 annotation
+      firmware.metal3.io/update: "true"
+      同時更新 spec.firmware 指向新版本設定
+            ↓
+  (3) BMO 偵測到 annotation → 觸發 Ironic firmware update workflow
+            ↓
+  (4) Ironic 呼叫 Redfish UpdateService：
+      POST /redfish/v1/UpdateService/Actions/UpdateService.SimpleUpdate
+      body: { ImageURI: "http://fw-server/bios-v2.9.1.bin",
+               Targets: ["/redfish/v1/Systems/1/Bios"] }
+            ↓
+  (5) BMC 下載韌體包、排程在下次 reboot 時 flash
+      Ironic 發送 Redfish reboot 指令
+      伺服器重開機，韌體 flash 執行
+            ↓
+  (6) 伺服器重啟後，Ironic 再次讀取 Redfish firmware inventory
+      確認版本符合期望 → BMH annotation 清除
+      BMH 狀態回到 available
+            ↓
+  (7) 等待這批 20 台全部回到 available（逾時則標記為 failed）
+            ↓
+  (8) 繼續下一批 20 台，直到全部 200 台完成
+            ↓
+[Phase 3：合規報告]
+
+  kubectl get baremetalhost -A -o jsonpath 擷取所有韌體版本
+  輸出 CSV / JSON，對應到 asset inventory，產生審計報告
+```
+
+## 最小可行配置
+
+### 第一步：盤點現有韌體版本
+
+執行大規模更新前，先確認哪些台需要更新，避免浪費更新視窗時間。
+
+```bash
+# 批次查詢所有 BMH 的 BIOS 版本
+kubectl get baremetalhost -n metal3 \
+  -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.status.hardware.systemVendor.productName}{"\t"}{.status.hardware.firmware.bios.version}{"\n"}{end}' \
+  | column -t
+
+# 範例輸出：
+# prod-node-001   PowerEdge R750   2.8.3   ← 舊版，需要更新
+# prod-node-002   PowerEdge R750   2.9.1   ← 已是目標版本，跳過
+# prod-node-003   PowerEdge R750   2.8.3   ← 舊版，需要更新
+
+# 找出需要更新的台數
+kubectl get baremetalhost -n metal3 \
+  -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.status.hardware.firmware.bios.version}{"\n"}{end}' \
+  | grep -v "2.9.1" | wc -l
+# 輸出：158（表示 158 台需要更新）
+```
+
+### 第二步：定義含韌體設定的 BareMetalHost
+
+Metal3 的韌體管理分兩個層面：（1）`spec.firmware` 設定 BIOS 選項（如 Hyperthreading、Virtualization）；（2）透過 annotation 觸發韌體版本更新。
+
+```yaml
+apiVersion: metal3.io/v1alpha1
+kind: BareMetalHost
+metadata:
+  name: prod-node-001
+  namespace: metal3
+  annotations:
+    # ★ 觸發韌體更新的 annotation
+    # 當 BMO 偵測到這個 annotation 且值為 "true" 時，
+    # 會在下一次 deprovisioning 或 available 狀態時執行韌體更新
+    firmware.metal3.io/update: "true"
+spec:
+  bmc:
+    address: redfish+https://192.168.100.201/redfish/v1/Systems/1
+    credentialsName: prod-node-001-bmc-secret
+    disableCertificateVerification: false  # 生產環境應使用正式 TLS 憑證
+  bootMACAddress: "bb:cc:dd:ee:01:01"
+  online: true
+  # ★ firmware spec：宣告期望的 BIOS 設定值
+  # 這些設定在每次 provision 前會被強制套用，確保一致性
+  firmware:
+    simultaneousMultithreadingEnabled: true    # Hyperthreading on
+    virtualizationEnabled: true                # VT-x/AMD-V on（Kubernetes 必要）
+    sriovEnabled: true                         # SR-IOV（金融業高效能網路需求）
+    # ★ 韌體更新包的 URL（Ironic 會從這裡下載）
+    # 實務上放到內部 HTTP server，伺服器不需要存取外網
+```
+
+<Callout type="warning" title="韌體更新需要 deprovisioning">
+BareMetalHost 的韌體更新操作需要重開機，因此 **BMH 必須先從 workload cluster 中移除**（對應的 Machine 先被刪除，BMH 回到 `available` 狀態），才能執行韌體更新。不要嘗試在 `provisioned` 狀態的 BMH 上直接觸發韌體更新，這會造成 active workload 中斷。
+</Callout>
+
+### 第三步：查看 FirmwareSchema（了解可設定項目）
+
+FirmwareSchema CRD 由 Ironic inspection 自動建立，記錄每台伺服器型號支援的所有 BIOS 設定項目，包含允許值與說明：
+
+```bash
+# 查看針對特定伺服器型號產生的 FirmwareSchema
+kubectl get firmwareschema -n metal3
+# NAME                              AGE
+# prod-node-001-schema              2d
+# prod-node-002-schema              2d
+
+# 查看 BIOS 設定的可選值（確認 spec.firmware 裡的欄位名稱正確）
+kubectl get firmwareschema prod-node-001-schema -n metal3 \
+  -o jsonpath='{range .spec.schema.*}{.name}{"\t"}{.allowable_values}{"\n"}{end}' \
+  | head -20
+
+# 範例輸出：
+# ProcHyperthreading    [Enabled, Disabled]
+# ProcVirtualization    [Enabled, Disabled]
+# SriovGlobalEnable     [Enabled, Disabled]
+# ProcAes               [Enabled, Disabled]
+```
+
+### 第四步：HardwareData — 查看已安裝韌體版本清單
+
+```yaml
+# HardwareData 由 Ironic inspection 自動建立，與 BMH 同名
+# 它包含比 BMH status 更完整的硬體資訊，適合作為審計資料來源
+apiVersion: metal3.io/v1alpha1
+kind: HardwareData
+metadata:
+  name: prod-node-001
+  namespace: metal3
+# status 欄位由 Ironic 填入，不需手動編輯
+# 以下是典型的韌體相關欄位（僅供參考，實際欄位因廠商而異）
+```
+
+```bash
+# 查看 HardwareData 中的完整韌體清單
+kubectl get hardwaredata prod-node-001 -n metal3 \
+  -o jsonpath='{.spec.hardware.firmware}' | python3 -m json.tool
+
+# 範例輸出：
+# {
+#   "bios": {
+#     "date": "09/15/2023",
+#     "vendor": "Dell Inc.",
+#     "version": "2.8.3"
+#   }
+# }
+
+# 批次查詢所有 node 的 BIOS 版本，存成 CSV（合規報告用）
+kubectl get hardwaredata -n metal3 \
+  -o jsonpath='{range .items[*]}{.metadata.name}{","}
+{.spec.hardware.systemVendor.serialNumber}{","}{.spec.hardware.firmware.bios.version}{"\n"}{end}' \
+  > firmware-audit-$(date +%Y%m%d).csv
+```
+
+## 第五步：滾動批次更新腳本
+
+以下是一個完整的 Bash 腳本，實現「每批 20 台，更新完才進行下一批」的滾動策略。金融機構的維護視窗通常只有 4-6 小時，這個策略確保 cluster 始終保有足夠容量服務 workload。
+
+```bash
+#!/usr/bin/env bash
+# firmware-rolling-update.sh
+# 對指定的 BareMetalHost 清單執行滾動韌體更新
+# 用法: ./firmware-rolling-update.sh <namespace> <target-version> <batch-size>
+
+set -euo pipefail
+
+NAMESPACE="${1:-metal3}"
+TARGET_BIOS_VERSION="${2:-2.9.1}"
+BATCH_SIZE="${3:-20}"
+TIMEOUT_PER_SERVER=1800  # 每台最多等 30 分鐘
+LOG_FILE="firmware-update-$(date +%Y%m%d-%H%M%S).log"
+
+log() {
+  echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" | tee -a "$LOG_FILE"
+}
+
+# Step 1: 找出所有需要更新的 BMH（當前版本 != 目標版本）
+log "掃描需要更新的 BareMetalHost..."
+NODES_TO_UPDATE=$(kubectl get baremetalhost -n "$NAMESPACE" \
+  -o jsonpath='{range .items[?(@.status.hardware.firmware.bios.version!="'"$TARGET_BIOS_VERSION"'")]}{.metadata.name}{"\n"}{end}')
+
+TOTAL=$(echo "$NODES_TO_UPDATE" | grep -c . || true)
+log "找到 $TOTAL 台需要更新（目標版本：$TARGET_BIOS_VERSION）"
+
+if [[ "$TOTAL" -eq 0 ]]; then
+  log "所有 node 已是最新版本，無需更新"
+  exit 0
+fi
+
+# Step 2: 確認這些 BMH 都在 available 狀態（不能更新 provisioned 的機器）
+log "確認所有待更新 BMH 都在 available 狀態..."
+while IFS= read -r node; do
+  STATE=$(kubectl get baremetalhost "$node" -n "$NAMESPACE" \
+    -o jsonpath='{.status.provisioning.state}')
+  if [[ "$STATE" != "available" ]]; then
+    log "警告：$node 目前狀態為 $STATE，不是 available，跳過"
+    NODES_TO_UPDATE=$(echo "$NODES_TO_UPDATE" | grep -v "^$node$")
+  fi
+done <<< "$NODES_TO_UPDATE"
+
+# Step 3: 分批執行更新
+BATCH_NUM=0
+while IFS= read -r batch; do
+  [[ -z "$batch" ]] && continue
+  BATCH_NUM=$((BATCH_NUM + 1))
+  log "===== 開始第 $BATCH_NUM 批更新 ====="
+
+  # 對這批 node 加上韌體更新 annotation
+  while IFS= read -r node; do
+    [[ -z "$node" ]] && continue
+    log "  標記 $node 進行韌體更新..."
+    kubectl annotate baremetalhost "$node" -n "$NAMESPACE" \
+      firmware.metal3.io/update="true" --overwrite
+  done <<< "$batch"
+
+  # 等待這批 node 全部完成（回到 available 狀態）
+  log "  等待第 $BATCH_NUM 批完成（每台最多等 ${TIMEOUT_PER_SERVER}s）..."
+  DEADLINE=$((SECONDS + TIMEOUT_PER_SERVER))
+  while [[ $SECONDS -lt $DEADLINE ]]; do
+    ALL_DONE=true
+    while IFS= read -r node; do
+      [[ -z "$node" ]] && continue
+      STATE=$(kubectl get baremetalhost "$node" -n "$NAMESPACE" \
+        -o jsonpath='{.status.provisioning.state}' 2>/dev/null || echo "unknown")
+      if [[ "$STATE" != "available" ]]; then
+        ALL_DONE=false
+        break
+      fi
+    done <<< "$batch"
+
+    if $ALL_DONE; then
+      log "  第 $BATCH_NUM 批全部完成 ✓"
+      break
+    fi
+    sleep 30
+  done
+
+  if ! $ALL_DONE; then
+    log "  錯誤：第 $BATCH_NUM 批超時，請手動檢查以下 node："
+    echo "$batch"
+    exit 1
+  fi
+
+done < <(echo "$NODES_TO_UPDATE" | xargs -n "$BATCH_SIZE" printf '%s\n')
+
+log "===== 所有批次更新完成 ====="
+log "更新日誌已儲存至 $LOG_FILE"
+```
+
+```bash
+# 執行滾動更新（每批 20 台，目標版本 2.9.1）
+chmod +x firmware-rolling-update.sh
+./firmware-rolling-update.sh metal3 2.9.1 20
+```
+
+<Callout type="tip" title="維護視窗時間估算">
+每台伺服器韌體更新流程：Ironic 下載韌體包（~3 分鐘）+ BMC flash（~10 分鐘）+ 重啟（~5 分鐘）= 約 18-20 分鐘。批次大小 20 台並發，每批約 25 分鐘。200 台 ÷ 20 台/批 = 10 批 × 25 分鐘 ≈ 250 分鐘（約 4.2 小時）。符合典型 4-6 小時維護視窗。
+</Callout>
+
+## 關鍵參數說明
+
+| 參數 | 位置 | 說明 |
+|------|------|------|
+| `firmware.metal3.io/update` | BareMetalHost annotation | 觸發韌體更新；設為 `"true"` 時，BMO 在下次 available 狀態時執行更新；完成後 BMO 自動清除此 annotation |
+| `spec.firmware.simultaneousMultithreadingEnabled` | BareMetalHost | 宣告期望的 Hyperthreading 狀態；Ironic 在 provision 前確保 BIOS 設定符合此值 |
+| `spec.firmware.virtualizationEnabled` | BareMetalHost | 宣告期望的 VT-x/AMD-V 狀態；Kubernetes 需要此功能啟用 |
+| `spec.firmware.sriovEnabled` | BareMetalHost | 宣告期望的 SR-IOV 狀態；高效能網路場景（金融業低延遲交易）必要 |
+| `status.hardware.firmware.bios.version` | BareMetalHost status | 當前已安裝的 BIOS 版本，由 Ironic inspection 填入，是確認更新成功的依據 |
+| `spec.hardware.firmware` | HardwareData | 比 BMH status 更完整的韌體清單，包含 NIC firmware、Storage controller firmware 等 |
+
+## 合規審計報告生成
+
+金融業合規要求完整的韌體變更記錄，包含「更新前版本」、「更新後版本」、「更新時間」、「操作人員」。
+
+### 更新後韌體版本盤點
+
+```bash
+# 生成完整的韌體版本審計 CSV
+# 欄位：hostname, serial_number, bios_version, bios_date, vendor, update_timestamp
+kubectl get baremetalhost -n metal3 \
+  -o jsonpath='{range .items[*]}{.metadata.name}{","}\
+{.status.hardware.systemVendor.serialNumber}{","}\
+{.status.hardware.firmware.bios.version}{","}\
+{.status.hardware.firmware.bios.date}{","}\
+{.status.hardware.systemVendor.manufacturer}{","}\
+{.metadata.annotations.last-firmware-update-time}{"\n"}{end}' \
+  | sort > firmware-inventory-after-$(date +%Y%m%d).csv
+
+# 對比更新前後的 CSV，生成 diff 報告
+diff firmware-inventory-before.csv firmware-inventory-after-$(date +%Y%m%d).csv \
+  | grep "^[<>]" | sed 's/^< /BEFORE: /; s/^> /AFTER:  /'
+```
+
+### 查驗特定伺服器的韌體版本（隨時可查）
+
+```bash
+# 精確查驗單台伺服器（供審計員點查）
+kubectl get baremetalhost prod-node-001 -n metal3 \
+  -o jsonpath='{
+    "hostname":           "{.metadata.name}",
+    "serial":             "{.status.hardware.systemVendor.serialNumber}",
+    "bios_version":       "{.status.hardware.firmware.bios.version}",
+    "bios_date":          "{.status.hardware.firmware.bios.date}",
+    "last_inspection":    "{.status.lastUpdated}",
+    "provisioning_state": "{.status.provisioning.state}"
+  }'
+
+# 範例輸出（格式化後）：
+# hostname:           prod-node-001
+# serial:             MXQ01234567
+# bios_version:       2.9.1
+# bios_date:          11/20/2024
+# last_inspection:    2024-11-21T03:15:00Z
+# provisioning_state: available
+```
+
+### 標記更新時間戳記（供後續審計查詢）
+
+```bash
+# 在更新完成後，用 annotation 記錄更新時間（腳本自動執行）
+kubectl annotate baremetalhost prod-node-001 -n metal3 \
+  last-firmware-update-time="$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+  last-firmware-update-version="bios-2.9.1,nic-21.0.17" \
+  last-firmware-update-operator="$(kubectl config current-context)" \
+  --overwrite
+```
+
+## 常見問題與解法
+
+### Q1：Redfish UpdateService 回傳 400 / 不支援
+
+**症狀**：`kubectl describe baremetalhost prod-node-001 -n metal3` 顯示 `ErrorMessage: failed to update firmware: 400 Bad Request`
+
+**可能原因**：
+1. BMC firmware 版本太舊，不支援 Redfish SimpleUpdate API
+2. 韌體包格式不正確（Dell 要求 `.exe` packaging，HPE 要求 `.fwpkg`）
+3. Redfish Target 路徑不正確（各廠商路徑不同）
+
+```bash
+# 手動測試 Redfish UpdateService 是否支援
+curl -sku admin:password \
+  https://192.168.100.201/redfish/v1/UpdateService | python3 -m json.tool
+# 確認 Actions 中有 #UpdateService.SimpleUpdate
+
+# 確認支援哪些 Targets
+curl -sku admin:password \
+  https://192.168.100.201/redfish/v1/UpdateService/FirmwareInventory \
+  | python3 -m json.tool | grep "@odata.id"
+```
+
+### Q2：韌體更新後 BMH 沒有回到 `available`，停在 `inspecting`
+
+**原因**：韌體更新後 Ironic 觸發了一次完整的 re-inspection，確認新版本已生效。這是正常行為，`inspecting` 約需 5-10 分鐘。
+
+**如果超過 15 分鐘仍停在 `inspecting`**：
+
+```bash
+# 查看 Ironic 日誌，找 inspection 卡住的原因
+kubectl logs -n baremetal-operator-system \
+  deployment/baremetal-operator -c ironic-inspector --since=20m \
+  | grep -i "prod-node-001\|error\|timeout"
+
+# 強制重跑 inspection
+kubectl annotate baremetalhost prod-node-001 -n metal3 \
+  inspect.metal3.io="" --overwrite
+```
+
+### Q3：部分台的韌體版本更新後仍顯示舊版本
+
+**原因**：`status.hardware.firmware` 的值來自 inspection，如果 re-inspection 還沒完成，舊版本資料仍會顯示。等 BMH 回到 `available` 狀態後，inspection 才算完成，此時版本會更新。
+
+```bash
+# 確認 inspection 完成時間
+kubectl get baremetalhost prod-node-001 -n metal3 \
+  -o jsonpath='{.status.lastUpdated}'
+# 對比更新開始時間，確認 inspection 已在更新後執行
+```
+
+### Q4：想在不重開機的情況下預覽韌體設定差異
+
+Metal3 的 `spec.firmware` 設定部分項目（BIOS 設定選項，不是韌體版本）可以在 provisioning 階段套用，不需額外重開機——Ironic 在寫入 OS image 後、重啟進入 OS 之前，會先套用 BIOS 設定。但**韌體版本升級**（flash 操作）仍然需要額外的重開機。
+
+```bash
+# 查看 FirmwareSchema 確認哪些設定可以在 provisioning 時套用
+kubectl get firmwareschema prod-node-001-schema -n metal3 \
+  -o jsonpath='{range .spec.schema.*}{.name}{"\t"}{.read_only}{"\n"}{end}' \
+  | grep "false"  # false = 可寫（可套用），true = 唯讀
+```
+
+### Q5：200 台同時觸發更新，Ironic conductor 過載
+
+**解法**：Ironic conductor 有 `max_concurrent_builds` 設定（預設 20）。韌體更新也受這個限制，因此即使你一次 annotate 200 台，Ironic 實際上也只會同時處理 20 台。但如果 200 台全都在 annotation queue 裡，日誌量會很大，建議搭配上面的滾動腳本分批加 annotation，讓 queue 保持在合理大小。
+
+<Callout type="info" title="韌體管理最佳實踐">
+金融業建議的韌體管理流程：（1）每季執行一次韌體版本盤點（`kubectl get hardwaredata`）；（2）每半年或有重大 CVE 時執行批次更新；（3）每次更新後立即生成審計報告（存入版本控制或 S3）；（4）在 BareMetalHost annotation 中記錄每次更新的時間戳記與版本號，讓審計員隨時可查。
+</Callout>
+
+## 深入閱讀
+
+- [BareMetalHost 生命週期](/cluster-api-provider-metal3/features/bmh-lifecycle) — BMH 狀態機詳解，了解韌體更新在哪個狀態發生、如何觸發 re-inspection
+- [Metal3 進階功能](/cluster-api-provider-metal3/features/advanced-features) — FirmwareSchema CRD、HardwareData CRD 的完整欄位說明與 inspection 資料結構

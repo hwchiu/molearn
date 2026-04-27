@@ -1,0 +1,426 @@
+---
+layout: doc
+title: Rook — RBD Mirroring 跨資料中心災難恢復
+description: 如何用 Ceph RBD Mirroring 在兩個資料中心間同步 Block Storage 資料，實現 RPO < 1 分鐘、RTO < 15 分鐘的災難恢復能力
+---
+
+# 使用情境：RBD Mirroring 跨資料中心災難恢復
+
+> **目標效果**：生產環境的 PostgreSQL 資料庫 PVC 部署在 DC1 的 Rook-Ceph 叢集；當 DC1 發生機房斷電或網路中斷時，DC2 可在 15 分鐘內完成 failover，資料損失不超過 1 分鐘。
+
+## 你會遇到什麼問題
+
+在 bare-metal 自建機房中，Kubernetes 有狀態應用的災難恢復（DR）一直是難題：
+
+- **PVC 資料不跨站**：預設 Rook-Ceph 只在同一 cluster 內複製，機房整體故障時資料全部不可用
+- **etcd 備份不夠**：Velero 能備份 YAML 資源定義，但 PVC 裡的資料（資料庫 binary files）若沒有另外處理，還原後是空的
+- **RTO 太長**：傳統方案是定期備份 + 異地還原，但資料庫幾十 GB 還原往往需要數小時
+- **RPO 難滿足**：每日備份代表 RPO 最差 24 小時，對生產資料庫無法接受
+
+Ceph RBD Mirroring 透過 **非同步複製**（async replication）在兩個獨立的 Ceph cluster 之間持續同步 block image，讓 DC2 始終保有 DC1 資料的近實時副本。
+
+## 哪些元件協作解決這個問題
+
+| 元件 | 職責 |
+|------|------|
+| [CephBlockPool](/rook/features/ceph-block-pool) | 啟用 mirroring mode，讓該 pool 內的所有 image 成為複製來源 |
+| [CephRBDMirror](/rook/features/ceph-controllers) | 在每個站點部署 `rbd-mirror` daemon，負責拉取對端 image 的 journal 並在本地重放 |
+| RBD Journaling | 每次寫入先記錄到 image 的 journal，mirror daemon 消費 journal 複製到對端 |
+| Bootstrap Token Secret | 兩個 cluster 之間的認證憑證，讓 rbd-mirror daemon 可以存取遠端 cluster |
+| StorageClass | 指向已啟用 mirroring 的 pool，讓新建立的 PVC 自動具備複製能力 |
+| Rook Toolbox Pod | 執行 `rbd` 命令查詢 mirroring 狀態與手動觸發 failover |
+
+## 協作流程
+
+```
+DC1（Primary Site）                      DC2（Secondary Site）
+─────────────────────                    ─────────────────────
+CephCluster (rook-ceph)                  CephCluster (rook-ceph-dr)
+  └── CephBlockPool                        └── CephBlockPool
+        mirroring.mode: image                   mirroring.mode: image
+              │                                        │
+              │  bootstrap peer token                  │
+              │ ◄─────────────────────────────────────►│
+              │                                        │
+        RBD image (PVC)                         RBD image (mirror)
+        with journaling                         replayed from journal
+              │                                        │
+              │  rbd-mirror daemon (async)             │
+              │ ──────── journal stream ──────────────►│
+              │          (通常 <1min lag)               │
+              │                                        │
+        CephRBDMirror Pod                       CephRBDMirror Pod
+        (watches DC2 journal)                   (receives DC1 journal)
+
+正常狀態：DC1 = primary (R/W)，DC2 = secondary (read-only mirror)
+Failover：promote DC2 image → primary (R/W)，DC1 image → demote
+```
+
+## 最小可行配置
+
+### 第一步：兩個站點都部署 Rook Operator 與 CephCluster
+
+兩個站點各自獨立部署，namespace 可相同（rook-ceph），確認兩個 cluster 都達到 `HEALTH_OK`。
+
+```bash
+# DC1
+kubectl --context=dc1 -n rook-ceph exec deploy/rook-ceph-tools -- ceph status
+# DC2
+kubectl --context=dc2 -n rook-ceph exec deploy/rook-ceph-tools -- ceph status
+```
+
+### 第二步：在 DC1 建立啟用 Mirroring 的 CephBlockPool
+
+```yaml
+# dc1-blockpool-mirror.yaml
+apiVersion: ceph.rook.io/v1
+kind: CephBlockPool
+metadata:
+  name: replicapool-mirror
+  namespace: rook-ceph
+spec:
+  replicated:
+    size: 3
+    requireSafeReplicaSize: true
+  # ★ 啟用 mirroring，mode: image 表示每個 image 獨立控制複製
+  mirroring:
+    enabled: true
+    mode: image          # 或 pool（整個 pool 都複製）
+    snapshotSchedules:
+      - interval: 1m     # 每分鐘建立 snapshot，作為 async 複製的同步點
+```
+
+```bash
+kubectl --context=dc1 apply -f dc1-blockpool-mirror.yaml
+```
+
+### 第三步：取得 DC1 的 Bootstrap Token
+
+Bootstrap Token 讓 DC2 的 rbd-mirror daemon 能夠認證到 DC1 的 Ceph cluster。
+
+```bash
+# 在 DC1 的 toolbox pod 中執行
+kubectl --context=dc1 -n rook-ceph exec deploy/rook-ceph-tools -- \
+  rbd mirror pool peer bootstrap create \
+  --site-name dc1 \
+  replicapool-mirror
+
+# 輸出類似：
+# eyJmc2lkIjoiMT...（base64 encoded token）
+# 將這個 token 存到 DC2 的 Secret
+```
+
+```yaml
+# dc2-mirror-peer-secret.yaml（在 DC2 建立）
+apiVersion: v1
+kind: Secret
+metadata:
+  name: dc1-peer-bootstrap-token
+  namespace: rook-ceph
+data:
+  # 將上一步的 token 做 base64 encode
+  token: eyJmc2lkIjoiMT...（base64 of the bootstrap token）
+  pool: cmVwbGljYXBvb2wtbWlycm9y  # base64 of "replicapool-mirror"
+```
+
+### 第四步：在 DC2 建立 CephBlockPool 並加入 Peer
+
+```yaml
+# dc2-blockpool-mirror.yaml
+apiVersion: ceph.rook.io/v1
+kind: CephBlockPool
+metadata:
+  name: replicapool-mirror
+  namespace: rook-ceph
+spec:
+  replicated:
+    size: 3
+  mirroring:
+    enabled: true
+    mode: image
+    peers:
+      secretNames:
+        - dc1-peer-bootstrap-token   # ★ 指向上一步建立的 Secret
+```
+
+```bash
+kubectl --context=dc2 apply -f dc2-mirror-peer-secret.yaml
+kubectl --context=dc2 apply -f dc2-blockpool-mirror.yaml
+```
+
+### 第五步：在兩個站點部署 CephRBDMirror Daemon
+
+```yaml
+# ceph-rbd-mirror.yaml（兩個站點都要部署）
+apiVersion: ceph.rook.io/v1
+kind: CephRBDMirror
+metadata:
+  name: my-rbd-mirror
+  namespace: rook-ceph
+spec:
+  count: 1    # mirror daemon 實例數；高可用可設 2
+  peers:
+    secretNames:
+      - dc1-peer-bootstrap-token   # DC2 side；DC1 side 填 DC2 的 token
+```
+
+```bash
+kubectl --context=dc1 apply -f ceph-rbd-mirror-dc1.yaml
+kubectl --context=dc2 apply -f ceph-rbd-mirror-dc2.yaml
+
+# 確認 mirror daemon 就緒
+kubectl --context=dc1 -n rook-ceph get pod -l app=rook-ceph-rbd-mirror
+```
+
+### 第六步：建立指向 Mirror Pool 的 StorageClass
+
+```yaml
+# storageclass-mirror.yaml（部署在 DC1）
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: rook-ceph-block-mirror
+provisioner: rook-ceph.rbd.csi.ceph.com
+parameters:
+  clusterID: rook-ceph
+  pool: replicapool-mirror    # ★ 指向啟用 mirroring 的 pool
+  imageFormat: "2"
+  # ★ 必須啟用 journaling feature，mirroring 依賴 journal 追蹤 write order
+  imageFeatures: layering,journaling,exclusive-lock
+  csi.storage.k8s.io/provisioner-secret-name: rook-csi-rbd-provisioner
+  csi.storage.k8s.io/provisioner-secret-namespace: rook-ceph
+  csi.storage.k8s.io/node-stage-secret-name: rook-csi-rbd-node
+  csi.storage.k8s.io/node-stage-secret-namespace: rook-ceph
+reclaimPolicy: Retain    # ★ 使用 Retain，防止 DR 演練時誤刪資料
+allowVolumeExpansion: true
+```
+
+```yaml
+# 應用程式 PVC 使用 mirror StorageClass
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: postgres-data
+  namespace: production
+spec:
+  storageClassName: rook-ceph-block-mirror
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 100Gi
+```
+
+### 第七步：啟用 PVC 對應 image 的 Mirroring
+
+透過 Rook CRD annotation 啟用個別 image 的 mirroring：
+
+```bash
+# 找到 PVC 對應的 RBD image 名稱
+kubectl -n rook-ceph exec deploy/rook-ceph-tools -- \
+  rbd ls replicapool-mirror
+
+# 啟用該 image 的 mirroring（Rook 也可以透過 CephBlockPool annotation 自動啟用）
+kubectl -n rook-ceph exec deploy/rook-ceph-tools -- \
+  rbd mirror image enable replicapool-mirror/csi-vol-xxxxxxxx snapshot
+```
+
+## 驗證複製狀態
+
+```bash
+# 在 DC1 toolbox 中查詢 pool 整體 mirroring 狀態
+kubectl --context=dc1 -n rook-ceph exec deploy/rook-ceph-tools -- \
+  rbd mirror pool status replicapool-mirror --verbose
+
+# 期望輸出：
+# health: OK
+# daemon health: OK
+# image health: OK
+# images: 3 total
+#     3 replaying        ← DC2 正在重放 DC1 的 journal
+
+# 查看個別 image 的複製延遲
+kubectl --context=dc1 -n rook-ceph exec deploy/rook-ceph-tools -- \
+  rbd mirror image status replicapool-mirror/csi-vol-xxxxxxxx
+
+# 期望輸出：
+#   global_id:   xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
+#   state:       up+replaying
+#   description: replaying, master_position=...
+#   last_update:  2024-01-15 10:23:45     ← 最後同步時間
+```
+
+## Failover 程序：DC1 故障時的 15 分鐘恢復流程
+
+<Callout type="warning" title="Failover 是破壞性操作">
+Promote 操作會使 DC1 的 image 變為 non-primary。即使 DC1 恢復，也需要執行 resync 才能重新同步，且 resync 期間 DC1 的資料會被 DC2 覆蓋。務必確認 DC1 確實不可用再執行。
+</Callout>
+
+```bash
+# ──────────────────────────────────────
+# STEP 1：在 DC2 promote mirror image 為 primary（約 30 秒）
+# ──────────────────────────────────────
+kubectl --context=dc2 -n rook-ceph exec deploy/rook-ceph-tools -- \
+  rbd mirror image promote replicapool-mirror/csi-vol-xxxxxxxx
+
+# ──────────────────────────────────────
+# STEP 2：在 DC2 建立新 PV/PVC 指向該 image（約 2 分鐘）
+# ──────────────────────────────────────
+# 取得 image 的 CSI volume handle
+kubectl --context=dc2 -n rook-ceph exec deploy/rook-ceph-tools -- \
+  rbd info replicapool-mirror/csi-vol-xxxxxxxx | grep block_name_prefix
+
+# 手動建立 PersistentVolume 指向既有 image
+cat <<EOF | kubectl --context=dc2 apply -f -
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: postgres-data-dr
+spec:
+  capacity:
+    storage: 100Gi
+  accessModes:
+    - ReadWriteOnce
+  csi:
+    driver: rook-ceph.rbd.csi.ceph.com
+    nodeStageSecretRef:
+      name: rook-csi-rbd-node
+      namespace: rook-ceph
+    volumeAttributes:
+      clusterID: rook-ceph
+      imageFeatures: layering,journaling,exclusive-lock
+      pool: replicapool-mirror
+    volumeHandle: 0001-0009-rook-ceph-0000000000000001-csi-vol-xxxxxxxx
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: rook-ceph-block-mirror
+EOF
+
+# ──────────────────────────────────────
+# STEP 3：在 DC2 部署工作負載（約 5 分鐘，含 Pod 啟動）
+# ──────────────────────────────────────
+kubectl --context=dc2 apply -f postgres-deployment.yaml
+kubectl --context=dc2 -n production get pod -w
+```
+
+### DC1 恢復後的 Failback 程序
+
+```bash
+# DC1 恢復後，需要把 DC1 的 image resync 到 DC2 的最新狀態
+kubectl --context=dc1 -n rook-ceph exec deploy/rook-ceph-tools -- \
+  rbd mirror image resync replicapool-mirror/csi-vol-xxxxxxxx
+
+# 等待 resync 完成（可能需要數分鐘，取決於 failover 後的寫入量）
+# 再執行反向 promote，將 DC1 重新設為 primary
+kubectl --context=dc1 -n rook-ceph exec deploy/rook-ceph-tools -- \
+  rbd mirror image promote replicapool-mirror/csi-vol-xxxxxxxx
+
+kubectl --context=dc2 -n rook-ceph exec deploy/rook-ceph-tools -- \
+  rbd mirror image demote replicapool-mirror/csi-vol-xxxxxxxx
+```
+
+## 關鍵參數說明
+
+| 參數 | 位置 | 說明 | 建議值 |
+|------|------|------|--------|
+| `mirroring.mode` | CephBlockPool | `image`：每個 image 獨立控制；`pool`：整個 pool 強制複製 | `image`（生產彈性更大） |
+| `snapshotSchedules.interval` | CephBlockPool | Snapshot-based mirroring 的同步間隔 | `1m`（平衡 RPO 與 journal 空間） |
+| `imageFeatures` | StorageClass | 必須包含 `journaling` 和 `exclusive-lock` | `layering,journaling,exclusive-lock` |
+| `reclaimPolicy` | StorageClass | DR 用途務必設 `Retain`，防止誤刪 | `Retain` |
+| `CephRBDMirror.count` | CephRBDMirror | mirror daemon 實例數 | 生產 `2`（HA） |
+| `mon.count` | CephCluster | Monitor 節點數，兩個站點都要 3 個 | `3` |
+
+## RPO / RTO 分析
+
+```
+RPO（Recovery Point Objective）— 資料損失上限
+─────────────────────────────────────────────
+Snapshot-based mirroring（interval: 1m）：
+  最壞情況 = 1 分鐘（最後一次 snapshot 到故障之間的寫入）
+  實際通常 < 30 秒（snapshot 週期過半時故障）
+
+Journal-based mirroring（需要 Ceph Reef+）：
+  最壞情況 ≈ 秒級（取決於網路延遲與 journal replay 速度）
+  適合 RPO < 5 秒的場景（資料量大時 journal 傳輸可能有滯後）
+
+RTO（Recovery Time Objective）— 服務恢復時間
+────────────────────────────────────────────
+  promote image       ≈  30 秒
+  建立 PV/PVC        ≈   2 分鐘
+  Pod 重新排程        ≈   2 分鐘
+  應用啟動 + 就緒     ≈   5 分鐘（視應用而定）
+  DNS / LB 切換      ≈   3 分鐘
+  ─────────────────────────────
+  總計                ≈  12-15 分鐘（手動操作）
+  
+  使用自動化腳本：約 5-8 分鐘
+```
+
+<Callout type="info" title="網路頻寬規劃">
+RBD Mirroring 的頻寬需求 = 應用寫入速率 × (1 + journal overhead ~20%)。
+若 PostgreSQL 的 WAL 寫入速率為 50 MB/s，站點間連線需要至少 60 MB/s 的穩定頻寬。
+可用 `rbd mirror pool stats` 監控實際複製流量。
+</Callout>
+
+## 常見問題與解法
+
+### 問題 1：`rbd mirror pool status` 顯示 `health: WARNING`
+
+```bash
+# 查看詳細錯誤
+kubectl -n rook-ceph exec deploy/rook-ceph-tools -- \
+  rbd mirror pool status replicapool-mirror --verbose 2>&1 | grep -i error
+
+# 常見原因：
+# 1. peer secret 格式錯誤 → 重新執行 bootstrap create，確認 base64 正確
+# 2. 站點間網路不通 → 確認 DC2 能到達 DC1 的 Ceph MON endpoint
+#    kubectl -n rook-ceph exec deploy/rook-ceph-tools -- \
+#      ceph mon dump | grep addr
+# 3. image 沒有啟用 journaling feature
+#    rbd info <pool>/<image> | grep features
+```
+
+### 問題 2：複製延遲過高（lag > 5 分鐘）
+
+```bash
+# 查看 mirror daemon 的詳細統計
+kubectl -n rook-ceph exec deploy/rook-ceph-tools -- \
+  rbd mirror pool status replicapool-mirror --verbose | grep "replay lag"
+
+# 可能原因與解法：
+# 1. 站點間頻寬不足 → 增加連線頻寬，或考慮縮減複製的 image 數量
+# 2. OSD 過載 → 增加 OSD 數量或改用更快的磁碟
+# 3. CephRBDMirror.count 不足 → 增加 mirror daemon 數量
+```
+
+### 問題 3：Failover 後 Pod 無法掛載 PVC
+
+```bash
+# 確認 image 已成功 promote 為 primary
+kubectl --context=dc2 -n rook-ceph exec deploy/rook-ceph-tools -- \
+  rbd mirror image status replicapool-mirror/csi-vol-xxxxxxxx | grep "state"
+# 期望：state: up+stopped（promoted, no longer replaying）
+
+# 確認 PV 的 volumeHandle 格式正確
+# 格式：{clusterID}-{imageID}
+kubectl --context=dc2 get pv postgres-data-dr -o yaml | grep volumeHandle
+```
+
+### 問題 4：如何定期 DR 演練而不影響生產
+
+<Callout type="tip" title="DR 演練最佳實踐">
+使用 `rbd export` 將特定 snapshot 匯出到 DC2 的獨立測試 pool，在隔離的 namespace 建立測試 VM 驗證資料完整性，整個過程不需要 promote，不影響正常複製。
+</Callout>
+
+```bash
+# 匯出最新 snapshot（不中斷複製）
+kubectl --context=dc1 -n rook-ceph exec deploy/rook-ceph-tools -- \
+  rbd export-diff replicapool-mirror/csi-vol-xxxxxxxx@mirror.primary \
+  - | kubectl --context=dc2 -n rook-ceph exec -i deploy/rook-ceph-tools -- \
+  rbd import-diff - test-pool/dr-test-image
+```
+
+## 深入閱讀
+
+- [CephBlockPool 配置詳解](/rook/features/ceph-block-pool) — Pool 類型、複製因子、erasure coding
+- [Rook Controllers](/rook/features/ceph-controllers) — CephRBDMirror controller 的 reconcile 邏輯
+- [StorageClasses](/rook/features/storage-classes) — CSI 參數與 imageFeatures 設定

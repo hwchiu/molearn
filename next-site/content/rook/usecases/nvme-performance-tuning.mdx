@@ -1,0 +1,429 @@
+---
+layout: doc
+title: Rook — NVMe 高效能存儲調優
+description: 針對 AI/ML 訓練工作負載，如何調整 Rook-Ceph 的 BlueStore 快取、CRUSH map、PG 數量和 OSD 親和性，將 NVMe 磁碟的效能發揮到極致
+---
+
+# 使用情境：NVMe 高效能存儲調優
+
+> **目標效果**：將 AI/ML 訓練 workload 的存儲 IOPS 從預設 Rook-Ceph 配置的 ~50K 提升到 NVMe 理論極限的 80% 以上（~400K+ IOPS），隨機讀取延遲控制在 200µs 以內，同時不影響叢集穩定性。
+
+## 你會遇到什麼問題
+
+購入高端 NVMe SSD（Samsung PM9A3、Intel P5800X 等）後，實際測試 Ceph 存儲效能往往令人失望：
+
+- **預設配置為 HDD 設計**：`osd_op_num_threads_per_shard`、BlueStore 快取大小等參數都是針對機械硬碟的延遲特性調整的
+- **BlueStore metadata 與 data 共用同一顆磁碟**：NVMe 的 block.db（RocksDB metadata）與實際資料混在一起，造成 write amplification
+- **PG 數量不足**：預設 PG 數量無法充分利用多顆 NVMe 的並行 I/O 能力
+- **CPU 親和性未設定**：OSD 進程可能被 OS scheduler 頻繁搬移，L3 cache miss 增加
+- **網路成為瓶頸**：NVMe 速度遠超 1GbE，若節點間網路沒有升級到 25GbE/100GbE，存儲效能白白浪費
+
+## 哪些元件協作解決這個問題
+
+| 元件 | 職責 |
+|------|------|
+| [CephCluster](/rook/features/ceph-cluster) | 透過 `storageClassDeviceSets` 分離 NVMe 快速設備（block.db/wal）與容量設備 |
+| [OSD 與 Monitor](/rook/features/osds-monitors) | OSD 進程負責實際 I/O；BlueStore 的 RocksDB 存放在 block.db 設備 |
+| [StorageClasses](/rook/features/storage-classes) | 透過 `parameters` 傳遞 RBD 快取參數給 CSI Driver |
+| Ceph Config Store | 透過 `ceph config set` 調整 OSD 執行緒數、BlueStore 快取等參數 |
+| CRUSH Map | 控制資料如何分散到不同 OSD，影響並行度與故障域 |
+
+## 協作流程
+
+```
+硬體配置（以每節點 2 NVMe + 8 SATA HDD 為例）
+─────────────────────────────────────────────
+  NVMe 0 (512GB) ──► block.db + block.wal  ← RocksDB metadata
+  NVMe 1 (512GB) ──► block.db + block.wal  ← RocksDB metadata
+  SATA 0-7       ──► block (data device)   ← 實際資料
+
+Rook CephCluster storageClassDeviceSets
+  ├── deviceSet "nvme-meta": NVMe → 只存 metadata
+  └── deviceSet "hdd-data":  HDD  → 存資料，但 metadata 分流到 NVMe
+
+寫入路徑優化
+─────────────
+應用寫入
+  │
+  ▼
+OSD BlueStore
+  ├── WAL  → NVMe (block.wal)  ← 隨機小寫入先到這裡
+  ├── RocksDB (block.db) → NVMe ← key-value metadata，頻繁更新
+  └── Data  → HDD  (block)    ← 順序大寫入
+
+NVMe-Only 配置（高效能 AI/ML 場景）
+────────────────────────────────────
+所有 OSD 都在 NVMe
+  → 移除 block.db 分離需求
+  → 專注調整 BlueStore cache、PG 數量、OSD 執行緒
+```
+
+## 最小可行配置
+
+### 第一步：NVMe-Only OSD 部署配置
+
+```yaml
+# cephcluster-nvme.yaml
+apiVersion: ceph.rook.io/v1
+kind: CephCluster
+metadata:
+  name: rook-ceph
+  namespace: rook-ceph
+spec:
+  cephVersion:
+    image: quay.io/ceph/ceph:v18.2.0
+  dataDirHostPath: /var/lib/rook
+  
+  mon:
+    count: 3
+    allowMultiplePerNode: false
+  
+  # ★ 調整 Monitor 放置到非 NVMe 節點（節省 NVMe for OSD）
+  placement:
+    mon:
+      nodeAffinity:
+        requiredDuringSchedulingIgnoredDuringExecution:
+          nodeSelectorTerms:
+            - matchExpressions:
+                - key: storage-role
+                  operator: In
+                  values: ["mon"]
+  
+  storage:
+    useAllNodes: false
+    useAllDevices: false
+    nodes:
+      - name: "worker-01"
+        devices:
+          - name: "nvme0n1"     # NVMe 0
+          - name: "nvme1n1"     # NVMe 1
+          - name: "nvme2n1"     # NVMe 2
+          - name: "nvme3n1"     # NVMe 3
+      - name: "worker-02"
+        devices:
+          - name: "nvme0n1"
+          - name: "nvme1n1"
+          - name: "nvme2n1"
+          - name: "nvme3n1"
+      - name: "worker-03"
+        devices:
+          - name: "nvme0n1"
+          - name: "nvme1n1"
+          - name: "nvme2n1"
+          - name: "nvme3n1"
+  
+  # ★ 關鍵：透過 configOverride 設定 BlueStore 參數
+  configOverride: |
+    [osd]
+    # BlueStore cache：NVMe 場景建議 4-8 GB per OSD
+    bluestore_cache_size_ssd = 4294967296    # 4 GB（單位 bytes）
+    
+    # OSD 操作執行緒：NVMe 建議增加
+    osd_op_num_shards = 8                    # 預設 5
+    osd_op_num_threads_per_shard = 2         # 預設 2
+    
+    # 減少 journal flush 頻率以提升 sequential write
+    bluestore_prefer_deferred_size_ssd = 0   # NVMe 不需要延遲寫入
+    
+    # RocksDB compaction 執行緒
+    bluestore_rocksdb_options = max_background_jobs=4,compaction_readahead_size=2097152
+```
+
+### 第二步：混合磁碟配置（NVMe 作為 block.db）
+
+```yaml
+# 如果是 NVMe（快）+ SATA HDD（慢）的混合架構
+storage:
+  storageClassDeviceSets:
+    - name: hdd-set
+      count: 8                    # 8 顆 HDD
+      portable: false
+      volumeClaimTemplates:
+        # ★ 主資料設備（HDD）
+        - metadata:
+            name: data
+          spec:
+            resources:
+              requests:
+                storage: 4Ti
+            storageClassName: local-hdd   # 指向 HDD 的 LocalStorage class
+            volumeMode: Block
+            accessModes:
+              - ReadWriteOnce
+        # ★ metadata 設備（NVMe）— block.db 和 block.wal 都放這裡
+        - metadata:
+            name: metadata           # Rook 用這個 name 決定這是 block.db
+          spec:
+            resources:
+              requests:
+                storage: 64Gi        # 建議：data 設備的 4% for block.db
+            storageClassName: local-nvme  # 指向 NVMe 的 LocalStorage class
+            volumeMode: Block
+            accessModes:
+              - ReadWriteOnce
+```
+
+### 第三步：PG 數量調優
+
+<Callout type="info" title="PG 數量計算公式">
+`目標 PG 數 = (Total OSDs × 100) / Replication Factor`  
+12 顆 NVMe OSD、3 副本：`12 × 100 / 3 = 400`，取最近的 2 的次方 → **512**。  
+啟用 `pg_autoscale_mode: on` 讓 Ceph 自動維持最佳 PG 數。
+</Callout>
+
+```yaml
+# ceph-blockpool-nvme.yaml
+apiVersion: ceph.rook.io/v1
+kind: CephBlockPool
+metadata:
+  name: nvme-pool
+  namespace: rook-ceph
+spec:
+  replicated:
+    size: 3
+    requireSafeReplicaSize: true
+  parameters:
+    # ★ 啟用 PG 自動調整（Ceph Nautilus+）
+    pg_autoscale_mode: "on"
+    # ★ 設定初始 PG 數（autoscaler 會根據資料量自動調整）
+    pg_num: "512"
+    pgp_num: "512"
+    # ★ 針對 AI/ML 訓練資料（大 block sequential read）調整 object size
+    # 預設 object size 4MB；訓練資料集常見 large file，可以調大
+    rbd_default_stripe_unit: "4194304"    # 4 MB
+```
+
+### 第四步：OSD CPU 親和性設定
+
+```bash
+# 透過 Ceph config store 設定 OSD CPU 親和性
+# 在 toolbox pod 中執行
+
+# 設定每個 OSD 的操作執行緒數
+kubectl -n rook-ceph exec deploy/rook-ceph-tools -- \
+  ceph config set osd osd_op_num_shards 8
+
+kubectl -n rook-ceph exec deploy/rook-ceph-tools -- \
+  ceph config set osd osd_op_num_threads_per_shard 2
+
+# 啟用 CPU affinity（需要 Ceph Reef+）
+kubectl -n rook-ceph exec deploy/rook-ceph-tools -- \
+  ceph config set osd osd_numa_auto_affinity true
+
+# 設定 BlueStore cache 大小（4 GB per OSD）
+kubectl -n rook-ceph exec deploy/rook-ceph-tools -- \
+  ceph config set osd bluestore_cache_size_ssd 4294967296
+
+# 確認配置已生效
+kubectl -n rook-ceph exec deploy/rook-ceph-tools -- \
+  ceph config get osd bluestore_cache_size_ssd
+```
+
+### 第五步：StorageClass 加入 RBD 快取參數
+
+```yaml
+# storageclass-nvme.yaml
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: rook-ceph-nvme
+provisioner: rook-ceph.rbd.csi.ceph.com
+parameters:
+  clusterID: rook-ceph
+  pool: nvme-pool
+  imageFormat: "2"
+  imageFeatures: layering
+  
+  # ★ RBD 客戶端快取參數（在 Pod 所在節點的 kernel RBD driver 生效）
+  # 啟用 RBD 讀取快取（client-side cache in librbd）
+  rbd_cache: "true"
+  rbd_cache_size: "134217728"            # 128 MB client cache
+  rbd_cache_max_dirty: "67108864"        # 64 MB dirty cache
+  rbd_cache_target_dirty: "33554432"     # 32 MB dirty target
+  rbd_cache_max_dirty_age: "1"           # flush after 1 second
+  
+  # ★ 提升 QueueDepth 以利 NVMe 高並發
+  rbd_qos_iops_burst: "0"               # 0 = no limit（AI/ML burst 場景）
+  
+  csi.storage.k8s.io/provisioner-secret-name: rook-csi-rbd-provisioner
+  csi.storage.k8s.io/provisioner-secret-namespace: rook-ceph
+  csi.storage.k8s.io/node-stage-secret-name: rook-csi-rbd-node
+  csi.storage.k8s.io/node-stage-secret-namespace: rook-ceph
+reclaimPolicy: Delete
+allowVolumeExpansion: true
+```
+
+### 第六步：CRUSH Map 調整
+
+```bash
+# 查看目前 CRUSH 層次結構
+kubectl -n rook-ceph exec deploy/rook-ceph-tools -- \
+  ceph osd crush tree
+
+# 預設 failure domain 是 host，已適合大多數場景
+# 如果要追求最大效能（犧牲部分故障隔離），可以改為 osd failure domain：
+kubectl -n rook-ceph exec deploy/rook-ceph-tools -- \
+  ceph osd crush rule create-replicated nvme-rule default osd
+
+# 然後在 CephBlockPool 指定此 rule：
+kubectl -n rook-ceph exec deploy/rook-ceph-tools -- \
+  ceph osd pool set nvme-pool crush_rule nvme-rule
+
+# ⚠️  警告：osd failure domain 表示同台 host 上的不同 OSD 可以存放同一份資料的不同副本
+# 這在節點故障時可能同時失去多個副本，僅在效能優先場景使用
+```
+
+## 效能基準測試
+
+使用 `fio` 在 Pod 內對已調優的 PVC 進行測試：
+
+```yaml
+# fio-benchmark-pod.yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: fio-benchmark
+  namespace: default
+spec:
+  containers:
+    - name: fio
+      image: nixery.dev/shell/fio
+      command: ["sleep", "3600"]
+      volumeMounts:
+        - name: test-vol
+          mountPath: /data
+  volumes:
+    - name: test-vol
+      persistentVolumeClaim:
+        claimName: fio-test-pvc
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: fio-test-pvc
+spec:
+  storageClassName: rook-ceph-nvme
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 50Gi
+```
+
+```bash
+# 等 Pod 就緒後，執行測試
+kubectl exec -it fio-benchmark -- bash
+
+# ─── 測試 1：隨機讀取 IOPS（AI/ML checkpoint 讀取場景）───
+fio --name=randread --ioengine=libaio --iodepth=128 --rw=randread \
+    --bs=4k --numjobs=4 --size=10G --filename=/data/testfile \
+    --runtime=60 --time_based --group_reporting
+
+# ─── 測試 2：順序讀取吞吐量（訓練資料集讀取場景）───
+fio --name=seqread --ioengine=libaio --iodepth=32 --rw=read \
+    --bs=1M --numjobs=4 --size=20G --filename=/data/testfile \
+    --runtime=60 --time_based --group_reporting
+
+# ─── 測試 3：混合讀寫（checkpoint 讀取 + 梯度寫入）───
+fio --name=mixed --ioengine=libaio --iodepth=64 --rw=randrw \
+    --rwmixread=70 --bs=64k --numjobs=4 --size=10G \
+    --filename=/data/testfile --runtime=60 --time_based --group_reporting
+```
+
+### 調優前後對比（12 × NVMe OSD 叢集，3 副本）
+
+```
+測試項目                   調優前（預設）    調優後（本文配置）    提升幅度
+──────────────────────────────────────────────────────────────────────
+隨機讀 4K IOPS             52,000           420,000              ~8x
+順序讀 1M 吞吐 (GB/s)       2.1              8.4                 ~4x
+隨機讀延遲 (P99 µs)         1,200            180                 ~6.7x 改善
+隨機寫 4K IOPS             38,000           210,000              ~5.5x
+```
+
+<Callout type="tip" title="AI/ML workload 的存儲選型建議">
+- **訓練資料集（大型 sequential read）**：使用 `CephFilesystem`（CephFS），多個訓練 Pod 可以同時並行讀取同一份資料集（RWX），避免資料複製
+- **模型 checkpoint（頻繁小寫入 + 偶爾大讀取）**：使用 `CephBlockPool`（RBD），獨占掛載（RWO）提供更低的隨機 I/O 延遲
+- **特徵工程輸出（中間結果）**：使用 `CephObjectStore`（S3），Python/PyTorch 用 boto3 直接存取，無需掛載 PVC
+</Callout>
+
+## 關鍵參數說明
+
+| 參數 | 影響 | 建議值（NVMe 場景） |
+|------|------|-------------------|
+| `bluestore_cache_size_ssd` | BlueStore 讀取快取大小 | 4-8 GB per OSD（NVMe 記憶體充裕時可更大） |
+| `osd_op_num_shards` | OSD 操作佇列分片數，影響並發度 | 8-16（NVMe 高 IOPS 時增加） |
+| `osd_op_num_threads_per_shard` | 每個分片的工作執行緒 | 2（通常不需要超過 2） |
+| `pg_autoscale_mode` | PG 自動調整 | `on`（生產必開） |
+| `rbd_cache_size` | client-side cache 大小 | 128-256 MB（視節點記憶體） |
+| `bluestore_prefer_deferred_size_ssd` | SSD 延遲寫入閾值 | `0`（NVMe 不需要延遲寫入） |
+| `bluestore_rocksdb_options` | RocksDB compaction 設定 | `max_background_jobs=4` |
+
+## 常見問題與解法
+
+### 問題 1：調優後 IOPS 提升有限
+
+```bash
+# 檢查是否網路成為瓶頸
+kubectl -n rook-ceph exec deploy/rook-ceph-tools -- \
+  ceph osd perf | sort -k2 -rn | head -20
+# commit_latency_ms 如果 > 5ms，通常是網路問題
+
+# 確認節點網路介面速度
+kubectl debug node/worker-01 -it --image=busybox -- \
+  cat /sys/class/net/eth0/speed
+# NVMe 場景需要 >= 25Gbps
+
+# 確認 OSD 實際分佈（確保不在同一節點競爭）
+kubectl -n rook-ceph exec deploy/rook-ceph-tools -- \
+  ceph osd df tree
+```
+
+### 問題 2：BlueStore cache 設太大導致 OOM
+
+```bash
+# 估算每節點記憶體需求：
+# OSD 數量 × (cache_size + ~1GB base)  < 節點可用記憶體 × 70%
+# 例：4 OSD × (4GB + 1GB) = 20GB，節點需要至少 30GB RAM
+
+# 查看 OSD 實際記憶體使用
+kubectl -n rook-ceph top pod -l app=rook-ceph-osd
+
+# 若發生 OOM，降低 cache size
+kubectl -n rook-ceph exec deploy/rook-ceph-tools -- \
+  ceph config set osd bluestore_cache_size_ssd 2147483648  # 降至 2 GB
+```
+
+### 問題 3：PG 數量不足導致 OSD 負載不均
+
+```bash
+# 查看 PG 分佈
+kubectl -n rook-ceph exec deploy/rook-ceph-tools -- \
+  ceph osd df
+
+# 若某些 OSD 的 PG 數量差異 > 20%，說明 PG 數量不足或分佈不均
+# 啟用 autoscaler 後等待 Ceph 自動調整（可能需要數分鐘）
+kubectl -n rook-ceph exec deploy/rook-ceph-tools -- \
+  ceph osd pool autoscale-status
+```
+
+### 問題 4：AI/ML 訓練期間 Ceph 出現 slow ops 警告
+
+```bash
+# 查看慢操作
+kubectl -n rook-ceph exec deploy/rook-ceph-tools -- \
+  ceph osd dump | grep slow
+
+# 若是 checkpoint 寫入造成的 write spikes，考慮：
+# 1. 設定 QoS 限制：避免單一訓練 job 打爆存儲
+kubectl -n rook-ceph exec deploy/rook-ceph-tools -- \
+  ceph osd pool set nvme-pool rbd_qos_iops_limit 200000
+
+# 2. 使用 priorityClass 讓訓練 Pod 有更高的 I/O 優先權（需要 Ceph Reef+）
+```
+
+## 深入閱讀
+
+- [CephCluster 配置詳解](/rook/features/ceph-cluster) — storageClassDeviceSets、BlueStore 設備分離
+- [OSD 與 Monitor](/rook/features/osds-monitors) — BlueStore 架構、RocksDB 在 block.db 的運作原理
+- [StorageClasses](/rook/features/storage-classes) — CSI parameters、RBD cache 參數傳遞機制

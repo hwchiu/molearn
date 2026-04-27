@@ -1,0 +1,605 @@
+---
+layout: doc
+title: Cluster API — 跨 Provider 工作負載遷移策略
+description: 從 bare-metal MAAS cluster 遷移到雲端 CAPI cluster，利用 ClusterClass 確保兩端拓撲一致，以 Velero 備份還原 workload，實現零停機的 Provider 切換
+---
+
+# 使用情境：跨 Provider 工作負載遷移策略
+
+> **目標效果**：把跑在 bare-metal MAAS cluster 上的生產 workload 遷移到 AWS CAPI cluster，過程中服務不中斷，資料不遺失，遷移步驟可重複執行，並且可以反向操作（cloud → bare-metal）。
+
+## 你會遇到什麼問題
+
+企業從 bare-metal 遷移到雲端（或反過來）時，往往低估了以下幾個層面的複雜度：
+
+**問題一：cluster 拓撲不一致**
+
+bare-metal MAAS cluster 是「某個工程師六個月前手動建的」，AWS cluster 是「另一個工程師按照不同的 runbook 建的」。結果：
+- Control Plane 節點數量不同（bare-metal 5 台、AWS 3 台）
+- Kubelet 參數不同（`--max-pods=250` vs `--max-pods=110`）
+- Node label 不同，導致 affinity 規則在新 cluster 失效
+- 舊 cluster 有 taint、新 cluster 沒有，workload 排在了不該排的地方
+
+**問題二：有狀態 workload 的儲存問題**
+
+bare-metal 上的 Rook/Ceph PV 無法直接搬到 AWS EBS。StorageClass 名稱不同，PVC 綁定的 provisioner 不同，甚至資料格式（block device vs filesystem）也可能不同。
+
+**問題三：沒有標準的「暫停狀態」**
+
+遷移過程中需要有一個明確的時間點：「舊 cluster 停止寫入，新 cluster 開始服務」。沒有這個明確邊界，資料很容易在兩端都有不完整的寫入。
+
+**問題四：DNS / Load Balancer 切換風險**
+
+DNS TTL 可能讓部分流量在切換後繼續打到舊 cluster，但舊 cluster 可能已經開始 decommission，導致服務短暫中斷。
+
+<Callout type="warning" title="這個方案的前提假設">
+本文假設你的 workload 可以短暫（幾分鐘到幾小時）進入唯讀或降級模式來完成資料同步。如果你的系統完全無法容忍任何唯讀視窗，需要的是資料庫層的雙寫同步，不是本文描述的遷移方案。
+</Callout>
+
+## 哪些元件協作解決這個問題
+
+| 元件 | 職責 |
+|------|------|
+| [ClusterClass + Topology](/cluster-api/features/clusterclass-topology) | 定義跨 Provider 一致的 cluster 拓撲（節點數、kubelet 設定、label、taint），確保 workload 在新 cluster 的行為與舊 cluster 相同 |
+| [MachineDeployment](/cluster-api/features/api-machineset-machinedeployment) | 透過 `spec.template` 確保新 cluster 的 worker node 設定與舊 cluster 完全一致 |
+| [Cluster / Machine API](/cluster-api/features/api-cluster-machine) | 宣告式描述新 cluster 的期望狀態，Provider 無關的 API 讓你用相同的方式管理 MAAS 和 AWS cluster |
+| Velero（外部工具） | 備份舊 cluster 的 K8s 資源（Deployment、ConfigMap、Secret、PVC metadata）並還原到新 cluster |
+| External-DNS / kubectl（外部工具） | DNS 記錄切換，控制流量從舊 cluster 切到新 cluster |
+
+## 遷移整體策略
+
+遷移分為四個階段，每個階段都有明確的 go/no-go 檢查點：
+
+```
+階段 1：建立新 cluster（並行操作，不影響舊 cluster）
+─────────────────────────────────────────────────
+  ┌──────────────────┐         ┌──────────────────┐
+  │  舊 cluster      │         │  新 cluster      │
+  │  (MAAS)          │         │  (AWS CAPI)      │
+  │                  │         │                  │
+  │  ■ prod workload │         │  正在建立中...   │
+  │  ■ 接收流量      │         │                  │
+  └──────────────────┘         └──────────────────┘
+
+階段 2：同步資料 & 預先部署 workload（並行）
+─────────────────────────────────────────────────
+  ┌──────────────────┐         ┌──────────────────┐
+  │  舊 cluster      │         │  新 cluster      │
+  │  (MAAS)          │  Velero │  (AWS CAPI)      │
+  │                  │ ──────▶ │                  │
+  │  ■ prod workload │  備份   │  ■ workload 已   │
+  │  ■ 接收流量      │  還原   │    部署，but 無  │
+  │                  │         │    流量（scale 0 │
+  │                  │         │    或 no-traffic）│
+  └──────────────────┘         └──────────────────┘
+
+階段 3：流量切換（最短停機時間）
+─────────────────────────────────────────────────
+  ┌──────────────────┐         ┌──────────────────┐
+  │  舊 cluster      │         │  新 cluster      │
+  │  (MAAS)          │         │  (AWS CAPI)      │
+  │                  │         │                  │
+  │  ■ workload      │         │  ■ prod workload │
+  │    cordon/drain  │  DNS    │  ■ 開始接收流量  │
+  │  ■ 停止接收流量  │ ──────▶ │                  │
+  └──────────────────┘  切換   └──────────────────┘
+
+階段 4：確認 & 下線舊 cluster
+─────────────────────────────────────────────────
+  ┌──────────────────┐         ┌──────────────────┐
+  │  舊 cluster      │         │  新 cluster      │
+  │  (MAAS)          │         │  (AWS CAPI)      │
+  │                  │         │                  │
+  │  保留 48 小時    │         │  ■ 正常服務中    │
+  │  確認無異常後    │         │                  │
+  │  kubectl delete  │         │                  │
+  └──────────────────┘         └──────────────────┘
+```
+
+## 最小可行配置
+
+### 步驟 1：用 ClusterClass 確保新舊 cluster 拓撲一致
+
+這是整個遷移成功的技術基礎。先徹底盤點舊 cluster（MAAS）的關鍵設定：
+
+```bash
+# ────── 盤點舊 cluster 的 node 設定 ──────
+
+# 1. 查看 kubelet 參數
+kubectl get nodes -o yaml | grep -A 20 "nodeInfo"
+ssh <control-plane-node> "cat /var/lib/kubelet/config.yaml"
+
+# 2. 查看所有 node 的 label
+kubectl get nodes --show-labels
+
+# 3. 查看 taint
+kubectl get nodes -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.spec.taints}{"\n"}{end}'
+
+# 4. 查看 worker 數量與機器規格
+kubectl get machinedeployment -n capi-system -o wide
+```
+
+根據盤點結果，建立一個跨 Provider 的 ClusterClass，確保兩端的 cluster 拓撲完全一致：
+
+```yaml
+# 這個 ClusterClass 同時可以被 MAAS provider 和 AWS provider 的 cluster 使用
+# 它定義的是 topology（節點數、kubelet config、label），而不是 infrastructure 細節
+apiVersion: cluster.x-k8s.io/v1beta1
+kind: ClusterClass
+metadata:
+  name: production-standard-v1
+  namespace: capi-system
+spec:
+  controlPlane:
+    ref:
+      apiVersion: controlplane.cluster.x-k8s.io/v1beta1
+      kind: KubeadmControlPlaneTemplate
+      name: prod-kcp-template
+      namespace: capi-system
+    machineInfrastructure:
+      ref:
+        # ★ 這裡的 infrastructure template 是 Provider 特定的
+        # MAAS cluster 指向 Metal3MachineTemplate
+        # AWS cluster 指向 AWSMachineTemplate
+        # 但 KubeadmControlPlaneTemplate（bootstrap 設定）兩邊完全相同
+        apiVersion: infrastructure.cluster.x-k8s.io/v1beta2
+        kind: AWSMachineTemplate
+        name: prod-cp-aws-template
+        namespace: capi-system
+
+  workers:
+    machineDeployments:
+      - class: general-worker
+        template:
+          bootstrap:
+            ref:
+              apiVersion: bootstrap.cluster.x-k8s.io/v1beta1
+              kind: KubeadmConfigTemplate
+              name: prod-worker-bootstrap  # ★ 兩個 cluster 共用同一個 bootstrap template
+              namespace: capi-system
+          infrastructure:
+            ref:
+              apiVersion: infrastructure.cluster.x-k8s.io/v1beta2
+              kind: AWSMachineTemplate
+              name: prod-worker-aws-template
+              namespace: capi-system
+          # ★ 確保 node label 和 taint 一致（關鍵！）
+          metadata:
+            labels:
+              node-role.kubernetes.io/worker: ""
+              platform.io/node-class: general
+            # annotations 也可以從這裡傳入
+```
+
+針對兩個 cluster 共用的 KubeadmConfigTemplate，確保 kubelet 參數完全相同：
+
+```yaml
+apiVersion: bootstrap.cluster.x-k8s.io/v1beta1
+kind: KubeadmConfigTemplate
+metadata:
+  name: prod-worker-bootstrap
+  namespace: capi-system
+spec:
+  template:
+    spec:
+      joinConfiguration:
+        nodeRegistration:
+          # ★ 這裡的設定在新舊兩個 cluster 必須完全一致
+          kubeletExtraArgs:
+            max-pods: "250"
+            eviction-hard: "memory.available<500Mi,nodefs.available<10%"
+            kube-reserved: "cpu=200m,memory=500Mi"
+            system-reserved: "cpu=200m,memory=500Mi"
+            # container runtime socket
+            container-runtime-endpoint: "unix:///var/run/containerd/containerd.sock"
+          # ★ taint 在這裡設定（如果 workload 有 tolerations 依賴這些 taint）
+          taints: []
+```
+
+### 步驟 2：建立新的 AWS Cluster
+
+```yaml
+# new-cluster-aws.yaml
+apiVersion: cluster.x-k8s.io/v1beta1
+kind: Cluster
+metadata:
+  name: prod-aws-migration-target
+  namespace: capi-system
+  annotations:
+    # ★ 標記這是遷移目標，方便 operator 識別
+    platform.io/migration-source: "prod-maas-01"
+    platform.io/migration-phase: "staging"
+spec:
+  topology:
+    class: production-standard-v1
+    version: v1.29.5        # ★ 必須與舊 cluster 相同版本，避免 API 相容性問題
+    controlPlane:
+      replicas: 3
+    workers:
+      machineDeployments:
+        - class: general-worker
+          name: general
+          replicas: 10       # ★ 初始開 10 台，與舊 cluster 相同
+  # AWS 特定設定（通過 ClusterClass variables 傳入）
+  infrastructureRef:
+    apiVersion: infrastructure.cluster.x-k8s.io/v1beta2
+    kind: AWSCluster
+    name: prod-aws-migration-target
+---
+apiVersion: infrastructure.cluster.x-k8s.io/v1beta2
+kind: AWSCluster
+metadata:
+  name: prod-aws-migration-target
+  namespace: capi-system
+spec:
+  region: us-east-1
+  sshKeyName: platform-ops-key
+  network:
+    vpc:
+      cidrBlock: "10.20.0.0/16"   # ★ 使用不同的 CIDR，與 MAAS cluster 不重疊
+    subnets:
+      - availabilityZone: us-east-1a
+        cidrBlock: "10.20.1.0/24"
+        isPublic: false
+      - availabilityZone: us-east-1b
+        cidrBlock: "10.20.2.0/24"
+        isPublic: false
+      - availabilityZone: us-east-1c
+        cidrBlock: "10.20.3.0/24"
+        isPublic: false
+```
+
+```bash
+# 應用並等待新 cluster 就緒
+kubectl apply -f new-cluster-aws.yaml
+
+# 等待 cluster 完全 Ready（可能需要 10-20 分鐘）
+kubectl wait cluster prod-aws-migration-target \
+  -n capi-system \
+  --for=condition=Ready \
+  --timeout=30m
+
+# 取得新 cluster 的 kubeconfig
+clusterctl get kubeconfig prod-aws-migration-target \
+  -n capi-system > ~/.kube/prod-aws-migration-target.kubeconfig
+
+# 驗證 node label 和 taint 與舊 cluster 一致
+kubectl --kubeconfig ~/.kube/prod-aws-migration-target.kubeconfig \
+  get nodes --show-labels
+```
+
+### 步驟 3：Velero 備份與還原
+
+<Callout type="info" title="Velero 的適用範圍">
+Velero 備份的是 K8s 物件（Deployment、StatefulSet、ConfigMap、Secret、PVC 定義等），以及 PV 的資料快照（需要 CSI snapshot 支援）。它不備份 node 本身的狀態，也不備份容器的 runtime 狀態。對於純無狀態 workload，甚至不需要 Velero，直接用 Git 重新 apply manifests 就夠了。
+</Callout>
+
+在舊 MAAS cluster 安裝 Velero 並設定 S3 作為備份儲存：
+
+```bash
+# ────── 在舊 cluster（MAAS）安裝 Velero ──────
+velero install \
+  --provider aws \
+  --plugins velero/velero-plugin-for-aws:v1.8.0 \
+  --bucket velero-migration-backups \
+  --secret-file ./credentials-velero \
+  --backup-location-config region=us-east-1 \
+  --snapshot-location-config region=us-east-1 \
+  --use-node-agent \                         # ★ 啟用 file system backup（支援非 CSI PV）
+  --kubeconfig ~/.kube/prod-maas-01.kubeconfig
+
+# ────── 執行備份（排除不需要遷移的資源）──────
+velero backup create migration-$(date +%Y%m%d) \
+  --include-namespaces production,monitoring,logging \
+  --exclude-resources nodes,events,endpoints \
+  --snapshot-volumes=true \
+  --wait \
+  --kubeconfig ~/.kube/prod-maas-01.kubeconfig
+
+# 確認備份完成
+velero backup describe migration-$(date +%Y%m%d) \
+  --kubeconfig ~/.kube/prod-maas-01.kubeconfig
+
+# ────── 在新 cluster（AWS）安裝 Velero（指向同一個 S3 bucket）──────
+velero install \
+  --provider aws \
+  --plugins velero/velero-plugin-for-aws:v1.8.0 \
+  --bucket velero-migration-backups \          # ★ 同一個 bucket
+  --secret-file ./credentials-velero \
+  --backup-location-config region=us-east-1 \
+  --snapshot-location-config region=us-east-1 \
+  --use-node-agent \
+  --kubeconfig ~/.kube/prod-aws-migration-target.kubeconfig
+
+# ────── 還原到新 cluster ──────
+velero restore create \
+  --from-backup migration-$(date +%Y%m%d) \
+  --restore-volumes=true \
+  --wait \
+  --kubeconfig ~/.kube/prod-aws-migration-target.kubeconfig
+
+# 確認還原狀態
+velero restore describe --details \
+  --kubeconfig ~/.kube/prod-aws-migration-target.kubeconfig
+```
+
+### 步驟 4：StorageClass 映射（PVC 遷移的核心挑戰）
+
+這是整個遷移中最容易出問題的環節。舊 cluster（MAAS/Rook）的 StorageClass 名稱和 provisioner 在新 cluster（AWS）完全不同：
+
+```yaml
+# ────── 舊 cluster（MAAS + Rook/Ceph）的 StorageClass ──────
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: rook-ceph-block      # ← 舊名稱
+provisioner: rook-ceph.rbd.csi.ceph.com
+parameters:
+  clusterID: rook-ceph
+  pool: replicapool
+  imageFormat: "2"
+  imageFeatures: layering
+reclaimPolicy: Retain
+volumeBindingMode: Immediate
+```
+
+```yaml
+# ────── 新 cluster（AWS）的 StorageClass ──────
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: rook-ceph-block      # ★ 刻意使用相同名稱！避免修改所有 PVC 的 storageClassName
+  annotations:
+    # 標記這是遷移期間的相容層
+    platform.io/migration-compat: "true"
+provisioner: ebs.csi.aws.com
+parameters:
+  type: gp3
+  encrypted: "true"
+  kmsKeyId: "arn:aws:kms:us-east-1:123456789:key/xxxx"
+reclaimPolicy: Retain
+volumeBindingMode: WaitForFirstConsumer
+allowVolumeExpansion: true
+```
+
+<Callout type="tip" title="使用相同 StorageClass 名稱的技巧">
+在新 cluster 建立一個與舊 cluster 同名的 StorageClass，但讓它指向新的 provisioner（AWS EBS）。這樣 Velero 還原的 PVC 不需要修改任何 manifest，就能自動綁定到新的 CSI provisioner。完成遷移後，可以再把 StorageClass 名稱統一到新的命名規範。
+</Callout>
+
+如果 StorageClass 名稱無法相同，使用 Velero 的 `--storage-class-mappings` 參數：
+
+```bash
+velero restore create \
+  --from-backup migration-20240115 \
+  --restore-volumes=true \
+  --storage-class-mappings "rook-ceph-block:gp3-encrypted,rook-ceph-fs:efs-sc" \
+  --kubeconfig ~/.kube/prod-aws-migration-target.kubeconfig
+```
+
+### 步驟 5：預先驗證 workload（切換流量前）
+
+在切換流量前，必須驗證 workload 在新 cluster 上能正常運作：
+
+```bash
+# ────── 驗證 workload 健康狀態 ──────
+KUBECONFIG=~/.kube/prod-aws-migration-target.kubeconfig
+
+# 確認所有 pod 都 Running
+kubectl get pods --all-namespaces | grep -v Running | grep -v Completed
+
+# 確認 PVC 都已綁定
+kubectl get pvc --all-namespaces | grep -v Bound
+
+# ★ 重要：確認 node affinity / node selector 在新 cluster 上有對應的 label
+kubectl get pods --all-namespaces \
+  -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.spec.nodeSelector}{"\n"}{end}' \
+  | grep -v "^$"
+
+# 用 port-forward 在不切換 DNS 的情況下測試應用程式
+kubectl port-forward svc/my-app 8080:80 -n production
+curl -s http://localhost:8080/healthz
+```
+
+### 步驟 6：流量切換
+
+```bash
+# ────── 方法 A：修改 DNS 記錄（推薦）──────
+# 先降低舊 DNS 記錄的 TTL（提前 24 小時做，確保 TTL cache 過期）
+# 舊 record: api.prod.company.com → MAAS Load Balancer IP（TTL 300）
+# 降低 TTL: api.prod.company.com → MAAS Load Balancer IP（TTL 30）
+
+# 取得新 cluster 的 Load Balancer 地址
+kubectl --kubeconfig ~/.kube/prod-aws-migration-target.kubeconfig \
+  get svc -n production my-app-lb \
+  -o jsonpath='{.status.loadBalancer.ingress[0].hostname}'
+
+# 切換 DNS 指向（在 TTL 足夠低之後）
+# api.prod.company.com → AWS ALB hostname（TTL 30）
+
+# ────── 方法 B：同時 cordon + drain 舊 cluster（確保舊 cluster 停止寫入）──────
+# 在 DNS 切換完成、確認流量已到新 cluster 後執行
+for node in $(kubectl --kubeconfig ~/.kube/prod-maas-01.kubeconfig \
+                get nodes -o name); do
+  kubectl --kubeconfig ~/.kube/prod-maas-01.kubeconfig \
+    cordon $node
+done
+
+# 等待 DNS TTL 過期（TTL 時間），確認沒有新連線進來後再 drain
+# 監控舊 cluster 的 ingress access log，確認流量清零
+kubectl --kubeconfig ~/.kube/prod-maas-01.kubeconfig \
+  logs -n ingress-nginx -l app.kubernetes.io/name=ingress-nginx \
+  --since=1m | grep -c "GET\|POST"   # 確認請求數趨近 0
+
+# 開始 drain（此時才是真正的切換時刻）
+for node in $(kubectl --kubeconfig ~/.kube/prod-maas-01.kubeconfig \
+                get nodes -o name); do
+  kubectl --kubeconfig ~/.kube/prod-maas-01.kubeconfig \
+    drain $node \
+    --ignore-daemonsets \
+    --delete-emptydir-data \
+    --grace-period=30
+done
+```
+
+### 步驟 7：確認完成後下線舊 cluster
+
+```bash
+# ────── 觀察 48 小時確認穩定後，下線舊 cluster ──────
+# 在 management cluster 上刪除舊 MAAS cluster
+kubectl delete cluster prod-maas-01 -n capi-system
+
+# 確認 CAPI 已開始清理舊 cluster 的 Machine 物件
+kubectl get machines -n capi-system \
+  -l cluster.x-k8s.io/cluster-name=prod-maas-01 -w
+```
+
+## MachineDeployment spec.template 的一致性要求
+
+[MachineDeployment](/cluster-api/features/api-machineset-machinedeployment) 的 `spec.template` 是確保兩個 cluster worker node 行為一致的關鍵。以下是需要在新舊兩個 cluster 完全對齊的欄位：
+
+```yaml
+spec:
+  template:
+    spec:
+      # ★ 1. K8s 版本必須相同（或新 cluster 可以高一個 patch 版本）
+      version: v1.29.5
+
+      # ★ 2. Bootstrap 設定必須相同（kubelet 參數、container runtime）
+      bootstrap:
+        configRef:
+          name: prod-worker-bootstrap   # 指向相同的 KubeadmConfigTemplate
+
+      # ★ 3. node label 和 taint 必須與舊 cluster 一致
+      metadata:
+        labels:
+          node-role.kubernetes.io/worker: ""
+          platform.io/node-class: general
+          # ★ 如果 workload 有 topologySpreadConstraints，這些 zone label 也要有
+          topology.kubernetes.io/zone: us-east-1a
+
+      # ★ 4. Infrastructure template（這個可以不同，因為 Provider 不同）
+      infrastructureRef:
+        # MAAS: Metal3MachineTemplate
+        # AWS: AWSMachineTemplate
+        # 規格盡量對齊（CPU cores、RAM）
+```
+
+## 關鍵參數說明
+
+### 遷移前後對比表
+
+| 層面 | 舊 cluster（MAAS） | 新 cluster（AWS） | 對齊方式 |
+|------|--------------------|--------------------|----------|
+| K8s 版本 | v1.29.5 | v1.29.5 | ClusterClass `version` 欄位相同 |
+| Control Plane 數量 | 3 | 3 | ClusterClass `controlPlane.replicas` |
+| Worker 數量 | 10 | 10 | MachineDeployment `replicas` |
+| Kubelet `max-pods` | 250 | 250 | KubeadmConfigTemplate `kubeletExtraArgs` |
+| Node label | `platform.io/node-class=general` | `platform.io/node-class=general` | MachineDeployment `template.metadata.labels` |
+| StorageClass 名稱 | `rook-ceph-block` | `rook-ceph-block`（別名） | 手動建立同名 StorageClass |
+| CNI | Calico 3.26 | Calico 3.26 | 在 workload cluster 手動安裝相同版本 |
+
+### PVC 遷移的三種模式
+
+根據資料量和 RTO（Recovery Time Objective）選擇不同策略：
+
+| 模式 | 工具 | 適合情境 | 停機時間 |
+|------|------|----------|----------|
+| Velero VolumeSnapshot | Velero + CSI snapshot | 資料量 < 500GB，支援 CSI snapshot | 數分鐘（快照時間） |
+| Velero File System Backup | Velero node-agent | 非 CSI PV（如 Rook block device）| 與資料量成正比 |
+| 應用層同步 | 資料庫複製（MySQL binlog、Redis SYNC） | 大資料量，需要近零停機 | 接近 0（雙寫期） |
+| 放棄 PV，重建資料 | 從備份/種子資料重灌 | 無狀態或資料可重算 | 重灌時間 |
+
+### 回滾決策樹
+
+```
+流量切換後發現問題
+        ↓
+問題發生在切換後 < 30 分鐘？
+        ├── 是 → DNS 還沒完全生效
+        │        ├── 立即把 DNS 切回舊 cluster
+        │        └── 取消 cordon（舊 cluster node 恢復可排程）
+        │            kubectl uncordon --all --kubeconfig prod-maas-01.kubeconfig
+        │
+        └── 否（30 分鐘以上）→ 評估問題嚴重程度
+                  ├── 應用層 bug（不影響資料）→ 在新 cluster 修復
+                  ├── 資料寫入異常 → 立即停寫，比對兩端資料後再決定
+                  └── 基礎設施問題（node 故障、網路）→ CAPI 自動修復
+                      或切回舊 cluster（若舊 cluster 還未 decommission）
+```
+
+## 常見問題與解法
+
+### Q1：Velero 還原後 Pod 一直 Pending（PVC 無法綁定）
+
+```bash
+# 查看 PVC 事件
+kubectl describe pvc <pvc-name> -n production | grep -A 10 Events
+
+# 常見原因：新 cluster 沒有對應的 StorageClass
+kubectl get storageclass
+
+# 如果 StorageClass 名稱不同，在還原時指定映射
+velero restore create \
+  --from-backup migration-20240115 \
+  --storage-class-mappings "rook-ceph-block:gp3-encrypted"
+```
+
+### Q2：workload 在新 cluster 的 node 上排程位置與預期不符
+
+```bash
+# 檢查 node affinity 規則
+kubectl get pods -n production -o json | \
+  jq '.items[].spec.affinity'
+
+# 比對新舊 cluster 的 node label
+diff \
+  <(kubectl --kubeconfig ~/.kube/prod-maas-01.kubeconfig \
+      get nodes --show-labels | sort) \
+  <(kubectl --kubeconfig ~/.kube/prod-aws-migration-target.kubeconfig \
+      get nodes --show-labels | sort)
+
+# 如果發現 label 不一致，用 MachineDeployment template.metadata.labels 補齊
+kubectl patch machinedeployment general \
+  -n capi-system \
+  --type merge \
+  -p '{"spec":{"template":{"metadata":{"labels":{"topology.kubernetes.io/zone":"us-east-1a"}}}}}'
+```
+
+### Q3：新舊 cluster 的 CNI 設定不同，導致 NetworkPolicy 行為差異
+
+**這是最容易被忽略的問題**。不同 CNI 版本對同一份 NetworkPolicy 的行為可能不同。
+
+```bash
+# 確認 CNI 版本
+kubectl get pods -n kube-system -l k8s-app=calico-node \
+  -o jsonpath='{.items[0].spec.containers[0].image}'
+
+# 確認 NetworkPolicy 在新 cluster 中被正確解讀
+kubectl get networkpolicy --all-namespaces
+# 用 kubectl exec 跑連通性測試
+kubectl exec -n production <pod-name> -- \
+  curl -v http://target-service.production.svc.cluster.local
+```
+
+### Q4：CAPI 刪除舊 MAAS cluster 時，bare-metal 機器沒有被正確釋放
+
+```bash
+# 檢查 Machine 物件的刪除進度
+kubectl get machines -n capi-system \
+  -l cluster.x-k8s.io/cluster-name=prod-maas-01
+
+# 如果 Machine 卡在 Deleting 狀態，通常是 MaaS Provider 無法呼叫 MAAS API
+kubectl describe machine <machine-name> -n capi-system | grep -A 20 Events
+
+# 緊急情況：強制移除 finalizer（謹慎使用！會導致 MAAS 機器變成孤兒）
+kubectl patch machine <machine-name> -n capi-system \
+  -p '{"metadata":{"finalizers":[]}}' \
+  --type merge
+# 執行後必須手動到 MAAS UI 釋放機器
+```
+
+## 延伸閱讀
+
+- [ClusterClass 與 Topology 詳解](/cluster-api/features/clusterclass-topology) — 深入理解 ClusterClass 如何跨 Provider 統一拓撲定義
+- [MachineSet 與 MachineDeployment](/cluster-api/features/api-machineset-machinedeployment) — `spec.template` 的所有欄位與 rolling update 策略
+- [Cluster 與 Machine API](/cluster-api/features/api-cluster-machine) — Cluster 物件的 infrastructure 抽象層設計，理解為什麼 MAAS 和 AWS 可以用相同的 CAPI API 描述

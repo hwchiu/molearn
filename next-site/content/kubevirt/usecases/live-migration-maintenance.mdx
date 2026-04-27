@@ -1,0 +1,403 @@
+---
+layout: doc
+title: KubeVirt — Live Migration 實現零停機硬體維護
+description: 當需要對 Kubernetes node 進行硬體維護（更換記憶體、升級 kernel）時，如何透過 KubeVirt Live Migration 將 VM 遷移到其他 node，實現完全零停機的維護視窗
+---
+
+# 使用情境：Live Migration 實現零停機硬體維護
+
+> **目標效果**：維運工程師需要替換 worker node 上的記憶體模組或升級 kernel 版本，透過 KubeVirt Live Migration，VM 在用戶無感知的情況下遷移到其他 node（中斷時間 < 1 秒），整個維護視窗期間業務服務不停機。
+
+## 你會遇到什麼問題
+
+在 Kubernetes 上，對 node 進行硬體維護的標準流程是 `kubectl drain`，但這個流程對 VM 有根本性問題：
+
+- **一般 container 可以重新排程**：Pod 被驅逐後，Deployment controller 會在其他 node 上建立新 Pod，應用狀態由外部持久化（資料庫、快取）維護，客戶體驗只有短暫中斷
+- **VM 不能直接重新排程**：VM 的記憶體（RAM）中有大量狀態 —— 連線中的 TCP session、應用程序的 heap、kernel 頁表。如果像 container 一樣直接刪除再重建，等同於「關機再開機」，會造成：
+  - 所有 TCP 連線重置（用戶的 SSH session 中斷、資料庫連線池失效）
+  - 應用需要重新初始化（可能需要幾分鐘）
+  - 對於 Windows VM，關機 + 重開機可能需要 10+ 分鐘
+- **Cold Migration 不夠**：KubeVirt 的 cold migration 會關機 VM 再重啟，本質上就是重新排程，不符合零停機需求
+
+KubeVirt Live Migration 解決這個問題：在 VM 持續運行的情況下，透過增量記憶體複製，將 VM 的完整狀態搬移到目標 node，最終停機時間通常不超過 100-500ms。
+
+## 哪些元件協作解決這個問題
+
+| 元件 | 職責 |
+|------|------|
+| [VirtualMachineInstance (VMI)](/kubevirt/features/virtualmachineinstance) | 代表正在運行的 VM；`spec.evictionStrategy: LiveMigrate` 告訴 KubeVirt 在被驅逐時執行 live migration |
+| [virt-operator](/kubevirt/features/virt-operator) | 管理 KubeVirt 組件的生命週期，確保 virt-controller 和 virt-handler 正常運行 |
+| virt-controller | 偵測到 VMI 的 eviction 請求後，建立 `VirtualMachineInstanceMigration` 物件，驅動整個遷移流程 |
+| virt-handler (source node) | 準備 migration source；協調記憶體 dirty page tracking |
+| virt-handler (target node) | 在目標 node 上啟動目標 VM 進程，接收記憶體頁 |
+| Migration Network | 專用於記憶體傳輸的網路介面（可選但強烈建議），避免 migration 流量影響業務網路 |
+| Shared Storage (RWX PVC) | VM 磁碟必須同時可被兩個 node 存取（RWX），或使用 CDI DataVolume 搭配 block migration |
+
+## 協作流程
+
+```
+維運工程師執行 kubectl drain worker-01
+        │
+        ▼
+Kubernetes Eviction API 發送 eviction request 給 VMI Pod
+        │
+        ▼
+virt-controller 偵測到 VMI eviction（evictionStrategy = LiveMigrate）
+        │  不執行刪除 Pod
+        ▼
+virt-controller 建立 VirtualMachineInstanceMigration CRD
+        │
+        ├─────────────────────────────────────────┐
+        ▼                                         ▼
+virt-handler（source: worker-01）        virt-handler（target: worker-02）
+  ├── 通知 QEMU 開始 live migration          ├── 啟動 target QEMU 進程
+  ├── 追蹤 dirty memory pages                ├── 開放 migration port
+  └── 持續傳送 dirty pages ────────────────►├── 接收並重建記憶體狀態
+                                            └── 等待 source 的 cutover 信號
+        │
+        ▼ （dirty page 數量收斂到閾值以下）
+最終 cutover（< 500ms）
+  ├── source QEMU suspend（暫停執行）
+  ├── 傳送剩餘 dirty pages
+  ├── source 發送 cutover 信號
+  └── target QEMU resume（繼續執行）
+        │
+        ▼
+VM 在 worker-02 繼續運行（TCP connections 保持）
+worker-01 drain 完成，進入維護模式
+```
+
+## 前置條件
+
+<Callout type="warning" title="Live Migration 硬體需求">
+Live Migration 要求 VM 的磁碟使用 `ReadWriteMany (RWX)` 存取模式的 PVC，讓 source 和 target node 可以同時存取相同磁碟。
+建議使用 Rook CephFS 或 NFS 提供 RWX storage。
+若使用 block volume（RBD），需要 KubeVirt v0.57+ 支援的 block device live migration。
+</Callout>
+
+## 最小可行配置
+
+### 第一步：確認 KubeVirt 已啟用 Live Migration
+
+```bash
+# 確認 KubeVirt CR 中啟用了 live migration 功能
+kubectl get kubevirt -n kubevirt -o yaml | grep -A5 liveMigration
+
+# 確認 virt-controller 和 virt-handler 都在運行
+kubectl -n kubevirt get pod -l kubevirt.io=virt-controller
+kubectl -n kubevirt get pod -l kubevirt.io=virt-handler
+```
+
+### 第二步：建立支援 Live Migration 的 VM
+
+```yaml
+# vm-with-live-migration.yaml
+apiVersion: kubevirt.io/v1
+kind: VirtualMachine
+metadata:
+  name: prod-webserver
+  namespace: production
+spec:
+  running: true
+  template:
+    metadata:
+      labels:
+        kubevirt.io/vm: prod-webserver
+    spec:
+      # ★ 關鍵：設定 evictionStrategy 為 LiveMigrate
+      # 當 node 被 drain 時，KubeVirt 執行 live migration 而非刪除 VM
+      evictionStrategy: LiveMigrate
+      
+      domain:
+        cpu:
+          cores: 4
+          # ★ 啟用 CPU hotplug 相容模式（live migration 需要）
+          model: host-model    # 使用 host CPU model，遷移後目標 node 需同型 CPU
+        memory:
+          guest: 8Gi
+        devices:
+          disks:
+            - name: rootdisk
+              disk:
+                bus: virtio
+            - name: cloudinit
+              disk:
+                bus: virtio
+          interfaces:
+            - name: default
+              masquerade: {}   # NAT 模式，live migration 後網路自動切換
+      
+      networks:
+        - name: default
+          pod: {}
+      
+      volumes:
+        # ★ 使用 RWX PVC（CephFS），讓 source 和 target node 都能存取
+        - name: rootdisk
+          persistentVolumeClaim:
+            claimName: prod-webserver-disk
+        - name: cloudinit
+          cloudInitNoCloud:
+            userData: |
+              #cloud-config
+              hostname: prod-webserver
+```
+
+### 第三步：建立 RWX PVC（使用 Rook CephFS）
+
+```yaml
+# 首先建立 CephFS StorageClass（若尚未存在）
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: rook-cephfs
+provisioner: rook-ceph.cephfs.csi.ceph.com
+parameters:
+  clusterID: rook-ceph
+  fsName: myfs
+  pool: myfs-replicated
+  csi.storage.k8s.io/provisioner-secret-name: rook-csi-cephfs-provisioner
+  csi.storage.k8s.io/provisioner-secret-namespace: rook-ceph
+  csi.storage.k8s.io/node-stage-secret-name: rook-csi-cephfs-node
+  csi.storage.k8s.io/node-stage-secret-namespace: rook-ceph
+reclaimPolicy: Delete
+allowVolumeExpansion: true
+---
+# VM 磁碟 PVC：使用 RWX 存取模式
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: prod-webserver-disk
+  namespace: production
+spec:
+  # ★ ReadWriteMany 是 live migration 的必要條件
+  accessModes:
+    - ReadWriteMany
+  storageClassName: rook-cephfs
+  resources:
+    requests:
+      storage: 50Gi
+  volumeMode: Block   # Block mode for VM disk performance
+```
+
+### 第四步：設定 Live Migration 全域策略
+
+```yaml
+# kubevirt-migration-policy.yaml
+# KubevirtMigrationPolicy 讓你針對不同 workload 設定不同的遷移策略
+apiVersion: migrations.kubevirt.io/v1alpha1
+kind: MigrationPolicy
+metadata:
+  name: production-vms
+spec:
+  selectors:
+    namespaceSelector:
+      matchLabels:
+        environment: production    # 只套用到 production namespace 的 VM
+    virtualMachineInstanceSelector:
+      matchLabels:
+        migration-policy: standard
+  
+  # ★ 頻寬限制：防止 migration 流量影響業務網路
+  # 單位：MiB/s，設 0 = 無限制
+  bandwidthPerMigration: "1Gi"    # 1 Gbit/s 上限
+  
+  # ★ 並行遷移數量限制：防止同時遷移過多 VM 造成存儲過載
+  parallelMigrationsPerCluster: 2    # 整個 cluster 最多同時 2 個 migration
+  parallelOutboundMigrationsPerNode: 1  # 每個 node 最多同時遷出 1 個 VM
+  
+  # ★ Auto-convergence：若 dirty page 速率過快導致遷移卡住，自動降低 VM CPU 速度
+  allowAutoConverge: true
+  
+  # ★ Post-copy migration：先完成 cutover，再從 source 拉取缺少的記憶體頁
+  # 風險：post-copy 期間若網路中斷，VM 會崩潰；僅在 RAm 極大（>128GB）時考慮
+  allowPostCopy: false
+```
+
+### 第五步：執行 Node 維護（標準流程）
+
+```bash
+# ──────────────────────────────────────────────
+# 1. 標記 node 為不可排程（預防新 VM 排程到這個 node）
+# ──────────────────────────────────────────────
+kubectl cordon worker-01
+
+# ──────────────────────────────────────────────
+# 2. 開始監控 migration 進度（在另一個終端）
+# ──────────────────────────────────────────────
+watch kubectl -n production get virtualmachineinstancemigration
+
+# ──────────────────────────────────────────────
+# 3. Drain node（KubeVirt 攔截 eviction，觸發 live migration）
+# ──────────────────────────────────────────────
+kubectl drain worker-01 \
+  --delete-emptydir-data \
+  --ignore-daemonsets \
+  --pod-selector="!kubevirt.io/vm"  # ★ 排除 virt-handler（DaemonSet），它需要留在 node 上
+
+# ──────────────────────────────────────────────
+# 4. 監控 migration 狀態
+# ──────────────────────────────────────────────
+kubectl -n production get vmim -w
+# NAME                          PHASE       VMI
+# prod-webserver-migration-xxx  Scheduled   prod-webserver
+# prod-webserver-migration-xxx  Running     prod-webserver
+# prod-webserver-migration-xxx  Succeeded   prod-webserver
+
+# ──────────────────────────────────────────────
+# 5. 確認 VM 已在新 node 上運行
+# ──────────────────────────────────────────────
+kubectl -n production get vmi prod-webserver -o wide
+# NAME             AGE   PHASE     IP            NODENAME    READY
+# prod-webserver   2d    Running   10.244.1.23   worker-02   True
+#                                              ↑ 已切換到 worker-02
+
+# ──────────────────────────────────────────────
+# 6. 進行硬體維護...（換記憶體、升級 kernel 等）
+# ──────────────────────────────────────────────
+
+# ──────────────────────────────────────────────
+# 7. 維護完成，解除 cordon
+# ──────────────────────────────────────────────
+kubectl uncordon worker-01
+```
+
+### 手動觸發 Migration（測試或主動遷移）
+
+```yaml
+# manual-migration.yaml
+# 不需要 drain，可以主動把 VM 搬到特定 node
+apiVersion: kubevirt.io/v1
+kind: VirtualMachineInstanceMigration
+metadata:
+  name: migrate-webserver-to-worker03
+  namespace: production
+spec:
+  vmiName: prod-webserver
+```
+
+```bash
+kubectl apply -f manual-migration.yaml
+
+# 查看詳細進度
+kubectl -n production describe vmim migrate-webserver-to-worker03
+
+# 輸出包含：
+#   Phase: Running
+#   Migration State:
+#     Target Node: worker-03
+#     Source Node: worker-02
+#     Migration UID: xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
+#     Start Time: 2024-01-15T10:30:00Z
+#     Migration Network Bandwidth: 1.2 Gb/s
+#     Memory Transferred: 4.3 GiB / 8 GiB
+```
+
+## VirtualMachineInstanceMigration 狀態追蹤
+
+```
+Migration Phase 狀態機：
+
+Pending
+  │  virt-controller 選擇目標 node，準備 target QEMU 進程
+  ▼
+Scheduling
+  │  target node 上的 virt-handler 啟動目標 VM
+  ▼
+Scheduled
+  │  開始傳輸記憶體（初始複製）
+  ▼
+Running ─── Pre-copy 循環 ──► dirty pages 越來越少
+  │  dirty page 數量 < threshold，執行 cutover（< 500ms 停頓）
+  ▼
+Succeeded ── VM 在目標 node 繼續執行
+
+在任何阶段若發生錯誤：
+  ▼
+Failed ── virt-controller 將 VM 留在 source node，migration 物件顯示錯誤原因
+```
+
+## 關鍵參數說明
+
+| 參數 | 位置 | 說明 | 建議值 |
+|------|------|------|--------|
+| `evictionStrategy` | VMI spec | 決定 node drain 時的行為 | `LiveMigrate`（生產 VM 必設） |
+| `bandwidthPerMigration` | MigrationPolicy | 單個 migration 的頻寬上限 | `1Gi`（1 Gbit/s），網路充裕可調高 |
+| `parallelMigrationsPerCluster` | MigrationPolicy | 全 cluster 同時 migration 數量 | `2`（防止存儲過載） |
+| `allowAutoConverge` | MigrationPolicy | dirty page 過多時自動降速 CPU | `true`（防止 migration stuck） |
+| `allowPostCopy` | MigrationPolicy | 是否允許 post-copy 模式 | `false`（除非 RAM > 128GB） |
+| `cpu.model` | VMI domain | CPU 型號兼容性設定 | `host-model`（確保跨 node 相容） |
+
+## 常見問題與解法
+
+### 問題 1：Migration 卡在 `Running` 狀態超過 10 分鐘
+
+原因通常是 VM 內有高速率的 dirty page 寫入（如資料庫密集寫入），導致 pre-copy 無法收斂。
+
+```bash
+# 查看 migration 進度詳情
+kubectl -n production describe vmim <migration-name> | grep -A20 "Migration State"
+
+# 確認 allowAutoConverge 已啟用（若未啟用，migration 可能永遠無法收斂）
+kubectl get kubevirt kubevirt -n kubevirt -o yaml | grep autoConverge
+
+# 若需要強制取消 migration（VM 保留在 source node）
+kubectl -n production delete vmim <migration-name>
+```
+
+### 問題 2：`VolumeMode: Block` 的 RBD PVC 無法 live migrate
+
+```bash
+# 確認 KubeVirt 版本支援 block device live migration
+kubectl -n kubevirt get pod -l kubevirt.io=virt-controller -o yaml | grep image
+# 需要 v0.57+
+
+# 確認 feature gate 已啟用
+kubectl get kubevirt kubevirt -n kubevirt -o yaml | grep -A5 featureGates
+# 需要包含：WorkloadEncryptionS3、HotplugVolumes、Snapshot
+
+# Block device migration 的限制：RBD image 必須支援 deep copy
+# 檢查 image features
+kubectl -n rook-ceph exec deploy/rook-ceph-tools -- \
+  rbd info <pool>/<image> | grep features
+```
+
+### 問題 3：Migration 後 VM 網路中斷
+
+```bash
+# Live migration 後，VM 的 IP 應該保持不變（由 Kubernetes Service 處理）
+# 確認 VM 的 Service 存在且指向正確的 Pod
+kubectl -n production get svc -l kubevirt.io/vm=prod-webserver
+
+# 若使用 masquerade 網路模式，migration 後網路應自動恢復
+# 若使用 bridge 模式，需要額外配置；建議改用 masquerade
+kubectl -n production get vmi prod-webserver -o yaml | grep -A5 interfaces
+```
+
+### 問題 4：如何限制特定 node 的 migration 目標
+
+```yaml
+# 使用 VMI affinity 限制遷移只能到特定 node group
+spec:
+  template:
+    spec:
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: node-role
+                    operator: In
+                    values: ["compute"]   # 只能排程/遷移到 compute 角色的 node
+```
+
+<Callout type="info" title="Migration 網路最佳實踐">
+在生產環境中，建議配置專用的 migration network（透過 Multus CNI 額外的 NIC），將記憶體傳輸流量與業務流量完全分離。
+這樣即使在 migration 期間（傳輸數 GB 記憶體），業務網路的延遲也不會受影響。
+配置方法：設定 `KubeVirt.spec.configuration.migrations.network` 指向 NAD（NetworkAttachmentDefinition）。
+</Callout>
+
+## 深入閱讀
+
+- [VirtualMachineInstance 詳解](/kubevirt/features/virtualmachineinstance) — VMI 生命週期、evictionStrategy 所有選項
+- [virt-operator](/kubevirt/features/virt-operator) — KubeVirt 組件架構、virt-controller 與 virt-handler 的協作

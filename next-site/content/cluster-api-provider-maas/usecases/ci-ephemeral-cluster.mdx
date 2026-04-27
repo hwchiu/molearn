@@ -1,0 +1,543 @@
+---
+layout: doc
+title: MAAS Provider — CI/CD 流程中的短暫 bare-metal Cluster
+description: 利用 MAAS warm pool 預分配策略，讓每一個 Pull Request 自動取得專屬 bare-metal cluster 執行 end-to-end 測試，完成後立即釋放機器歸還資源池，整個流程從觸發到可用不超過 3 分鐘
+---
+
+# 使用情境：CI/CD 流程中的短暫 bare-metal Cluster
+
+> **目標效果**：每次 PR 合入前，GitHub Actions 自動建立一個由 bare-metal 組成的短暫 cluster，部署應用、執行完整 e2e 測試套件，測試結束後自動銷毀 cluster 並歸還機器，整個流程不需人工介入，cluster 啟動時間壓縮到 3 分鐘以內。
+
+## 你會遇到什麼問題
+
+大多數 CI/CD 流程的 e2e 測試跑在 VM 或 Kind cluster 上，隨著服務規模擴大，這個方案會暴露出幾個棘手的問題：
+
+**效能不一致，測試結果不可信**
+
+多個 CI job 共用同一台實體機上的 VM，CPU 和記憶體爭搶導致測試時間飄移。同一個測試今天跑 2 分鐘、明天跑 8 分鐘，無法判斷是程式碼變慢了還是 VM 鄰居在搶資源。測試結果的 flakiness 讓工程師對 CI 失去信心，開始習慣性地 re-run。
+
+**VM 無法重現 bare-metal 特有問題**
+
+如果你的服務依賴特定的網路卡功能（SR-IOV、DPDK）、NVMe 儲存效能、NUMA 拓撲或特定的核心參數，VM 根本無法重現。測試在 CI 通過，上到 bare-metal 生產環境才爆炸。
+
+**Cluster 啟動太慢，CI 等不起**
+
+傳統做法每次都重新 PXE boot 安裝 OS，光是這一步就要 10–20 分鐘，讓整個 CI pipeline 變成 25–35 分鐘，開發者幾乎無法忍受。
+
+**孤兒資源洩漏**
+
+CI job 被 cancel 或 timeout 時，已分配的 bare-metal 機器沒有被清理，永遠卡在 Deployed 狀態，直到有人手動釋放。資源池越來越小，CI 最後因為機器不夠而排隊等待。
+
+## 哪些元件協作解決這個問題
+
+| 元件 | 職責 |
+|------|------|
+| [Machine 生命週期](/cluster-api-provider-maas/features/machine-lifecycle) | 管理 bare-metal 從 Allocate → Deploy → Release 的完整狀態機；warm pool 策略讓機器保持 Ready 跳過 PXE boot |
+| [API Types](/cluster-api-provider-maas/features/api-types) | `MaasMachine.spec.resourcePool` 和 `spec.tags` 控制 CI job 只能拿 `ci-pool` 的機器，不會誤搶 production 機器 |
+| [Resource Pools & Tags](/cluster-api-provider-maas/features/resource-pools-tags) | MAAS 端的 tag 與 resource pool 隔離機制，與 CAPM 的 selector 語意對應 |
+| [Controllers](/cluster-api-provider-maas/features/controllers) | MaasMachine Controller Reconcile loop 偵測 MaasMachine 被刪除時，自動呼叫 MAAS API release |
+| GitHub Actions | CI 流程主體，呼叫 `clusterctl` 建立/刪除 cluster，並在失敗時觸發 cleanup job |
+
+## 核心加速策略：Warm Pool
+
+傳統 CAPI + MAAS 流程每次建立 cluster 都需要完整 PXE boot 流程：
+
+```
+機器狀態：New → Commissioning → Ready → Allocated → Deploying → Deployed
+                ↑                                      ↑
+           OS 探測（約 3 分鐘）              OS 安裝（約 10-15 分鐘）
+```
+
+Warm pool 策略是讓 CI 專用機器**預先停在 `Ready` 狀態**（已完成 commissioning，OS 尚未安裝）。CAPM 拿到 Ready 狀態的機器後，直接進入 `Deploying`，跳過前面所有等待：
+
+```
+Warm Pool 機器流程：
+
+  [Ready] ──→ CAPM allocate ──→ [Allocated] ──→ MAAS deploy
+                                                      ↓
+  CI 測試完成                                   OS 安裝（~3 min）
+       ↓                                              ↓
+  kubectl delete cluster                        [Deployed] ──→ kubeadm join
+       ↓                                              ↓
+  CAPM release ──→ [Ready]             cluster 可用（共約 3-4 分鐘）
+  機器回到資源池
+
+完整 PXE boot 流程（無 warm pool）：
+  [New] → Commissioning(3m) → [Ready] → Allocated → Deploying(15m) → Deployed
+  總計：約 18-22 分鐘
+
+Warm Pool 流程：
+  [Ready] → Allocated → Deploying(3m) → Deployed
+  總計：約 3-4 分鐘
+```
+
+<Callout type="tip" title="Warm Pool 大小建議">
+Warm pool 機器數量 = 並發 CI job 峰值 × 每 job 機器數。例如最多 5 個 PR 同時在跑 CI，每個 cluster 需要 3 台機器（1 control plane + 2 worker），就需要至少 15 台 warm pool 機器。建議多準備 20% 緩衝。
+</Callout>
+
+## 機器隔離：防止 CI 搶走 Production 機器
+
+MAAS 機器透過兩個維度隔離：**resource pool** 和 **tag**。
+
+**MAAS 端設定（管理員執行一次）：**
+
+```bash
+# 建立 CI 專用 resource pool
+maas admin resource-pools create name=ci-pool description="CI ephemeral clusters"
+
+# 建立 Production resource pool
+maas admin resource-pools create name=production-pool description="Production workloads"
+
+# 把機器加入對應 pool（用 machine system_id）
+maas admin machine update <system_id> pool=ci-pool
+
+# 在機器上加 tag 作為第二層過濾
+maas admin tag create name=ci-ephemeral comment="Available for CI allocation"
+maas admin tag update ci-ephemeral machines=<system_id1>,<system_id2>,...
+```
+
+**CAPM 端的對應設定（MaasMachineTemplate）：**
+
+```yaml
+# ci-worker-template.yaml
+apiVersion: infrastructure.cluster.x-k8s.io/v1alpha3
+kind: MaasMachineTemplate
+metadata:
+  name: ci-worker-template
+  namespace: capi-ci
+spec:
+  template:
+    spec:
+      # ★ 只從 ci-pool 分配，不會碰 production-pool
+      resourcePool: "ci-pool"
+      # ★ 雙重保險：只選有 ci-ephemeral tag 的機器
+      # 即使 resource pool 設定錯誤，沒有 tag 的機器也不會被選中
+      # 注意：tags 是 AND 邏輯，所有 tag 都必須存在
+      image: "ubuntu-22.04-lts-amd64"    # CI 用輕量 OS image
+      minCPU: 4
+      minMemory: 8192     # 8 GB，夠跑 e2e 測試
+```
+
+<Callout type="warning" title="Tag 隔離的重要性">
+`resourcePool` 只是軟性隔離。如果 MAAS 管理員誤操作把機器移到錯誤的 pool，tag 可以作為第二道防線。建議生產環境的機器加上 `production-only` tag，並在 MaasMachineTemplate 的 tag selector 中排除這個 tag。
+</Callout>
+
+## 最小可行配置
+
+### 第一步：建立 CI 專用 Namespace 與 RBAC
+
+```yaml
+# ci-namespace.yaml
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: capi-ci
+  labels:
+    purpose: ci-ephemeral
+---
+# 限制 CI service account 只能在 capi-ci namespace 操作
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: ci-cluster-manager
+  namespace: capi-ci
+rules:
+  - apiGroups: ["cluster.x-k8s.io", "infrastructure.cluster.x-k8s.io",
+                "bootstrap.cluster.x-k8s.io", "controlplane.cluster.x-k8s.io"]
+    resources: ["*"]
+    verbs: ["*"]
+  - apiGroups: [""]
+    resources: ["secrets", "configmaps"]
+    verbs: ["*"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: ci-cluster-manager
+  namespace: capi-ci
+subjects:
+  - kind: ServiceAccount
+    name: github-actions-sa
+    namespace: capi-ci
+roleRef:
+  kind: Role
+  name: ci-cluster-manager
+  apiGroup: rbac.authorization.k8s.io
+```
+
+### 第二步：CI Cluster Template
+
+建立一個可重用的 ClusterClass 或使用固定 template，讓所有 CI cluster 結構一致：
+
+```yaml
+# ci-cluster-template.yaml
+---
+apiVersion: cluster.x-k8s.io/v1beta1
+kind: Cluster
+metadata:
+  name: "${CLUSTER_NAME}"
+  namespace: capi-ci
+  labels:
+    # ★ 記錄是哪個 PR 建立的，方便追蹤孤兒資源
+    ci.company.com/pr-number: "${PR_NUMBER}"
+    ci.company.com/workflow-run-id: "${GITHUB_RUN_ID}"
+    ci.company.com/repo: "${GITHUB_REPOSITORY}"
+spec:
+  clusterNetwork:
+    pods:
+      cidrBlocks: ["10.244.0.0/16"]
+    services:
+      cidrBlocks: ["10.96.0.0/12"]
+  infrastructureRef:
+    apiVersion: infrastructure.cluster.x-k8s.io/v1alpha3
+    kind: MaasCluster
+    name: "${CLUSTER_NAME}-maas"
+  controlPlaneRef:
+    apiVersion: controlplane.cluster.x-k8s.io/v1beta1
+    kind: KubeadmControlPlane
+    name: "${CLUSTER_NAME}-kcp"
+---
+apiVersion: infrastructure.cluster.x-k8s.io/v1alpha3
+kind: MaasCluster
+metadata:
+  name: "${CLUSTER_NAME}-maas"
+  namespace: capi-ci
+spec:
+  dnsDomain: maas.internal
+  controlPlaneEndpoint:
+    host: ""    # MAAS 動態分配
+    port: 6443
+---
+apiVersion: controlplane.cluster.x-k8s.io/v1beta1
+kind: KubeadmControlPlane
+metadata:
+  name: "${CLUSTER_NAME}-kcp"
+  namespace: capi-ci
+spec:
+  replicas: 1    # CI 用單 control plane，省機器
+  version: v1.29.4
+  machineTemplate:
+    infrastructureRef:
+      apiVersion: infrastructure.cluster.x-k8s.io/v1alpha3
+      kind: MaasMachineTemplate
+      name: ci-cp-template
+  kubeadmConfigSpec:
+    initConfiguration:
+      nodeRegistration:
+        kubeletExtraArgs:
+          # CI 環境關閉 eviction，避免測試期間 node 壓力觸發驅逐
+          eviction-hard: "memory.available<100Mi,nodefs.available<5%"
+    clusterConfiguration:
+      # 縮短 etcd 保留時間，CI cluster 生命週期短，不需要長時間 log
+      etcd:
+        local:
+          extraArgs:
+            auto-compaction-retention: "1h"
+---
+apiVersion: infrastructure.cluster.x-k8s.io/v1alpha3
+kind: MaasMachineTemplate
+metadata:
+  name: ci-cp-template
+  namespace: capi-ci
+spec:
+  template:
+    spec:
+      resourcePool: "ci-pool"
+      image: "ubuntu-22.04-lts-amd64"
+      minCPU: 4
+      minMemory: 8192
+---
+apiVersion: cluster.x-k8s.io/v1beta1
+kind: MachineDeployment
+metadata:
+  name: "${CLUSTER_NAME}-workers"
+  namespace: capi-ci
+spec:
+  clusterName: "${CLUSTER_NAME}"
+  replicas: 2
+  selector:
+    matchLabels:
+      cluster.x-k8s.io/cluster-name: "${CLUSTER_NAME}"
+  template:
+    metadata:
+      labels:
+        cluster.x-k8s.io/cluster-name: "${CLUSTER_NAME}"
+    spec:
+      version: v1.29.4
+      bootstrap:
+        configRef:
+          apiVersion: bootstrap.cluster.x-k8s.io/v1beta1
+          kind: KubeadmConfigTemplate
+          name: ci-worker-bootstrap
+      infrastructureRef:
+        apiVersion: infrastructure.cluster.x-k8s.io/v1alpha3
+        kind: MaasMachineTemplate
+        name: ci-worker-template
+---
+apiVersion: infrastructure.cluster.x-k8s.io/v1alpha3
+kind: MaasMachineTemplate
+metadata:
+  name: ci-worker-template
+  namespace: capi-ci
+spec:
+  template:
+    spec:
+      resourcePool: "ci-pool"
+      image: "ubuntu-22.04-lts-amd64"
+      minCPU: 4
+      minMemory: 8192
+---
+apiVersion: bootstrap.cluster.x-k8s.io/v1beta1
+kind: KubeadmConfigTemplate
+metadata:
+  name: ci-worker-bootstrap
+  namespace: capi-ci
+spec:
+  template:
+    spec:
+      joinConfiguration:
+        nodeRegistration:
+          kubeletExtraArgs:
+            eviction-hard: "memory.available<100Mi,nodefs.available<5%"
+```
+
+### 第三步：GitHub Actions Workflow
+
+```yaml
+# .github/workflows/e2e-baremetal.yaml
+name: E2E on bare-metal
+
+on:
+  pull_request:
+    branches: [main]
+
+env:
+  CLUSTER_NAME: "ci-pr-${{ github.event.pull_request.number }}-${{ github.run_attempt }}"
+  PR_NUMBER: "${{ github.event.pull_request.number }}"
+  KUBECONFIG_PATH: "${{ github.workspace }}/ci-kubeconfig"
+
+jobs:
+  e2e-test:
+    runs-on: self-hosted   # 跑在能連到 management cluster 的 runner
+    timeout-minutes: 45    # 全流程 timeout 保護
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup kubectl and clusterctl
+        run: |
+          curl -Lo kubectl https://dl.k8s.io/release/v1.29.4/bin/linux/amd64/kubectl
+          curl -Lo clusterctl https://github.com/kubernetes-sigs/cluster-api/releases/download/v1.7.0/clusterctl-linux-amd64
+          chmod +x kubectl clusterctl
+          sudo mv kubectl clusterctl /usr/local/bin/
+
+      # ★ 建立 cluster（使用 template 展開）
+      - name: Create CI cluster
+        run: |
+          envsubst < hack/ci/ci-cluster-template.yaml | \
+            kubectl apply --kubeconfig=$MGMT_KUBECONFIG -f -
+
+      # ★ 等待 cluster Ready，最多等 8 分鐘
+      - name: Wait for cluster provisioned
+        run: |
+          kubectl wait cluster/${CLUSTER_NAME} \
+            --for=condition=Ready \
+            --timeout=480s \
+            --kubeconfig=$MGMT_KUBECONFIG \
+            --namespace=capi-ci
+
+      # ★ 取得 workload cluster kubeconfig
+      - name: Get cluster kubeconfig
+        run: |
+          clusterctl get kubeconfig ${CLUSTER_NAME} \
+            --kubeconfig=$MGMT_KUBECONFIG \
+            --namespace=capi-ci > ${KUBECONFIG_PATH}
+
+      # ★ 等待所有 node Ready
+      - name: Wait for nodes ready
+        run: |
+          kubectl wait nodes --all \
+            --for=condition=Ready \
+            --timeout=180s \
+            --kubeconfig=${KUBECONFIG_PATH}
+
+      # ★ 部署應用
+      - name: Deploy application
+        run: |
+          kubectl apply -f deploy/ --kubeconfig=${KUBECONFIG_PATH}
+          kubectl rollout status deployment/my-app \
+            --timeout=120s \
+            --kubeconfig=${KUBECONFIG_PATH}
+
+      # ★ 執行 e2e 測試
+      - name: Run e2e tests
+        run: |
+          go test ./test/e2e/... \
+            -v \
+            -timeout 20m \
+            -kubeconfig=${KUBECONFIG_PATH}
+
+      # ★ 無論成功失敗，一定要清理（使用 if: always()）
+      - name: Delete CI cluster
+        if: always()
+        run: |
+          kubectl delete cluster ${CLUSTER_NAME} \
+            --kubeconfig=$MGMT_KUBECONFIG \
+            --namespace=capi-ci \
+            --wait=true \
+            --timeout=300s || true
+          # 確認 MaasMachine 都已釋放
+          kubectl get maasmachine \
+            --kubeconfig=$MGMT_KUBECONFIG \
+            --namespace=capi-ci \
+            -l cluster.x-k8s.io/cluster-name=${CLUSTER_NAME}
+```
+
+<Callout type="info" title="為何用 if: always()">
+GitHub Actions 的 `if: always()` 確保即使前面的 step 失敗，cleanup step 依然執行。這是防止孤兒資源的第一道防線。如果 runner 本身意外死亡（runner 機器 OOM 或網路中斷），需要另外的 cleanup 機制（見下方「孤兒清理」）。
+</Callout>
+
+## 關鍵參數說明
+
+| 參數 | 位置 | 說明 | 建議值 |
+|------|------|------|--------|
+| `resourcePool` | `MaasMachineTemplate.spec.resourcePool` | 限制分配來源，只選 CI pool 的機器 | `"ci-pool"` |
+| `image` | `MaasMachineTemplate.spec.image` | MAAS OS image 名稱，建議 CI 用輕量版本 | `"ubuntu-22.04-lts-amd64"` |
+| `minCPU` | `MaasMachineTemplate.spec.minCPU` | 最小 CPU 核心數，低於此值的機器不會被分配 | 4（視測試需求） |
+| `minMemory` | `MaasMachineTemplate.spec.minMemory` | 最小記憶體（MB），確保測試不會 OOM | 8192（8 GB） |
+| `replicas`（KubeadmControlPlane） | `KubeadmControlPlane.spec.replicas` | CI 用 1，省機器；生產用 3 | `1` |
+| `--timeout`（wait） | GitHub Actions | cluster Ready 等待上限 | `480s`（8 分鐘） |
+| `labels`（Cluster） | `Cluster.metadata.labels` | PR number、run ID，用於孤兒資源追蹤 | 必填 |
+
+## 孤兒 MaasMachine 清理策略
+
+當 GitHub Actions runner 崩潰（OOM、網路中斷、強制 cancel），`if: always()` 的 cleanup step 不會執行，機器會永遠卡在 Deployed 狀態。
+
+### 被動清理：定時 CronJob
+
+```yaml
+# orphan-cleaner-cronjob.yaml
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: ci-orphan-cleaner
+  namespace: capi-ci
+spec:
+  schedule: "*/30 * * * *"   # 每 30 分鐘掃描一次
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          serviceAccountName: ci-cluster-manager
+          restartPolicy: OnFailure
+          containers:
+            - name: cleaner
+              image: bitnami/kubectl:1.29
+              command:
+                - /bin/sh
+                - -c
+                - |
+                  # 找出所有 ci-pr-* cluster
+                  for cluster in $(kubectl get cluster -n capi-ci \
+                    -l ci.company.com/pr-number \
+                    -o jsonpath='{.items[*].metadata.name}'); do
+
+                    pr_number=$(kubectl get cluster $cluster -n capi-ci \
+                      -o jsonpath='{.metadata.labels.ci\.company\.com/pr-number}')
+
+                    # 用 GitHub API 確認 PR 是否還開著
+                    pr_state=$(curl -s \
+                      -H "Authorization: token ${GITHUB_TOKEN}" \
+                      "https://api.github.com/repos/${REPO}/pulls/${pr_number}" \
+                      | jq -r '.state')
+
+                    # PR 已關閉但 cluster 還存在 → 孤兒，刪除
+                    if [ "$pr_state" = "closed" ]; then
+                      echo "Deleting orphan cluster: $cluster (PR #$pr_number is closed)"
+                      kubectl delete cluster $cluster -n capi-ci --wait=false
+                    fi
+                  done
+              env:
+                - name: GITHUB_TOKEN
+                  valueFrom:
+                    secretKeyRef:
+                      name: github-token
+                      key: token
+                - name: REPO
+                  value: "myorg/myrepo"
+```
+
+### 主動清理：MAAS 端確認
+
+即使 CronJob 清理了 Kubernetes 資源，也要確認 MAAS 端的機器確實被釋放：
+
+```bash
+# 確認 MAAS 端沒有卡住的 ci-pool 機器
+maas admin machines read | \
+  jq '.[] | select(.pool.name == "ci-pool") | 
+      {hostname: .hostname, status: .status_name, allocated_to: .owner}' | \
+  jq 'select(.status != "Ready")'
+
+# 手動釋放卡住的機器（緊急處理）
+maas admin machine release <system_id>
+```
+
+<Callout type="warning" title="MAAS 機器狀態不一致">
+如果 CAPM Controller 在 MaasMachine Finalizer 執行到一半時崩潰，可能出現 Kubernetes 資源已刪除但 MAAS 機器仍在 Deployed 狀態的情況。MaasMachine Controller 有冪等重試機制，重啟 controller 後會自動補完 release 流程。若 controller 無法自動恢復，才需要手動執行 `maas admin machine release`。
+</Callout>
+
+## 常見問題與解法
+
+### Q1：CI cluster 一直停在 `Provisioning`，不到 Ready
+
+**診斷步驟：**
+
+```bash
+# 1. 確認 MaasMachine 狀態
+kubectl get maasmachine -n capi-ci -l cluster.x-k8s.io/cluster-name=${CLUSTER_NAME}
+
+# 2. 看 MaasMachine 的 events
+kubectl describe maasmachine <name> -n capi-ci | tail -30
+
+# 3. 確認 CAPM controller log
+kubectl logs -n capi-system deployment/capm-controller-manager \
+  --since=10m | grep ${CLUSTER_NAME}
+```
+
+常見原因：
+- `ci-pool` 機器全部被佔用 → CAPM 停在等待可用機器（AllocateFailed event）
+- MAAS image 名稱拼錯 → MAAS API 返回 404
+- MAAS API token 過期 → Controller log 顯示 401 Unauthorized
+
+### Q2：Warm pool 機器被意外當作 Production 機器
+
+**根本原因**：MAAS 端 resource pool 設定錯誤，或有人手動把機器移到錯的 pool。
+
+**預防**：在 MaasMachineTemplate 加上 tag 雙重保護；同時在 MAAS 端設定 resource pool 的 RBAC，確保 CI 用的 API token 只有 `ci-pool` 的寫入權限。
+
+### Q3：GitHub Actions runner 被 kill，cluster 沒有被清理
+
+**短期**：手動刪除 `kubectl delete cluster <name> -n capi-ci`
+
+**長期**：部署上面的 orphan-cleaner CronJob，並設定 Cluster label `ci.company.com/pr-number`，讓 CronJob 能對應 GitHub PR 狀態自動清理。
+
+### Q4：e2e 測試比預期慢，超過 timeout
+
+機器拿到了但 node 加入慢：
+
+```bash
+# 在 workload cluster 查看 node 狀態
+kubectl get nodes --kubeconfig=${KUBECONFIG_PATH}
+
+# 確認 kubeadm join 有沒有卡住
+kubectl get kubeadmconfig -n capi-ci
+kubectl describe kubeadmconfig <name> -n capi-ci
+```
+
+通常是 CNI 沒有安裝導致 node 無法變成 Ready。確保 CI cluster template 包含 CNI 的 bootstrap addon，或在 `Wait for nodes ready` step 前先 apply CNI。
+
+## 深入閱讀
+
+- [Machine 生命週期](/cluster-api-provider-maas/features/machine-lifecycle) — Allocate/Deploy/Release 狀態機完整說明，理解 warm pool 的實作基礎
+- [API Types](/cluster-api-provider-maas/features/api-types) — `MaasMachine.spec` 所有欄位說明，包含 `resourcePool`、`tags`、`minCPU` 的語意
+- [Resource Pools & Tags](/cluster-api-provider-maas/features/resource-pools-tags) — MAAS 端隔離機制與 CAPM 的對應關係
+- [Controllers](/cluster-api-provider-maas/features/controllers) — MaasMachine Controller Reconcile 邏輯，包含 Finalizer 清理與冪等重試

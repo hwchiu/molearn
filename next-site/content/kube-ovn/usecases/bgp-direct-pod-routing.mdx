@@ -1,0 +1,396 @@
+---
+layout: doc
+title: Kube-OVN — BGP 直接 Pod 路由（金融/電信低延遲場景）
+description: 金融交易或 5G 電信工作負載如何透過 Kube-OVN BGP 功能，將 Pod IP 宣告到上游 ToR 交換機，完全消除 SNAT/DNAT 延遲，讓外部服務直接路由到 Pod
+---
+
+# 使用情境：BGP 直接 Pod 路由（金融/電信低延遲場景）
+
+> **目標效果**：高頻交易（HFT）或 5G UPF 工作負載的每個 Pod IP，直接透過 BGP 宣告到機架頂端（ToR）交換機，外部報價系統或 UPF 上游節點無需經過 NodePort/LoadBalancer，封包延遲從 NodePort 模式的 **~200–400 μs** 降低到 **~20–50 μs**，並消除所有 SNAT/DNAT 額外運算。
+
+## 你會遇到什麼問題
+
+標準 Kubernetes Service 模型（NodePort / LoadBalancer）天生在路徑上加入多層 NAT：
+
+- **SNAT 開銷**：封包進入 node 後，iptables/IPVS 做 DNAT 轉到 Pod IP，回程做 SNAT 改回 node IP；每個封包要多次查表，在高封包率下延遲疊加
+- **不可預測的路徑**：同一條 TCP 連線可能從 node-A 進來，轉到 node-B 的 Pod，回程路徑不同，RTT 不穩定
+- **無 ECMP**：NodePort / ClusterIP 依賴 iptables 隨機選擇 backend，無法利用交換機的硬體 ECMP 做 line-rate 負載分散
+- **難以防火牆審計**：外部防火牆看到的來源 IP 是 node IP 而非 Pod IP，log 關聯困難
+
+**典型受害場景**
+
+| 場景 | 為什麼 NAT 是問題 |
+|------|------------------|
+| 高頻交易（HFT）行情訂閱 | 報價廣播要求 p99 延遲 < 100 μs，SNAT 增加 50–200 μs |
+| 5G UPF（User Plane Function）| 3GPP 規範 GTP-U 路徑延遲 < 1 ms，任何 NAT 都可能違規 |
+| 金融結算批次 | 大量 TCP 長連線，SNAT 連線追蹤表耗盡導致丟包 |
+| 電信 SBC（Session Border Controller）| 需要保留真實來源 IP 做會話綁定 |
+
+## 哪些元件協作解決這個問題
+
+| 元件 | 職責 |
+|------|------|
+| [BGP 整合](/kube-ovn/features/bgp) | kube-ovn-speaker DaemonSet 與 ToR 建立 eBGP session，宣告 Pod CIDR 或個別 Pod IP |
+| [VPC 與 Subnet](/kube-ovn/features/vpc-subnet) | 定義 Pod 所屬的 Subnet CIDR，BGP speaker 依此決定要宣告哪些前綴 |
+| [OVN 整合](/kube-ovn/features/ovn-integration) | 維護 OVN Logical Switch Port，確保 Pod IP 在 OVN fabric 內可達 |
+| kube-ovn-speaker | GoBGP 進程，執行在每個 node 上，以 node IP 為 next-hop 宣告 Pod IP |
+| ToR 交換機（FRRouting / Arista EOS） | 收到 BGP 路由後，安裝轉發表，把 Pod IP 的流量直接送到對應 node |
+
+## 協作流程
+
+```
+外部客戶端（報價系統 / UPF 上游）
+        │ 目標 IP = Pod IP（e.g. 10.20.5.37）
+        ▼
+Spine Switch（ECMP：收到多條 /32 路由，每個 node 各一條）
+        │
+        ▼
+ToR Switch（BGP 路由表：10.20.5.37/32 via 192.168.1.11）
+        │ 目標 node 的物理 IP
+        ▼
+Node（192.168.1.11）
+  └─ OVS Port：ovn-k8s-mp0
+        │ OVN Logical Switch 轉發
+        ▼
+Pod（eth0：10.20.5.37）  ← 封包到達，無 NAT
+
+回程：
+Pod → OVN Logical Router（預設路由：to physical NIC）
+        → ToR Switch → Spine → 外部客戶端
+        （來源 IP 為 Pod IP，無 SNAT）
+```
+
+**kube-ovn-speaker 宣告流程**
+
+```
+kube-ovn-speaker（每個 node）
+  ├── Watch Pod annotation: speaker.ovn.kubernetes.io/announce-pod-ip: "true"
+  ├── 若 Pod 在本 node → 以 node 物理 IP 為 next-hop，宣告 <pod-ip>/32
+  ├── 若 Subnet 設 bgpPeer → 宣告整個 Subnet CIDR（/24 等）
+  └── Pod 消失時 → 撤回（WITHDRAW）對應前綴
+
+BGP Session 狀態機：
+  IDLE → CONNECT → ACTIVE → OpenSent → OpenConfirm → ESTABLISHED
+                                                         │
+                                               持續 UPDATE Pod IP prefix
+```
+
+## 最小可行配置
+
+### 第一步：確認 kube-ovn-speaker 已部署
+
+kube-ovn-speaker 預設作為 DaemonSet 部署在所有 node 上（Kube-OVN 1.11+）：
+
+```bash
+kubectl get daemonset -n kube-system kube-ovn-speaker
+# NAME               DESIRED   CURRENT   READY   ...
+# kube-ovn-speaker   3         3         3       ...
+
+# 查看 speaker 日誌確認 BGP session 建立
+kubectl logs -n kube-system -l app=kube-ovn-speaker --tail=40
+```
+
+### 第二步：建立 BGP 低延遲 Pod 專用 Subnet
+
+```yaml
+# subnet-hft.yaml
+apiVersion: kubeovn.io/v1
+kind: Subnet
+metadata:
+  name: hft-trading-subnet
+spec:
+  vpc: default-vpc
+  # ★ 這個 CIDR 將透過 BGP 整體宣告到 ToR
+  cidrBlock: 10.20.5.0/24
+  gateway: 10.20.5.1
+  excludeIps:
+    - 10.20.5.1
+  # ★ 只有 hft namespace 可以使用此 subnet
+  namespaces:
+    - hft
+  # ★ 啟用 BGP：宣告此 Subnet CIDR 到 peer 192.168.1.254
+  bgpPeer: "192.168.1.254:65100"
+  # ★ 關閉 natOutgoing：Pod 出站流量保留真實 Pod IP，不做 SNAT
+  natOutgoing: false
+  # ★ 關閉 gatewayType 的集中 gateway：讓每個 node 直接做轉發
+  gatewayType: distributed
+```
+
+```bash
+kubectl apply -f subnet-hft.yaml
+kubectl get subnet hft-trading-subnet
+```
+
+### 第三步：設定 BGP 全域參數（ConfigMap）
+
+```yaml
+# bgp-config.yaml — kube-ovn-speaker 讀取此 ConfigMap
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: bgp-config
+  namespace: kube-system
+data:
+  # ★ 本 AS（Autonomous System）號碼
+  bgp-local-as: "65001"
+  # ★ Router ID（通常用某個 node IP 或 loopback）
+  bgp-router-id: "192.168.1.10"
+  # ★ 預設 hold-time（秒），建議金融場景用較小值
+  bgp-hold-time: "9"
+  # ★ eBGP 對等清單（可多個，逗號分隔）
+  bgp-neighbors: "192.168.1.254:65100,192.168.1.253:65100"
+  # ★ 是否宣告個別 Pod IP（/32）；false = 只宣告 Subnet CIDR
+  bgp-announce-pod-ip: "true"
+  # ★ 是否宣告 Service ExternalIP
+  bgp-announce-service: "false"
+```
+
+```bash
+kubectl apply -f bgp-config.yaml
+# 重啟 speaker 讓設定生效
+kubectl rollout restart daemonset/kube-ovn-speaker -n kube-system
+```
+
+### 第四步：為高頻交易 Pod 加上 BGP 宣告 annotation
+
+```yaml
+# pod-hft-matcher.yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: market-data-matcher-0
+  namespace: hft
+  annotations:
+    # ★ 個別 Pod /32 宣告：只宣告這個 Pod 的 IP，不影響同 Subnet 其他 Pod
+    speaker.ovn.kubernetes.io/announce-pod-ip: "true"
+    # ★ 靜態 IP：固定 IP 讓外部防火牆/路由設備可以寫靜態 ACL
+    ovn.kubernetes.io/ip_address: "10.20.5.10"
+spec:
+  # ★ 讓 Pod 固定在特定 node（避免 IP 宣告位置漂移）
+  nodeName: hft-node-01
+  containers:
+    - name: matcher
+      image: internal-registry/market-matcher:v3.2
+      resources:
+        requests:
+          cpu: "4"
+          memory: "8Gi"
+        limits:
+          cpu: "4"
+          memory: "8Gi"
+      # ★ hostNetwork: false — 使用 Pod IP 而非 node IP
+```
+
+### 第五步：ToR 交換機端設定（以 FRRouting 為例）
+
+在 ToR 交換機（或軟體路由器）上加入 BGP peer 設定：
+
+```
+! FRRouting 設定（/etc/frr/frr.conf）
+router bgp 65100
+  bgp router-id 192.168.1.254
+  !
+  ! ★ 與每個 Kubernetes node 建立 eBGP peer
+  neighbor 192.168.1.11 remote-as 65001
+  neighbor 192.168.1.12 remote-as 65001
+  neighbor 192.168.1.13 remote-as 65001
+  !
+  address-family ipv4 unicast
+    ! ★ 接收從 kube-ovn-speaker 宣告的 Pod IP 路由
+    neighbor 192.168.1.11 activate
+    neighbor 192.168.1.12 activate
+    neighbor 192.168.1.13 activate
+    ! ★ 最大接受前綴數（防止 BGP 路由表爆炸）
+    neighbor 192.168.1.11 maximum-prefix 1000
+    neighbor 192.168.1.12 maximum-prefix 1000
+    neighbor 192.168.1.13 maximum-prefix 1000
+  exit-address-family
+```
+
+Arista EOS 等效設定：
+
+```
+router bgp 65100
+   router-id 192.168.1.254
+   neighbor KUBE-OVN-NODES peer group
+   neighbor KUBE-OVN-NODES remote-as 65001
+   neighbor KUBE-OVN-NODES maximum-routes 1200
+   neighbor 192.168.1.11 peer group KUBE-OVN-NODES
+   neighbor 192.168.1.12 peer group KUBE-OVN-NODES
+   neighbor 192.168.1.13 peer group KUBE-OVN-NODES
+   !
+   address-family ipv4
+      neighbor KUBE-OVN-NODES activate
+```
+
+### 第六步：驗證 BGP session 和路由宣告
+
+```bash
+# ① 確認 speaker 已建立 ESTABLISHED session
+kubectl logs -n kube-system -l app=kube-ovn-speaker | grep -i "established\|session"
+
+# ② 確認 Pod 的 /32 路由已注入 node 路由表
+kubectl exec -n kube-system <speaker-pod> -- gobgp neighbor 192.168.1.254
+
+# ③ 從 ToR 側確認路由（FRRouting）
+# vtysh -c "show bgp ipv4 unicast 10.20.5.10/32"
+# 應看到 next-hop 為某個 node IP
+
+# ④ 從外部客戶端測試延遲（對比有無 NAT）
+# 無 BGP（NodePort）：
+ping -c 100 <node-ip>:<nodeport>   # ~300 μs p99
+
+# 有 BGP direct routing：
+ping -c 100 10.20.5.10             # ~35 μs p99
+
+# ⑤ 確認回程封包來源 IP 為 Pod IP（無 SNAT）
+tcpdump -n -i eth0 src 10.20.5.10  # 在外部客戶端執行
+```
+
+## 關鍵參數說明
+
+| 參數 | 位置 | 說明 |
+|------|------|------|
+| `bgpPeer` | Subnet spec | `<peer-ip>:<peer-AS>` 格式；Subnet CIDR 整體宣告 |
+| `speaker.ovn.kubernetes.io/announce-pod-ip` | Pod annotation | `"true"` 時宣告 /32 個別 Pod IP |
+| `natOutgoing: false` | Subnet spec | 關閉 SNAT；Pod 出站保留真實 IP |
+| `gatewayType: distributed` | Subnet spec | 每個 node 各自轉發，無集中 gateway 瓶頸 |
+| `bgp-hold-time` | bgp-config ConfigMap | BGP keepalive 的三倍；設小（9s）以快速偵測 link down |
+| `bgp-announce-pod-ip` | bgp-config ConfigMap | 全域開關；`true` 時才尊重 Pod annotation |
+| `bgp-local-as` | bgp-config ConfigMap | Kube-OVN 的 AS 號碼（iBGP/eBGP 取決於 peer AS） |
+
+### 延遲對比：有無 BGP Direct Routing
+
+```
+方案                  | 路徑                                 | 典型 p99 延遲
+─────────────────────────────────────────────────────────────────
+NodePort（DNAT+SNAT）  | Client→Node→iptables→Pod→iptables→Client | 200–400 μs
+ClusterIP + Ingress   | Client→LB→Node→kube-proxy→Pod→SNAT   | 150–300 μs
+BGP Direct Routing    | Client→ToR→Node→OVN→Pod（無 NAT）    | 20–50 μs
+BGP + RDMA (SR-IOV)   | Client→ToR→Node→RDMA NIC→Pod          | 5–15 μs
+```
+
+<Callout type="warning" title="ECMP 雜湊與 TCP 會話保持">
+ToR 交換機的 ECMP 預設以 5-tuple（src IP/port、dst IP/port、protocol）做雜湊。若同一 Pod 有多個 BGP next-hop（不同 node 宣告相同 /32 是錯誤配置），TCP 會話可能中斷。**正確做法**：每個 Pod IP 只由它所在的 node 宣告 /32；Subnet CIDR（/24）才由所有 node 宣告用於 ECMP。
+</Callout>
+
+<Callout type="info" title="iBGP vs eBGP 選擇">
+Kube-OVN speaker 支援 iBGP（相同 AS）和 eBGP（不同 AS）。金融場景通常選 **eBGP**，因為 eBGP 更新不需要 full mesh 且路由優先級明確。電信場景若已有 MPLS/BGP backbone 可考慮 iBGP + route reflector。
+</Callout>
+
+## 安全考量
+
+BGP 直接 Pod 路由意味著外部客戶端可以直接存取 Pod IP，**繞過** Service 層的任何防護。必須搭配以下措施：
+
+### OVN ACL（SecurityGroup）限制外部存取
+
+```yaml
+# security-group-hft.yaml
+apiVersion: kubeovn.io/v1
+kind: SecurityGroup
+metadata:
+  name: hft-external-access
+spec:
+  allowSameGroupTraffic: true
+  ingressRules:
+    # ★ 只允許報價伺服器（10.100.0.0/24）存取交易引擎 Port 7777
+    - ipVersion: ipv4
+      protocol: tcp
+      remoteType: address
+      remoteAddress: "10.100.0.0/24"
+      portRangeMin: 7777
+      portRangeMax: 7777
+      policy: allow
+      priority: 100
+    # ★ 拒絕所有其他外部連線
+    - ipVersion: ipv4
+      protocol: tcp
+      remoteType: address
+      remoteAddress: "0.0.0.0/0"
+      portRangeMin: 1
+      portRangeMax: 65535
+      policy: drop
+      priority: 200
+  egressRules:
+    - ipVersion: ipv4
+      protocol: tcp
+      remoteType: address
+      remoteAddress: "10.100.0.0/24"
+      portRangeMin: 1
+      portRangeMax: 65535
+      policy: allow
+      priority: 100
+```
+
+```yaml
+# 在 Pod 上套用 SecurityGroup
+metadata:
+  annotations:
+    ovn.kubernetes.io/security_groups: "hft-external-access"
+```
+
+<Callout type="tip" title="ACL Log 模式追蹤非法連線">
+在 SecurityGroup 的 `drop` 規則上加入 `log: true`，OVN 會將每次被拒絕的連線記錄到 OVS 日誌，方便審計哪些外部 IP 嘗試直連 Pod。
+</Callout>
+
+## 常見問題與解法
+
+### ① BGP session 停留在 ACTIVE 狀態
+
+```bash
+# 診斷步驟
+kubectl logs -n kube-system <speaker-pod> | grep -i "active\|error\|refused"
+
+# 可能原因 A：ToR 端 ACL 擋住 TCP 179
+# 解法：在 ToR 確認 permit tcp any any eq 179
+
+# 可能原因 B：AS 號碼不匹配
+# 解法：確認 bgp-config ConfigMap 的 bgp-local-as 與 ToR 設定的 remote-as 一致
+
+# 可能原因 C：kube-ovn-speaker 還未取得設定（ConfigMap 尚未套用）
+kubectl get configmap bgp-config -n kube-system -o yaml
+kubectl rollout restart daemonset/kube-ovn-speaker -n kube-system
+```
+
+### ② Pod IP 路由有宣告但封包不通
+
+```bash
+# 確認 OVN 轉發規則已下發
+kubectl ko nbctl show | grep -A5 hft-trading-subnet
+
+# 確認 Pod annotation 正確
+kubectl get pod market-data-matcher-0 -n hft -o jsonpath='{.metadata.annotations}'
+
+# 在 node 上追蹤 OVS 封包路徑
+kubectl ko trace hft/market-data-matcher-0 10.100.0.5 tcp 7777
+# 預期輸出最後一行："output to <pod-port>"
+```
+
+### ③ 宣告了 /32 但 ToR 顯示 /24 優先
+
+BGP 最長前綴優先（Longest Prefix Match）應讓 /32 優先。若 ToR 仍用 /24 路徑，檢查：
+
+```bash
+# FRRouting ToR 上確認
+vtysh -c "show ip route 10.20.5.10/32 longer-prefixes"
+# 若只有 /24 表示 /32 沒有被宣告
+
+# 確認 speaker Pod 對應的 node 確實有 Pod
+kubectl get pod -n hft -o wide | grep market-data-matcher-0
+# READY 1/1 表示 Pod 在線，/32 應被宣告
+```
+
+### ④ 切換 node 後延遲短暫上升
+
+Pod 遷移到新 node 時，kube-ovn-speaker 需要：
+1. 舊 node 撤回 /32（WITHDRAW）
+2. 新 node 宣告 /32（UPDATE）
+3. ToR BGP 收斂（通常 < 1 秒）
+
+在 BGP 收斂期間，封包可能短暫（< 1s）走舊 next-hop（black hole）。**金融場景解法**：使用靜態 IP + `nodeName` 固定 Pod 到特定 node，避免遷移。
+
+## 深入閱讀
+
+- [BGP 整合](/kube-ovn/features/bgp) — GoBGP 整合架構、宣告策略與 AS Path 控制
+- [VPC 與 Subnet](/kube-ovn/features/vpc-subnet) — Subnet BGP 欄位與 natOutgoing 設定細節
+- [OVN 整合](/kube-ovn/features/ovn-integration) — Logical Router 轉發路徑，了解 Pod 封包如何離開 OVN fabric
