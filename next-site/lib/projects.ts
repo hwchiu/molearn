@@ -219,11 +219,11 @@ export const PROJECTS: Record<ProjectId, ProjectMeta> = {
     color: 'teal',
     accentClass: 'border-teal-500 text-teal-400',
     features: [
-      'architecture', 'ceph-cluster', 'storage-classes',
+      'feature-map', 'architecture', 'ceph-cluster', 'storage-classes',
       'osds-monitors', 'ceph-controllers', 's3-object-store', 'csi-driver',
     ],
     featureGroups: [
-      { label: '從這裡開始', icon: '🚀', slugs: ['architecture'] },
+      { label: '從這裡開始', icon: '🗺️', slugs: ['feature-map', 'architecture'] },
       { label: 'Ceph 核心', icon: '🗄️', slugs: ['ceph-cluster', 'osds-monitors', 'ceph-controllers'] },
       { label: '儲存服務', icon: '💾', slugs: ['storage-classes', 's3-object-store', 'csi-driver'] },
     ],
@@ -244,6 +244,7 @@ export const PROJECTS: Record<ProjectId, ProjectMeta> = {
     },
     learningPaths: {
       beginner: [
+        { slug: 'feature-map', note: '從全景地圖了解 Rook 的所有功能模組與學習路徑' },
         { slug: 'architecture', note: '了解 Rook + Ceph 的整體架構與元件角色' },
         { slug: 'ceph-cluster', note: '認識 CephCluster CRD 與部署設定' },
         { slug: 'storage-classes', note: '了解如何透過 StorageClass 使用儲存' },
@@ -325,11 +326,11 @@ export const PROJECTS: Record<ProjectId, ProjectMeta> = {
     color: 'rose',
     accentClass: 'border-rose-500 text-rose-400',
     features: [
-      'architecture', 'vmi-lifecycle', 'virt-controller',
+      'feature-map', 'architecture', 'vmi-lifecycle', 'virt-controller',
       'virt-handler', 'vm-storage', 'vm-network', 'live-migration',
     ],
     featureGroups: [
-      { label: '從這裡開始', icon: '🚀', slugs: ['architecture'] },
+      { label: '從這裡開始', icon: '🗺️', slugs: ['feature-map', 'architecture'] },
       { label: 'VM 生命週期', icon: '🖥️', slugs: ['vmi-lifecycle', 'virt-controller', 'virt-handler'] },
       { label: '儲存與網路', icon: '🌐', slugs: ['vm-storage', 'vm-network'] },
       { label: '進階功能', icon: '✈️', slugs: ['live-migration'] },
@@ -351,6 +352,7 @@ export const PROJECTS: Record<ProjectId, ProjectMeta> = {
     },
     learningPaths: {
       beginner: [
+        { slug: 'feature-map', note: '從全景地圖了解 KubeVirt 的所有功能模組與學習路徑' },
         { slug: 'architecture', note: '了解 KubeVirt 元件架構與 VM 如何跑在 Kubernetes 上' },
         { slug: 'vmi-lifecycle', note: '追蹤 VM 從建立到執行的完整生命週期' },
         { slug: 'vm-storage', note: '了解 VM 磁碟與 PVC 的整合方式' },

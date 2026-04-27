@@ -1,0 +1,122 @@
+---
+layout: doc
+title: Rook — 功能全景地圖
+description: 以鳥瞰視角覽覽 Rook 的所有核心功能模組，了解各功能在整體架構中的定位與學習建議路徑。
+---
+
+## 為什麼需要這張地圖
+
+Rook 把 Ceph 這套工業等級的分散式儲存系統整合進 Kubernetes。從一個 `kubectl apply` 觸發到磁碟真正寫入資料，中間跨越了 **Operator Controller、Ceph Daemon、CSI Driver** 三個完全不同的技術領域。
+
+如果直接跳進原始碼，很容易迷失在細節裡。這張地圖的目的是：**先讓你看到全局，再決定要深入哪個方向**。
+
+---
+
+## 功能模組全景
+
+![Rook Feature Map](/diagrams/rook/feature-map.png)
+
+四個核心功能域相互協作，共同完成「讓 Kubernetes workload 獲得高可用儲存」的任務：
+
+| 功能域 | 核心職責 | 對應文件 |
+|--------|---------|---------|
+| **Ceph 核心元件** | Monitor 仲裁、OSD 資料寫入、Manager 監控 | [OSD 與 Monitor](/rook/features/osds-monitors) |
+| **Operator Controllers** | 監聽 CRD、驅動 Ceph daemon 到期望狀態 | [Ceph Controllers](/rook/features/ceph-controllers) |
+| **儲存服務** | Block / File / Object 三種存取模型 | [StorageClass](/rook/features/storage-classes)、[S3 Object Store](/rook/features/s3-object-store) |
+| **資料路徑 (CSI)** | PVC 動態佈建、Volume attach/mount | [CSI Driver](/rook/features/csi-driver) |
+
+---
+
+## 整體架構分層
+
+![Rook Architecture](/diagrams/rook/architecture.png)
+
+### 從上到下：四個層次
+
+**① Kubernetes 控制平面**
+使用者透過 `kubectl apply` 宣告 `CephCluster`、`CephBlockPool` 等 CRD。這些物件被存入 etcd，等待 Rook Operator reconcile。
+
+**② Rook Operator（rook-ceph namespace）**
+這是 Rook 的大腦。它以 Deployment 形式運行，內部包含多個 controller：
+- `ClusterController`：啟動並維護 mon/mgr/osd pod
+- `PoolController`、`FilesystemController`、`ObjectStoreController`：管理各種儲存資源
+- `CSI Provisioner side-car`：接收 Kubernetes 的 `CreateVolume` gRPC 呼叫
+
+**③ Ceph 儲存平面（一組 pod）**
+- `mon` pod（×3）：維護 cluster map 與 quorum
+- `mgr` pod（×2）：提供 Dashboard 與 Prometheus metrics
+- `osd` pod（每顆磁碟一個）：實際寫入資料，BlueStore 引擎
+- `mds` pod（CephFS 用）：管理 filesystem metadata
+- `rgw` pod（Object Store 用）：提供 S3-compatible API
+
+**④ 物理 / 雲端基礎設施**
+裸磁碟（NVMe/SSD）、節點網路（Ceph 需要 10GbE+ 複製流量）。
+
+---
+
+## 儲存請求完整流程
+
+![Rook Storage Request Flow](/diagrams/rook/storage-request-flow.png)
+
+### PVC 建立流程（上方路徑）
+
+1. 使用者 `kubectl apply PVC`，指定 `storageClassName: rook-ceph-block`
+2. Kubernetes 通知 CSI Provisioner（`rook-ceph-csi-rbdplugin`）
+3. CSI Provisioner 呼叫 Ceph `librbd` API，在 BlockPool 建立一個 RBD image
+4. 資料最終由 OSD Cluster 寫入磁碟，並根據 `replicaSize` 自動複製
+
+### Volume 掛載流程（下方路徑）
+
+1. Pod 被調度後，kubelet 呼叫 `NodeStageVolume`
+2. CSI Node Plugin 執行 `rbd map`，在 kernel 層映射為 `/dev/rbd0`
+3. kubelet 執行 `mount /dev/rbd0` 到 Pod 的 volume mount path
+
+<Callout type="info" title="兩個路徑的差異">
+**Provision**（上方）在 Ceph 叢集內建立 image，只發生一次。**Mount**（下方）在每次 Pod 啟動時執行，把 kernel RBD 裝置掛進容器。
+</Callout>
+
+---
+
+## 三種儲存模型比較
+
+| 模型 | Ceph 技術 | CRD | 典型用途 |
+|------|-----------|-----|---------|
+| Block Storage | RBD | `CephBlockPool` + `StorageClass` | 資料庫、單 Pod 讀寫 (RWO) |
+| Shared Filesystem | CephFS (MDS) | `CephFilesystem` + `StorageClass` | 多 Pod 共享讀寫 (RWX) |
+| Object Storage | RGW | `CephObjectStore` + `CephObjectStoreUser` | S3 API、AI 訓練資料集 |
+
+每種模型都有對應的 `StorageClass`，使用者只需要宣告 PVC 或 `ObjectBucketClaim`，Rook 的 CSI/RADOS 層自動處理底層細節。
+
+---
+
+## 學習路徑建議
+
+### 🟢 入門路徑（理解「Rook 做什麼」）
+
+1. **[整體架構概覽](/rook/features/architecture)** — 了解 Rook 在 Kubernetes 中的定位
+2. **[CephCluster CRD 設計](/rook/features/ceph-cluster)** — 學會如何宣告一個儲存叢集
+3. **[StorageClass 與動態佈建](/rook/features/storage-classes)** — 讓 workload 申請 PVC
+
+### 🟡 中階路徑（理解「Rook 怎麼做到的」）
+
+4. **[OSD 生命週期與 Monitor 仲裁](/rook/features/osds-monitors)** — 深入 Ceph 核心機制
+5. **[Operator Controller Reconcile 邏輯](/rook/features/ceph-controllers)** — 追蹤 controller 原始碼
+6. **[CSI Driver 架構](/rook/features/csi-driver)** — 理解資料路徑的實作
+
+### 🔴 進階路徑（深入「Rook 的邊界情境」）
+
+7. **[S3 Object Store](/rook/features/s3-object-store)** — RGW 部署與 S3 相容層
+8. **[Operator Controller](/rook/features/ceph-controllers)** — 跨 controller 協作的狀態機細節
+9. **[OSD 故障處理](/rook/features/osds-monitors)** — 磁碟故障的自動修復與資料重新平衡
+
+---
+
+## 常見問題定位
+
+| 問題症狀 | 先看哪個模組 |
+|---------|------------|
+| CephCluster 停在 `Progressing` | [Ceph Controllers](/rook/features/ceph-controllers) → Operator reconcile log |
+| PVC 一直 `Pending` | [CSI Driver](/rook/features/csi-driver) → provisioner log |
+| Monitor quorum 失效 | [OSD 與 Monitor](/rook/features/osds-monitors) → mon 選舉機制 |
+| S3 endpoint 無回應 | [S3 Object Store](/rook/features/s3-object-store) → RGW Service 設定 |
+| OSD 磁碟未被偵測 | [CephCluster CRD](/rook/features/ceph-cluster) → `storage` 欄位設定 |
