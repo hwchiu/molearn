@@ -111,6 +111,13 @@ spec:
           persistentVolumeClaim:
             claimName: ubuntu-server-01-disk
         # ★ cloud-init 設定（設定 root password、SSH key）
+        # 請將以下 base64 內容替換為你自己的 cloud-init YAML（base64 encoded）
+        # 範例解碼後的內容：
+        # #cloud-config
+        # users:
+        #   - name: ubuntu
+        #     ssh_authorized_keys:
+        #       - ssh-rsa AAAA... your-actual-public-key
         - name: cloudinitdisk
           cloudInitNoCloud:
             userDataBase64: |
