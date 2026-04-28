@@ -1,3 +1,4 @@
+import Link from 'next/link'
 import { CodeAnchor } from './CodeAnchor'
 import { Callout } from './Callout'
 import { QuizQuestion } from './QuizQuestion'
@@ -51,7 +52,13 @@ export const MDX_COMPONENTS = {
   table: (props: any) => <div className="overflow-x-auto mb-4"><table className="w-full border-collapse text-sm" {...props} /></div>,
   th: (props: any) => <th className="bg-[#21262d] text-[#e6edf3] p-2 border border-[#30363d] text-left font-semibold" {...props} />,
   td: (props: any) => <td className="p-2 border border-[#30363d] text-[#8b949e]" {...props} />,
-  a: (props: any) => <a className="text-[#2f81f7] hover:underline" {...props} />,
+  a: ({ href, ...props }: any) => {
+    const base = process.env.NEXT_PUBLIC_BASE_PATH || ''
+    if (href?.startsWith('/')) {
+      return <Link href={`${base}${href}`} className="text-[#2f81f7] hover:underline" {...props} />
+    }
+    return <a href={href} className="text-[#2f81f7] hover:underline" {...props} />
+  },
   blockquote: (props: any) => <blockquote className="border-l-4 border-[#2f81f7] pl-4 italic text-[#8b949e] my-4" {...props} />,
   strong: (props: any) => <strong className="text-white font-semibold" {...props} />,
   hr: () => <hr className="border-[#30363d] my-8" />,
