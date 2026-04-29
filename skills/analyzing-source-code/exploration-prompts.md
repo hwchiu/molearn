@@ -17,7 +17,7 @@ Explore the {project-name} repository at {repo-path} and provide a comprehensive
    Read cmd/ directory entries. What does each binary do?
 
 4. **Build System**: How is the project built?
-   Read Makefile targets, CI/CD files (.github/workflows/), Dockerfile.
+   Read Makefile targets, Dockerfile.
 
 5. **CRD Registration**: Where are CRDs registered?
    Look for register.go, types.go, scheme registration.
@@ -109,7 +109,7 @@ Explore external integrations in {repo-path}:
 4. **Storage/Network Integration**: CSI, CNI, volume plugins?
    Look for storage class, provisioner, network references.
 
-5. **CI/CD & Deployment**: Read .github/workflows/, bundle/, config/.
+5. **Deployment**: Read bundle/, config/.
    Document deployment methods (OLM, Kustomize, Helm).
 
 Show file paths and dependency references.

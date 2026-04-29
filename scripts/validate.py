@@ -253,9 +253,9 @@ def check_no_vitepress() -> None:
     print(f"\n{BOLD}[6] No VitePress / Legacy Artifacts{RESET}")
     issues = []
 
-    # Check for vitepress references in key files (CLAUDE.md may mention it historically — skip)
+    # Check for vitepress references in key files
     key_files = [
-        ROOT / "BOOTSTRAP.md",
+        ROOT / "AGENT.md",
         ROOT / "README.md",
         ROOT / "Makefile",
     ]
@@ -278,10 +278,133 @@ def check_no_vitepress() -> None:
 
 
 # ─────────────────────────────────────────────
-# CHECK 7: Build
+# CHECK 8: Framework scope guard
+# Detects if any framework files (app/, components/, etc.)
+# were modified. AI should only touch content files.
+# ─────────────────────────────────────────────
+
+# Paths the AI is ALLOWED to modify (relative to repo root)
+ALLOWED_PREFIXES = [
+    "next-site/content/",
+    "next-site/public/diagrams/",
+    "next-site/lib/projects.ts",
+    "versions.json",
+    "scripts/",
+    "AGENT.md",
+    "README.md",
+    "Makefile",
+    "skills/",
+]
+
+# Paths that are FORBIDDEN — framework code, never touch
+FORBIDDEN_PREFIXES = [
+    "next-site/app/",
+    "next-site/components/",
+    "next-site/lib/",        # lib/ except projects.ts (handled above)
+    "next-site/public/",     # public/ except diagrams/ (handled above)
+    "next-site/next.config",
+    "next-site/package.json",
+    "next-site/package-lock.json",
+    "next-site/tailwind.config",
+    "next-site/tsconfig",
+    "next-site/postcss.config",
+]
+
+
+def _is_allowed(path: str) -> bool:
+    for prefix in ALLOWED_PREFIXES:
+        if path.startswith(prefix) or path == prefix.rstrip("/"):
+            return True
+    return False
+
+
+def _is_forbidden(path: str) -> bool:
+    for prefix in FORBIDDEN_PREFIXES:
+        if path.startswith(prefix):
+            # Special case: next-site/lib/projects.ts is allowed
+            if path == "next-site/lib/projects.ts":
+                return False
+            # Special case: next-site/public/diagrams/ is allowed
+            if path.startswith("next-site/public/diagrams/"):
+                return False
+            return True
+    return False
+
+
+def check_framework_scope() -> None:
+    print(f"\n{BOLD}[8] Framework Scope Guard{RESET}")
+
+    # Collect all changed files (staged + unstaged vs HEAD)
+    try:
+        result_diff = subprocess.run(
+            ["git", "diff", "--name-only", "HEAD"],
+            cwd=ROOT, capture_output=True, text=True
+        )
+        result_staged = subprocess.run(
+            ["git", "diff", "--name-only", "--cached"],
+            cwd=ROOT, capture_output=True, text=True
+        )
+        # Also untracked files in next-site/ (new files added without staging)
+        result_untracked = subprocess.run(
+            ["git", "ls-files", "--others", "--exclude-standard", "next-site/"],
+            cwd=ROOT, capture_output=True, text=True
+        )
+    except FileNotFoundError:
+        warn("git not found — skipping scope check")
+        return
+
+    changed = set()
+    for line in (result_diff.stdout + result_staged.stdout + result_untracked.stdout).splitlines():
+        p = line.strip()
+        if p:
+            changed.add(p)
+
+    if not changed:
+        ok("No changed files detected (clean working tree)")
+        return
+
+    forbidden_touched = []
+    allowed_touched   = []
+    unknown_touched   = []
+
+    for p in sorted(changed):
+        # Deleted files that no longer exist on disk: skip silently
+        # (deletion of non-framework files is always safe)
+        if not (ROOT / p).exists():
+            if _is_forbidden(p):
+                forbidden_touched.append(p)  # deleting framework file is still bad
+            continue
+        if _is_forbidden(p):
+            forbidden_touched.append(p)
+        elif _is_allowed(p):
+            allowed_touched.append(p)
+        else:
+            unknown_touched.append(p)
+
+    if allowed_touched:
+        ok(f"{len(allowed_touched)} content file(s) modified (expected):")
+        for p in allowed_touched:
+            print(f"      {p}")
+
+    if unknown_touched:
+        for p in unknown_touched:
+            warn(f"Unexpected change (not content, not framework): {p}")
+
+    if forbidden_touched:
+        fail(f"{len(forbidden_touched)} FRAMEWORK file(s) modified — AI should never touch these:")
+        for p in forbidden_touched:
+            fail(f"  🚫 {p}")
+        fail("Framework changes will likely break the entire site.")
+        fail("Revert these files: git checkout HEAD -- <file>")
+    else:
+        ok("No framework files modified ✓")
+
+
+# ─────────────────────────────────────────────
+# CHECK 9: Build
 # ─────────────────────────────────────────────
 def check_build() -> None:
-    print(f"\n{BOLD}[7] Next.js Build{RESET}")
+    print(f"\n{BOLD}[9] Next.js Build{RESET}")
     print("  Running npm run build (this may take ~30s)...")
     result = subprocess.run(
         ["npm", "run", "build"],
@@ -316,6 +439,7 @@ def main() -> None:
     check_quiz_json()
     check_feature_files()
     check_no_vitepress()
+    check_framework_scope()
 
     # Build runs by default. Use --no-build / -n to skip (e.g. in quick iteration loops)
     if "--no-build" in sys.argv or "-n" in sys.argv:

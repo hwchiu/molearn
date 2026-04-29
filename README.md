@@ -49,7 +49,7 @@ next-site/lib/（除 projects.ts）  next-site/content/{project}/quiz.json
 | MDX | next-mdx-remote + remark-gfm + rehype-slug |
 | Syntax highlighting | shiki |
 | Icons | lucide-react |
-| Deployment | GitHub Actions → GitHub Pages |
+| Deployment | 靜態輸出（`next-site/out/`），手動部署 |
 
 ---
 
@@ -83,7 +83,7 @@ npm run build
 
 ## 加入新專案
 
-完整流程見 [`BOOTSTRAP.md`](./BOOTSTRAP.md)，摘要如下：
+完整流程見 [`AGENT.md`](./AGENT.md)，摘要如下：
 
 ```bash
 # 1. 加入 source code submodule
@@ -121,7 +121,7 @@ git submodule update --init --recursive
 cd next-site && npm install
 ```
 
-然後直接按 `BOOTSTRAP.md` 步驟加入你的公司專案。
+然後直接按 `AGENT.md` 步驟加入你的公司專案。
 
 ---
 
@@ -183,7 +183,7 @@ cd next-site && npm install && npm run build
 # 應該成功，只是首頁沒有任何專案卡片
 ```
 
-**Step 7：按照 `BOOTSTRAP.md` 加入你的第一個專案**
+**Step 7：按照 `AGENT.md` 加入你的第一個專案**
 
 ---
 
@@ -198,7 +198,7 @@ cd next-site && npm install && npm run build
 ### 給 AI 的工作說明
 
 分析新專案時，給 AI 以下文件（按順序）：
-1. [`BOOTSTRAP.md`](./BOOTSTRAP.md) — 告訴 AI 要動哪些檔案
+1. [`AGENT.md`](./AGENT.md) — 工作邊界、目錄結構、所有慣例
 2. [`skills/analyzing-source-code/SKILL.md`](./skills/analyzing-source-code/SKILL.md) — 完整分析流程
 3. [`skills/analyzing-source-code/content-writing-guide.md`](./skills/analyzing-source-code/content-writing-guide.md) — 文件寫作的 5 條 UX 規則
 
@@ -224,8 +224,7 @@ cd next-site && npm install && npm run build
 ```
 molearn/
 ├── README.md                      ← 你在這裡
-├── BOOTSTRAP.md                   ← AI 快速上手（只需碰 3 個地方）
-├── CLAUDE.md                      ← 給 Claude Code 的詳細說明
+├── AGENT.md                       ← AI 操作手冊（工作邊界、流程、所有慣例）
 ├── next-site/                     ← 網站主體
 │   ├── app/                       ← Next.js App Router（框架）
 │   │   ├── [project]/
@@ -278,18 +277,6 @@ molearn/
 - Cluster API → 藍色 (`border-blue-500`)
 - MAAS → 橘色 (`border-orange-500`)
 - Metal3 → 紫色 (`border-purple-500`)
-
----
-
-## CI/CD
-
-GitHub Actions 自動化：
-
-- **觸發條件：** push 到 `main` branch 且 `next-site/**` 有變更
-- **建置：** `npm run build` → `next-site/out/`
-- **部署：** GitHub Pages（`gh-pages` branch）
-
-Workflow 定義：[`.github/workflows/deploy.yml`](./.github/workflows/deploy.yml)
 
 ---
 
