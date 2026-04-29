@@ -68,7 +68,17 @@ next-site/lib/                                              ← 新增 quiz.json
 
 ---
 
-## 加入新專案（5 個步驟）
+## 加入新專案
+
+> ⚠️ **加入新專案或撰寫任何 MDX 文件前，必須先閱讀 `skills/analyzing-source-code/SKILL.md`。** 以下 5 個步驟只是 Phase 1（環境建立），原始碼探索（Phase 2）、規劃（Phase 2.5）、撰寫文件（Phase 3）、整合（Phase 4）、驗證（Phase 5）都在該 SKILL.md 裡。跳過這些 phase 直接寫文件，產出的內容會缺乏深度且容易出錯。
+
+**以下情況必須先讀 `skills/analyzing-source-code/SKILL.md`：**
+- 新增任何尚未有文件的專案
+- 為現有專案新增或改寫任何 `.mdx` 頁面
+- 被要求「分析」、「研究」、「整理」某個開源專案
+- 更新已有文件的專案（有新版本 commit）
+
+### Phase 1：環境建立（5 個步驟）
 
 ### Step 1：新增 git submodule
 
@@ -137,7 +147,7 @@ Sidebar 項目由 `content/{project}/features/` 目錄自動生成，**不需手
 cd next-site && npm run dev   # 確認頁面正常（localhost:3000）
 ```
 
-> **完整分析流程**（含原始碼探索、Phase 2-6）請參閱 `skills/analyzing-source-code/SKILL.md`。
+> **Phase 1 完成後立刻停下來，閱讀 `skills/analyzing-source-code/SKILL.md` 的 Phase 2–5，再開始任何文件撰寫。**
 
 ---
 
