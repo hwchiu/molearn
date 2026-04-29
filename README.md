@@ -197,9 +197,11 @@ cd next-site && npm install && npm run build
 
 ### 給 AI 的工作說明
 
-分析新專案時，給 AI 以下文件（按順序）：
-1. [`AGENT.md`](./AGENT.md) — 工作邊界、目錄結構、所有慣例
-2. [`skills/analyzing-source-code/SKILL.md`](./skills/analyzing-source-code/SKILL.md) — 完整分析流程
+指令範本請參閱下方 [如何對 AI 下指令](#如何對-ai-下指令) 章節。
+
+AI 需要讀取的核心文件：
+1. [`AGENT.md`](./AGENT.md) — 工作邊界、目錄結構、所有慣例（**必讀，先讀**）
+2. [`skills/analyzing-source-code/SKILL.md`](./skills/analyzing-source-code/SKILL.md) — 完整分析流程（分析新專案時自動觸發）
 3. [`skills/analyzing-source-code/content-writing-guide.md`](./skills/analyzing-source-code/content-writing-guide.md) — 文件寫作的 5 條 UX 規則
 
 ---
@@ -216,6 +218,57 @@ cd next-site && npm install && npm run build
 | [`skills/fireworks-tech-graph/`](./skills/fireworks-tech-graph/SKILL.md) | 產生靜態 SVG/PNG 架構圖 |
 
 所有 skills 均為 **model-agnostic** — 可以把 prompt 貼給任何 AI 工具使用。
+
+---
+
+## 如何對 AI 下指令
+
+所有任務只需要一個開場句，讓 AI 先讀 `AGENT.md`，它就會自己知道邊界、工具和流程。
+
+### 開場指令（每次新對話都貼這句）
+
+```
+請先閱讀這個 repo 根目錄的 AGENT.md，讀完後告訴我你理解了哪些工作邊界，再開始執行任何任務。
+```
+
+---
+
+### 任務指令範本
+
+**分析新專案並產生文件：**
+```
+請閱讀 AGENT.md，然後為 {project-name}/ 目錄執行完整的分析與文件撰寫流程。
+```
+
+**為現有專案補充某個功能頁面：**
+```
+請閱讀 AGENT.md，然後為 {project-name} 補充一頁關於 {功能名稱} 的說明文件。
+```
+
+**產生或更新測驗：**
+```
+請閱讀 AGENT.md，然後為 {project-name} 產生測驗題目。
+```
+
+**產生架構圖：**
+```
+請閱讀 AGENT.md，然後為 {project-name} 的 {功能名稱} 產生架構圖。
+```
+
+**更新已有文件（新版本發佈後）：**
+```
+請閱讀 AGENT.md，{project-name} 有新版本，請分析差異並更新相關文件。
+```
+
+---
+
+### 完成後務必請 AI 執行驗證
+
+```
+請執行 make validate 確認沒有破壞任何東西，並回報結果。
+```
+
+> `make validate` 包含框架邊界檢查（CHECK 8）— 若 AI 意外改動了框架程式碼，這個指令會立刻報錯並告訴你哪些檔案要還原。
 
 ---
 
