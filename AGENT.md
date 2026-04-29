@@ -59,12 +59,12 @@ next-site/lib/                                              ← 新增 quiz.json
 
 所有工作流程皆封裝為 skills，位於 `skills/` 目錄。**遇到任何任務，先閱讀對應 skill 的 `SKILL.md`，再開始執行。**
 
-| Skill | 用途 |
-|-------|------|
-| `skills/site-bootstrap/` | **從零建立完整網站框架**（含所有元件程式碼、設計系統）|
-| `skills/analyzing-source-code/` | 加入新專案的完整分析流程（model-agnostic）|
-| `skills/quiz-generation/` | 從現有文件產生互動式測驗題目 |
-| `skills/fireworks-tech-graph/` | 產生文件用靜態 SVG/PNG 技術圖表 |
+| Skill | 用途 | 何時自動觸發 |
+|-------|------|------------|
+| `skills/site-bootstrap/` | **從零建立完整網站框架**（含所有元件程式碼、設計系統）| 從零建站 |
+| `skills/analyzing-source-code/` | 加入新專案的完整分析流程（model-agnostic）| 分析新專案、產生文件 |
+| `skills/quiz-generation/` | 從現有文件產生互動式測驗題目 | 產生或更新測驗 |
+| `skills/fireworks-tech-graph/` | 產生文件用靜態 SVG/PNG 技術圖表 | **任何需要圖表的情況**（見下方）|
 
 ---
 
@@ -238,17 +238,21 @@ molearn/
 
 ## 圖表規範
 
-- 所有圖表使用靜態 PNG，**不使用 Mermaid**
+> ⚠️ **任何需要建立或修改圖表的情況，必須先閱讀 `skills/fireworks-tech-graph/SKILL.md` 再動手。** 不得自行用程式碼或文字描述替代圖表，也不得使用 Mermaid。
+
+**以下情況視為「需要圖表」，AI 必須主動觸發：**
+- 使用者要求「畫圖」、「架構圖」、「流程圖」
+- 撰寫 Architecture 頁面（必備架構圖）
+- 描述 3+ 個角色的多步驟流程（sequence 或 flow diagram）
+- 描述資源生命週期狀態轉換（state machine diagram）
+- MDX 文件裡有 `![...]()` 但對應 PNG 不存在
+
+**輸出規範：**
+- 格式：靜態 PNG（由 `skills/fireworks-tech-graph/` 生成）
 - 存放位置：`next-site/public/diagrams/{project}/{name}.png`
 - MDX 引用：`![說明文字](/diagrams/{project}/{name}.png)`
 - 命名慣例：`architecture.png`、`state-machine.png`、`{feature}-flow.png`、`{feature}-sequence.png`
-- 圖表 generator 腳本放在 `scripts/diagram-generators/{project}-{diagram}.py`
-- 如需 AI 生成圖表，使用 `skills/fireworks-tech-graph/SKILL.md` 流程
-
-**何時需要圖表：**
-- 描述 3+ 個角色的多步驟流程 → sequence 或 flow diagram
-- 描述資源的生命週期狀態 → state machine diagram
-- Architecture 頁面 → 必備架構圖
+- Generator 腳本存放：`scripts/diagram-generators/{project}-{diagram}.py`
 
 ---
 
